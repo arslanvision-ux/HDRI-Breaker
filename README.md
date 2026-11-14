@@ -38,6 +38,11 @@ python3 scripts/install.py
 - Writes an absolute-path `hdri_maker.json` package file (avoiding the `$HOUDINI_PACKAGE_PATH/..` relative-path trap).
 - Uses strict `LF` line endings and pure POSIX `sh` syntax.
 
+To update on Linux:
+```sh
+sh update.sh
+```
+
 To uninstall on Linux:
 ```sh
 sh uninstall.sh
