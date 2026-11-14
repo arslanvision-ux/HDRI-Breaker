@@ -1,0 +1,27 @@
+# Bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Generated textures / test outputs
+tex/
+*.exr
+*.hdr
+*.tif
+*.tiff
+
+# Houdini temporary / backup files
+*.hip*
+*.backup*
+*.crash*
+*.log
+*.tmp
+temp/
+tmp/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

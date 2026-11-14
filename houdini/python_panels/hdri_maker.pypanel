@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pythonPanelDocument>
+  <interface name="solaris_hdri_maker" label="HDRI Breaker (Solaris)" icon="hdri_breaker.png">
+    <script><![CDATA[
+from hdri_maker.ui_panel import HDRIMakerWidget
+
+def onCreateInterface():
+    return HDRIMakerWidget()
+]]></script>
+    <includeInToolbarMenu menu_position="200" create_separator="false"/>
+    <help><![CDATA[HDRI Breaker: Analyze real plates/sequences and generate true 32-bit float Lat/Long HDRIs for Houdini Solaris (/stage).]]></help>
+  </interface>
+</pythonPanelDocument>

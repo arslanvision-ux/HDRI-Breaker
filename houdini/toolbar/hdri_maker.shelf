@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<shelfDocument>
+  <toolshelf name="hdri_maker_shelf" label="HDRI Breaker">
+    <memberTool name="launch_hdri_maker"/>
+    <memberTool name="reload_hdri_maker"/>
+  </toolshelf>
+
+  <tool name="launch_hdri_maker" label="HDRI Breaker" icon="hdri_breaker.png">
+    <helpText><![CDATA[Open Solaris HDRI Breaker to extract plate lighting data and build 32-bit float Lat/Long HDRIs on /stage.]]></helpText>
+    <script scriptType="python"><![CDATA[
+from hdri_maker.ui_panel import launch_hdri_maker
+launch_hdri_maker()
+]]></script>
+  </tool>
+
+  <tool name="reload_hdri_maker" label="Reload HDRI Breaker" icon="BUTTONS_reload">
+    <helpText><![CDATA[Hot-reload all hdri_maker Python modules from disk without restarting Houdini.]]></helpText>
+    <script scriptType="python"><![CDATA[
+import hdri_maker
+hdri_maker.reload_all(relaunch=True)
+]]></script>
+  </tool>
+</shelfDocument>

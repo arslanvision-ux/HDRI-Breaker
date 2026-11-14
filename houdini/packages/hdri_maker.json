@@ -1,0 +1,13 @@
+{
+    "env": [
+        {
+            "HDRI_MAKER_ROOT": "d:/PROJECTS/HDRI_MAKER"
+        },
+        {
+            "PYTHONPATH": "${HDRI_MAKER_ROOT}/python"
+        },
+        {
+            "HOUDINI_PATH": "${HDRI_MAKER_ROOT}/houdini"
+        }
+    ]
+}
