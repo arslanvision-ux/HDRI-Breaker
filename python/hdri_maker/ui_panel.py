@@ -7,8 +7,10 @@ launched as a floating window from a shelf tool.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import traceback
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -18,6 +20,7 @@ from .hdri_generator import (
     HDRISynthesisParams,
     bake_planar_ground_texture,
     compute_neutral_wb_gains,
+    export_hdri_sequence,
     extract_and_inpaint_hotspot,
     extract_and_inpaint_multiple_hotspots,
     generate_latlong_hdri,
@@ -29,7 +32,12 @@ from .lighting_analyzer import (
     analyze_multiview_plates,
     analyze_plate,
     auto_align_adjacent_plates,
+    auto_equalize_plate_exposures,
+    compute_overlap_difference_map,
+    compute_plate_outline_uv,
+    equirect_rect_to_plate_rect,
     estimate_horizon_shift_deg,
+    hit_test_plate_uv,
     merge_lighting_profiles,
     rgb_to_cct_kelvin,
 )
@@ -37,6 +45,7 @@ from .plate_io import (
     linear_to_srgb,
     merge_ldr_brackets_to_hdr,
     read_plate,
+    read_plate_metadata,
     resolve_plate_sequence,
     write_exr_32f,
 )
@@ -55,6 +64,7 @@ except ImportError:
 
 
 SESSION_STATE_PATH = os.path.join(os.path.expanduser("~"), ".hdri_maker_last_session.json")
+DEBUG_LOG_PATH = os.path.join(os.path.expanduser("~"), ".hdri_maker_debug.log")
 
 UI_THEMES: Dict[str, Dict[str, str]] = {
     "Breaker Dark (Amber)": {
@@ -217,6 +227,10 @@ class PreviewLabel(QtWidgets.QLabel):
     regionEdited = Signal(str, int, tuple)
     pixelHovered = Signal(float, float)
     zoomChanged = Signal(float)
+    plateSelected = Signal(int)
+    plateDragMoved = Signal(int, float, float, str)
+    plateDragFinished = Signal(int)
+    plateWheelScaled = Signal(int, float)
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
@@ -235,6 +249,14 @@ class PreviewLabel(QtWidgets.QLabel):
         self._edit_edges: Tuple[bool, bool, bool, bool] = (False, False, False, False)
         self._edit_start_uv: Tuple[float, float] = (0.0, 0.0)
         self._edit_orig_rect: Optional[tuple] = None
+        # PTGui-style interactive plate alignment state
+        self._plate_edit_mode: bool = False
+        self._plate_views: list = []
+        self._selected_plate_idx: int = -1
+        self._plate_az_offset: float = 0.0
+        self._plate_v_shift: float = 0.0
+        self._plate_drag_mode: Optional[str] = None  # "move", "roll", "scale", "warp"
+        self._plate_drag_last_uv: Tuple[float, float] = (0.0, 0.0)
         # Zoom & Pan state
         self._source_pixmap: Optional[QtGui.QPixmap] = None
         self._zoom: float = 1.0
@@ -301,7 +323,47 @@ class PreviewLabel(QtWidgets.QLabel):
     def set_pick_mode(self, mode: Optional[str], shape: str = "rect") -> None:
         self._pick_mode = mode
         self._pick_shape = shape
-        self.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
+        self.setCursor(Qt.CrossCursor if mode else (Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor))
+
+    def set_plate_edit_mode(self, enabled: bool) -> None:
+        self._plate_edit_mode = bool(enabled)
+        if not enabled:
+            self._plate_drag_mode = None
+        if self._pick_mode is None:
+            self.setCursor(Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor)
+        self.update()
+
+    def set_plate_overlay(
+        self,
+        views: list,
+        selected_idx: int = -1,
+        az_offset: float = 0.0,
+        v_shift: float = 0.0,
+    ) -> None:
+        self._plate_views = list(views or [])
+        self._selected_plate_idx = int(selected_idx)
+        self._plate_az_offset = float(az_offset)
+        self._plate_v_shift = float(v_shift)
+        self.update()
+
+    def _hit_test_plate_handles(self, u: float, v: float) -> Optional[str]:
+        """Hit-test the selected plate's roll or corner scale handles."""
+        if not (0 <= self._selected_plate_idx < len(self._plate_views)):
+            return None
+        info = compute_plate_outline_uv(
+            self._plate_views[self._selected_plate_idx],
+            azimuth_offset_deg=self._plate_az_offset,
+            vertical_shift_deg=self._plate_v_shift,
+            samples_per_edge=8,
+        )
+        tol_u, tol_v = 0.016 / max(1.0, self._zoom * 0.5), 0.028 / max(1.0, self._zoom * 0.5)
+        ru, rv = info["roll_handle"]
+        if abs(u - ru) <= tol_u and abs(v - rv) <= tol_v:
+            return "roll"
+        for cu, cv in info["corners"]:
+            if abs(u - cu) <= tol_u and abs(v - cv) <= tol_v:
+                return "scale"
+        return None
 
     def _pixmap_rect(self) -> QtCore.QRect:
         pix = self._source_pixmap
@@ -356,6 +418,15 @@ class PreviewLabel(QtWidgets.QLabel):
             return
         delta = event.angleDelta().y()
         if delta != 0:
+            if (
+                self._plate_edit_mode
+                and self._pick_mode is None
+                and (event.modifiers() & Qt.ShiftModifier)
+                and 0 <= self._selected_plate_idx < len(self._plate_views)
+            ):
+                self.plateWheelScaled.emit(self._selected_plate_idx, float(delta))
+                event.accept()
+                return
             factor = 1.18 if delta > 0 else (1.0 / 1.18)
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
             self.set_zoom(self._zoom * factor, anchor_pos=pos)
@@ -388,7 +459,36 @@ class PreviewLabel(QtWidgets.QLabel):
             return
         if self._pick_mode is None and event.button() == Qt.LeftButton:
             uv = self._pos_to_uv(pos)
-            if uv is not None:
+            if self._plate_edit_mode and uv is not None and self._plate_views:
+                handle_mode = self._hit_test_plate_handles(uv[0], uv[1])
+                if handle_mode is not None:
+                    self._plate_drag_mode = handle_mode
+                    self._plate_drag_last_uv = (uv[0], uv[1])
+                    self.setCursor(Qt.ClosedHandCursor)
+                    return
+                hit_plate = hit_test_plate_uv(
+                    self._plate_views,
+                    uv[0],
+                    uv[1],
+                    azimuth_offset_deg=self._plate_az_offset,
+                    vertical_shift_deg=self._plate_v_shift,
+                )
+                if hit_plate is not None:
+                    if hit_plate != self._selected_plate_idx:
+                        self._selected_plate_idx = hit_plate
+                        self.plateSelected.emit(hit_plate)
+                    mods = event.modifiers()
+                    if mods & Qt.ShiftModifier:
+                        self._plate_drag_mode = "roll"
+                    elif mods & Qt.ControlModifier:
+                        self._plate_drag_mode = "warp"
+                    else:
+                        self._plate_drag_mode = "move"
+                    self._plate_drag_last_uv = (uv[0], uv[1])
+                    self.setCursor(Qt.ClosedHandCursor)
+                    self.update()
+                    return
+            if uv is not None and not self._plate_edit_mode:
                 hit = self._hit_test_region(uv[0], uv[1])
                 if hit is not None:
                     self._edit_kind, self._edit_idx, self._edit_mode, self._edit_edges, self._edit_orig_rect = hit
@@ -429,6 +529,14 @@ class PreviewLabel(QtWidgets.QLabel):
             self.update()
             return
 
+        if self._plate_drag_mode is not None and uv is not None and 0 <= self._selected_plate_idx < len(self._plate_views):
+            du = float(uv[0] - self._plate_drag_last_uv[0])
+            dv = float(uv[1] - self._plate_drag_last_uv[1])
+            self._plate_drag_last_uv = (uv[0], uv[1])
+            if abs(du) > 1e-6 or abs(dv) > 1e-6:
+                self.plateDragMoved.emit(self._selected_plate_idx, du, dv, self._plate_drag_mode)
+            return
+
         if self._edit_kind is not None and self._edit_orig_rect is not None and uv is not None:
             cu = max(0.0, min(1.0, uv[0]))
             cv = max(0.0, min(1.0, uv[1]))
@@ -452,6 +560,23 @@ class PreviewLabel(QtWidgets.QLabel):
             return
 
         if self._pick_mode is None and uv is not None:
+            if self._plate_edit_mode and self._plate_views:
+                handle_mode = self._hit_test_plate_handles(uv[0], uv[1])
+                if handle_mode == "roll":
+                    self.setCursor(Qt.SizeHorCursor)
+                elif handle_mode == "scale":
+                    self.setCursor(Qt.SizeFDiagCursor)
+                else:
+                    hit_p = hit_test_plate_uv(
+                        self._plate_views,
+                        uv[0],
+                        uv[1],
+                        azimuth_offset_deg=self._plate_az_offset,
+                        vertical_shift_deg=self._plate_v_shift,
+                    )
+                    self.setCursor(Qt.OpenHandCursor if hit_p is not None else Qt.ArrowCursor)
+                super().mouseMoveEvent(event)
+                return
             hit = self._hit_test_region(uv[0], uv[1])
             if hit is not None:
                 _, _, mode, edges, _ = hit
@@ -474,6 +599,13 @@ class PreviewLabel(QtWidgets.QLabel):
             self._panning = False
             self._pan_start_pos = None
             self.setCursor(Qt.CrossCursor if self._pick_mode else Qt.ArrowCursor)
+            return
+        if self._plate_drag_mode is not None:
+            idx = self._selected_plate_idx
+            self._plate_drag_mode = None
+            self.setCursor(Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor)
+            if idx >= 0:
+                self.plateDragFinished.emit(idx)
             return
         if self._edit_kind is not None:
             self._edit_kind = None
@@ -508,6 +640,51 @@ class PreviewLabel(QtWidgets.QLabel):
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._zoom <= 4.0)
             target = self._pixmap_rect()
             painter.drawPixmap(target, self._source_pixmap, self._source_pixmap.rect())
+            if self._plate_edit_mode and self._plate_views:
+                for idx, view in enumerate(self._plate_views):
+                    is_sel = idx == self._selected_plate_idx
+                    info = compute_plate_outline_uv(
+                        view,
+                        azimuth_offset_deg=self._plate_az_offset,
+                        vertical_shift_deg=self._plate_v_shift,
+                        samples_per_edge=14 if is_sel else 8,
+                    )
+                    if is_sel:
+                        pen = QtGui.QPen(QtGui.QColor(0, 225, 255), 2, Qt.SolidLine)
+                    else:
+                        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 110), 1, Qt.DashLine)
+                    painter.setPen(pen)
+                    for poly in info["polylines"]:
+                        pts = [
+                            QtCore.QPointF(target.x() + u * target.width(), target.y() + v * target.height())
+                            for u, v in poly
+                        ]
+                        painter.drawPolyline(QtGui.QPolygonF(pts))
+                    if is_sel:
+                        cu, cv = info["center"]
+                        cx = target.x() + cu * target.width()
+                        cy = target.y() + cv * target.height()
+                        painter.drawLine(QtCore.QPointF(cx - 7, cy), QtCore.QPointF(cx + 7, cy))
+                        painter.drawLine(QtCore.QPointF(cx, cy - 7), QtCore.QPointF(cx, cy + 7))
+                        painter.drawText(
+                            int(cx) + 8,
+                            int(cy) - 6,
+                            f"Plate #{idx + 1} (Az {view.cam_azimuth_deg:.1f}°, El {view.cam_elevation_deg:.1f}°, Roll {view.cam_roll_deg:.1f}°)",
+                        )
+                        # Corner scale handles
+                        painter.setBrush(QtGui.QColor(0, 225, 255))
+                        for hu, hv in info["corners"]:
+                            hx = target.x() + hu * target.width()
+                            hy = target.y() + hv * target.height()
+                            painter.drawRect(QtCore.QRectF(hx - 4, hy - 4, 8, 8))
+                        # Roll handle
+                        ru, rv = info["roll_handle"]
+                        rx = target.x() + ru * target.width()
+                        ry = target.y() + rv * target.height()
+                        painter.setBrush(QtGui.QColor(255, 180, 40))
+                        painter.setPen(QtGui.QPen(QtGui.QColor(255, 180, 40), 2))
+                        painter.drawEllipse(QtCore.QPointF(rx, ry), 5, 5)
+                        painter.setBrush(Qt.NoBrush)
             if self._drag_start is not None and self._drag_end is not None:
                 color = (
                     QtGui.QColor(80, 220, 255)
@@ -790,6 +967,61 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self._update_canvas_pixmap()
 
 
+class DebugLogDialog(QtWidgets.QDialog):
+    """Non-modal live debug log viewer showing runtime events, timings, and full tracebacks."""
+
+    def __init__(self, parent=None, log_path: str = DEBUG_LOG_PATH):
+        super().__init__(parent)
+        self.setWindowTitle("HDRI Breaker - Debug Log")
+        self.resize(780, 460)
+        self._log_path = log_path
+
+        layout = QtWidgets.QVBoxLayout(self)
+        path_lbl = QtWidgets.QLabel(f"Log file: {log_path}")
+        path_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(path_lbl)
+
+        self.text_edit = QtWidgets.QPlainTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QtGui.QFont("Consolas", 9))
+        self.text_edit.setStyleSheet("background-color: #111318; color: #e2e8f0; border: 1px solid #3a3a3a;")
+        layout.addWidget(self.text_edit, stretch=1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        copy_btn = QtWidgets.QPushButton("Copy All")
+        copy_btn.clicked.connect(self._on_copy)
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.clicked.connect(self._on_clear)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def set_lines(self, lines: List[str]) -> None:
+        self.text_edit.setPlainText("\n".join(lines))
+        sb = self.text_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def append_line(self, line: str) -> None:
+        self.text_edit.appendPlainText(line)
+        sb = self.text_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_copy(self) -> None:
+        cb = QtWidgets.QApplication.clipboard()
+        if cb is not None:
+            cb.setText(self.text_edit.toPlainText())
+
+    def _on_clear(self) -> None:
+        self.text_edit.clear()
+        p = self.parent()
+        if p is not None and hasattr(p, "_debug_lines"):
+            p._debug_lines.clear()
+
+
 class HDRIMakerWidget(QtWidgets.QWidget):
     """Main HDRI Breaker widget for Houdini Solaris."""
 
@@ -824,6 +1056,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         base_pt = self.font().pointSizeF()
         self._base_font_pt: float = float(base_pt) if base_pt > 0 else 9.0
         self._suppress_auto_preview: bool = False
+        self._debug_lines: List[str] = []
+        self._debug_dialog: Optional[DebugLogDialog] = None
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(120)
@@ -899,6 +1133,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         reload_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         reload_btn.clicked.connect(self._on_reload_code)
 
+        debug_btn = QtWidgets.QPushButton("Debug Log")
+        debug_btn.setToolTip(f"Open live Debug Log window (also written to {DEBUG_LOG_PATH})")
+        debug_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        debug_btn.clicked.connect(self._on_open_debug_log)
+
         theme_lbl = QtWidgets.QLabel("Theme:")
         self.theme_combo = QtWidgets.QComboBox()
         self.theme_combo.addItems(list(UI_THEMES.keys()))
@@ -918,6 +1157,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         status_row.addWidget(self.ui_scale_slider)
         status_row.addWidget(save_btn)
         status_row.addWidget(load_btn)
+        status_row.addWidget(debug_btn)
         status_row.addWidget(reload_btn)
         right_layout.addLayout(status_row)
 
@@ -1046,6 +1286,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         mv_btn_grid.addWidget(auto_360_btn, 1, 0)
         mv_btn_grid.addWidget(align_btn, 1, 1)
         mv_btn_grid.addWidget(clear_mv_btn, 1, 2)
+        eq_ev_btn = QtWidgets.QPushButton("Equalize EV")
+        eq_ev_btn.setToolTip("Automatically match exposure across overlapping plates to eliminate brightness seams")
+        eq_ev_btn.clicked.connect(self._on_equalize_plate_exposures)
+        mv_btn_grid.addWidget(eq_ev_btn, 2, 0, 1, 3)
         form.addRow("Multi-Position:", mv_btn_grid)
 
         self.multiview_table = QtWidgets.QTableWidget(0, 6)
@@ -1153,6 +1397,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.gnd_blur_slider.setToolTip("2D wrap-safe blur for the synthesized ground dome to remove horizontal stripes")
         self.hdri_blur_slider = SliderResetControl(0.0, 1.0, 0.0, 0.01)
         self.hdri_blur_slider.setToolTip("360-deg wrap-safe Gaussian-approximate blur for the output HDRI")
+        self.sky_fill_slider = SliderResetControl(0.0, 1.0, 0.0, 0.02)
+        self.sky_fill_slider.setToolTip("Synthesize a physical Rayleigh/Mie sky gradient & HDR sun disc in uncovered upper-hemisphere gaps")
 
         self.inpaint_chk = QtWidgets.QCheckBox("Inpaint Sky/Ground")
         self.inpaint_chk.setChecked(True)
@@ -1183,6 +1429,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         form.addRow("Sky Blur:", self.sky_blur_slider)
         form.addRow("Ground Blur:", self.gnd_blur_slider)
         form.addRow("HDRI Blur:", self.hdri_blur_slider)
+        form.addRow("Physical Sky Fill:", self.sky_fill_slider)
         form.addRow("", self.inpaint_chk)
 
         regen_btn = QtWidgets.QPushButton("Update Preview")
@@ -1212,6 +1459,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.sky_blur_slider,
             self.gnd_blur_slider,
             self.hdri_blur_slider,
+            self.sky_fill_slider,
         ):
             ctrl.valueChanged.connect(self._schedule_preview_update)
         self.vshift_spin.valueChanged.connect(self._on_vshift_changed)
@@ -1335,6 +1583,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.rectSelected.connect(self._on_preview_rect_selected)
         self.preview_label.regionEdited.connect(self._on_preview_region_edited)
         self.preview_label.pixelHovered.connect(self._on_preview_pixel_hovered)
+        self.preview_label.plateSelected.connect(self._on_viewer_plate_selected)
+        self.preview_label.plateDragMoved.connect(self._on_viewer_plate_dragged)
+        self.preview_label.plateDragFinished.connect(self._on_viewer_plate_drag_finished)
+        self.preview_label.plateWheelScaled.connect(self._on_viewer_plate_wheel_scaled)
+        self._selected_plate_idx: int = 0
+        self._updating_plate_ui: bool = False
         layout.addWidget(self.preview_label, stretch=1)
 
         self.inspector_label = QtWidgets.QLabel(
@@ -1346,7 +1600,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row = QtWidgets.QHBoxLayout()
         ev_row.addWidget(QtWidgets.QLabel("View:"))
         self.preview_tonemap_combo = QtWidgets.QComboBox()
-        self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear"])
+        self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear", "Overlap Diff"])
         self.preview_tonemap_combo.setToolTip(
             "Preview display transform (does not affect exported 32-bit float linear EXR)"
         )
@@ -1367,6 +1621,22 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.show_markers_chk.setChecked(False)
         self.show_markers_chk.toggled.connect(self._update_preview_pixmap)
         ev_row.addWidget(self.show_markers_chk)
+
+        self.edit_plates_btn = QtWidgets.QPushButton("Move / Align Plates")
+        self.edit_plates_btn.setCheckable(True)
+        self.edit_plates_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #0e7490; color: #ffffff; font-weight: bold; }"
+        )
+        self.edit_plates_btn.setToolTip(
+            "PTGui-style interactive plate alignment in viewer:\n"
+            "• Click plate to select\n"
+            "• Drag to move Az° / El°\n"
+            "• Shift+Drag or orange top handle to Roll°\n"
+            "• Drag cyan corner handles or Shift+Wheel to Scale FOV°\n"
+            "• Ctrl+Drag to adjust Lens Warp (k1)"
+        )
+        self.edit_plates_btn.toggled.connect(self._toggle_plate_edit_mode)
+        ev_row.addWidget(self.edit_plates_btn)
 
         zoom_out_btn = QtWidgets.QPushButton("-")
         zoom_out_btn.setMaximumWidth(28)
@@ -1434,6 +1704,70 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(undo_light_btn)
         ctrl_row.addWidget(clear_area_btn)
         layout.addLayout(ctrl_row)
+
+        self.plate_transform_bar = QtWidgets.QWidget()
+        pt_layout = QtWidgets.QHBoxLayout(self.plate_transform_bar)
+        pt_layout.setContentsMargins(2, 2, 2, 2)
+        pt_layout.setSpacing(6)
+        self.plate_sel_combo = QtWidgets.QComboBox()
+        self.plate_sel_combo.setMinimumWidth(110)
+        self.plate_sel_combo.currentIndexChanged.connect(self._on_plate_combo_changed)
+        pt_layout.addWidget(QtWidgets.QLabel("Plate:"))
+        pt_layout.addWidget(self.plate_sel_combo)
+
+        def _mk_spin(lo: float, hi: float, val: float, step: float, dec: int = 1) -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setValue(val)
+            sb.setSingleStep(step)
+            sb.setDecimals(dec)
+            sb.setMaximumWidth(70)
+            sb.valueChanged.connect(self._on_plate_spin_changed)
+            return sb
+
+        self.pt_az_spin = _mk_spin(-360.0, 360.0, 0.0, 1.0, 1)
+        self.pt_el_spin = _mk_spin(-89.0, 89.0, 0.0, 1.0, 1)
+        self.pt_roll_spin = _mk_spin(-180.0, 180.0, 0.0, 1.0, 1)
+        self.pt_fov_spin = _mk_spin(10.0, 165.0, 90.0, 1.0, 1)
+        self.pt_sx_spin = _mk_spin(0.3, 3.0, 1.0, 0.02, 2)
+        self.pt_sy_spin = _mk_spin(0.3, 3.0, 1.0, 0.02, 2)
+        self.pt_warp_spin = _mk_spin(-0.45, 0.45, 0.0, 0.01, 2)
+        self.pt_ev_spin = _mk_spin(-4.0, 4.0, 0.0, 0.05, 2)
+        self.pt_vig_spin = _mk_spin(-0.5, 1.5, 0.0, 0.05, 2)
+        self.pt_lens_combo = QtWidgets.QComboBox()
+        self.pt_lens_combo.addItems(["rectilinear", "fisheye_equidistant", "fisheye_equisolid"])
+        self.pt_lens_combo.currentIndexChanged.connect(self._on_plate_spin_changed)
+        self.pt_mask_btn = QtWidgets.QPushButton("Mask Area")
+        self.pt_mask_btn.setCheckable(True)
+        self.pt_mask_btn.setToolTip("Drag a box on the selected plate in the viewer to exclude tripod/moving objects")
+        self.pt_mask_btn.toggled.connect(self._on_toggle_plate_mask_mode)
+        self.pt_clear_mask_btn = QtWidgets.QPushButton("Clear Masks")
+        self.pt_clear_mask_btn.setToolTip("Clear all excluded mask regions on the selected plate")
+        self.pt_clear_mask_btn.clicked.connect(self._on_clear_plate_masks)
+        self.pt_reset_btn = QtWidgets.QPushButton("Reset")
+        self.pt_reset_btn.setToolTip("Reset Roll, Scale X/Y, Lens Warp, EV, and Vignette for selected plate")
+        self.pt_reset_btn.clicked.connect(self._on_reset_plate_transform)
+
+        for lbl, w in (
+            ("Az°:", self.pt_az_spin),
+            ("El°:", self.pt_el_spin),
+            ("Roll°:", self.pt_roll_spin),
+            ("FOV°:", self.pt_fov_spin),
+            ("ScaleX:", self.pt_sx_spin),
+            ("ScaleY:", self.pt_sy_spin),
+            ("Warp:", self.pt_warp_spin),
+            ("EV:", self.pt_ev_spin),
+            ("Vig:", self.pt_vig_spin),
+        ):
+            pt_layout.addWidget(QtWidgets.QLabel(lbl))
+            pt_layout.addWidget(w)
+        pt_layout.addWidget(self.pt_lens_combo)
+        pt_layout.addWidget(self.pt_mask_btn)
+        pt_layout.addWidget(self.pt_clear_mask_btn)
+        pt_layout.addWidget(self.pt_reset_btn)
+        pt_layout.addStretch(1)
+        self.plate_transform_bar.setVisible(False)
+        layout.addWidget(self.plate_transform_bar)
 
         light_row = QtWidgets.QHBoxLayout()
         light_row.addWidget(QtWidgets.QLabel("Light Area Blur:"))
@@ -1522,7 +1856,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.update_lookdev_btn.setMinimumHeight(34)
         self.update_lookdev_btn.clicked.connect(self._on_update_lookdev_clicked)
 
+        self.export_seq_btn = QtWidgets.QPushButton("Export Sequence ($F4)")
+        self.export_seq_btn.setMinimumHeight(34)
+        self.export_seq_btn.setToolTip("Export per-frame 32-bit float Lat/Long EXRs for an analyzed sequence and set $F4 path")
+        self.export_seq_btn.clicked.connect(self._on_export_sequence_exr)
+
         btn_row.addWidget(self.export_btn)
+        btn_row.addWidget(self.export_seq_btn)
         btn_row.addWidget(self.dome_btn)
         btn_row.addWidget(self.rig_btn)
         btn_row.addWidget(self.update_lookdev_btn)
@@ -1633,12 +1973,40 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._thumb_cache[key] = icon
         return icon
 
-    def _add_multiview_row(self, path: str, az: float, el: float, fov: float, cs: str) -> None:
+    def _add_multiview_row(
+        self,
+        path: str,
+        az: float,
+        el: float,
+        fov: float,
+        cs: str,
+        roll: float = 0.0,
+        scale_x: float = 1.0,
+        scale_y: float = 1.0,
+        warp_k1: float = 0.0,
+        lens_type: str = "rectilinear",
+        exposure_ev: float = 0.0,
+        vignette_v1: float = 0.0,
+        exclude_rects: Optional[List[Tuple[float, float, float, float]]] = None,
+    ) -> None:
         row = self.multiview_table.rowCount()
         self.multiview_table.insertRow(row)
 
         file_item = QtWidgets.QTableWidgetItem(os.path.basename(path))
         file_item.setData(Qt.UserRole, path)
+        file_item.setData(
+            Qt.UserRole + 1,
+            {
+                "roll": float(roll),
+                "scale_x": float(scale_x),
+                "scale_y": float(scale_y),
+                "warp_k1": float(warp_k1),
+                "lens_type": str(lens_type or "rectilinear"),
+                "exposure_ev": float(exposure_ev),
+                "vignette_v1": float(vignette_v1),
+                "exclude_rects": [list(r) for r in (exclude_rects or [])],
+            },
+        )
         file_item.setToolTip(path)
         file_item.setFlags(file_item.flags() & ~Qt.ItemIsEditable)
         thumb_icon = self._make_plate_thumbnail(path, cs)
@@ -1737,7 +2105,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             az = ((start_idx + i) * (360.0 / max(total, 1)))
             if az > 180.0:
                 az -= 360.0
-            self._add_multiview_row(p, az, el, fov, cs)
+            meta = read_plate_metadata(p)
+            plate_fov = meta["fov_h_deg"] if meta.get("fov_h_deg") is not None else fov
+            plate_roll = float(meta.get("roll_deg", 0.0))
+            self._add_multiview_row(p, az, el, plate_fov, cs, roll=plate_roll)
         self._maybe_update_default_output_path(paths[0])
         self.status_label.setText(f"Added {len(paths)} plate(s) to multi-view list.")
 
@@ -1745,12 +2116,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         p = self.plate_path_edit.text().strip()
         if not p:
             return
+        meta = read_plate_metadata(p)
+        plate_fov = meta["fov_h_deg"] if meta.get("fov_h_deg") is not None else self.fov_spin.value()
+        plate_roll = float(meta.get("roll_deg", 0.0))
         self._add_multiview_row(
             p,
             self.cam_az_spin.value(),
             self.cam_el_spin.value(),
-            self.fov_spin.value(),
+            plate_fov,
             self.colorspace_combo.currentText(),
+            roll=plate_roll,
         )
 
     def _on_auto_distribute_360(self) -> None:
@@ -1796,9 +2171,40 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             for row, v in enumerate(aligned):
                 self.multiview_table.item(row, 1).setText(f"{v.cam_azimuth_deg:.1f}")
                 self.multiview_table.item(row, 2).setText(f"{v.cam_elevation_deg:.1f}")
-            self.status_label.setText(f"Auto-aligned {len(aligned)} overlapping plates (Spherical NCC).")
+                self.multiview_table.item(row, 3).setText(f"{v.fov_h_deg:.1f}")
+                item0 = self.multiview_table.item(row, 0)
+                if item0 is not None:
+                    extra = dict(item0.data(Qt.UserRole + 1) or {})
+                    extra["roll"] = float(v.cam_roll_deg)
+                    extra["warp_k1"] = float(v.warp_k1)
+                    item0.setData(Qt.UserRole + 1, extra)
+            if self._views and len(self._views) == len(aligned):
+                for idx, v in enumerate(aligned):
+                    self._views[idx].cam_azimuth_deg = v.cam_azimuth_deg
+                    self._views[idx].cam_elevation_deg = v.cam_elevation_deg
+                    self._views[idx].cam_roll_deg = v.cam_roll_deg
+                    self._views[idx].fov_h_deg = v.fov_h_deg
+                    self._views[idx].warp_k1 = v.warp_k1
+                self._refresh_plate_transform_bar()
+                self._regenerate_preview()
+            self.status_label.setText(f"Auto-aligned {len(aligned)} overlapping plates (Az, El, Roll, FOV, Warp).")
         except Exception as exc:
             self.status_label.setText(f"Auto-align error: {exc}")
+
+    def _on_equalize_plate_exposures(self) -> None:
+        if len(self._views) < 2:
+            self.status_label.setText("Analyze at least 2 overlapping plates before equalizing EV.")
+            return
+        try:
+            eq = auto_equalize_plate_exposures(self._views)
+            for idx, v in enumerate(eq):
+                self._views[idx].exposure_ev = v.exposure_ev
+                self._sync_view_to_table_and_bar(idx)
+            self._regenerate_preview()
+            self.status_label.setText(f"Equalized exposure across {len(eq)} overlapping plates.")
+        except Exception as exc:
+            self._log_debug(f"Equalize EV error: {exc}\n{traceback.format_exc()}")
+            self.status_label.setText(f"Equalize EV error: {exc}")
 
     def _on_browse_output(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1843,6 +2249,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             ground_rect=self._ground_rect,
             light_rect=self._light_regions[0]["rect"] if self._light_regions else None,
             remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
+            physical_sky_fill=self.sky_fill_slider.value(),
         )
 
     def _current_light_shape(self) -> str:
@@ -1859,6 +2266,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _toggle_pick_mode(self, mode: str, checked: bool) -> None:
         if checked:
+            if hasattr(self, "edit_plates_btn") and self.edit_plates_btn.isChecked():
+                self.edit_plates_btn.setChecked(False)
             if mode != "sky":
                 self.pick_sky_btn.setChecked(False)
             if mode != "ground":
@@ -1883,6 +2292,204 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             wb_on = hasattr(self, "pick_wb_btn") and self.pick_wb_btn.isChecked()
             if not (self.pick_sky_btn.isChecked() or self.pick_gnd_btn.isChecked() or self.pick_light_btn.isChecked() or wb_on):
                 self.preview_label.set_pick_mode(None)
+
+    def _toggle_plate_edit_mode(self, checked: bool) -> None:
+        self._log_debug(f"Move/Align Plates toggled: {checked} (views={len(self._views)})")
+        if checked:
+            for btn in (self.pick_sky_btn, self.pick_gnd_btn, self.pick_light_btn):
+                btn.setChecked(False)
+            if hasattr(self, "pick_wb_btn"):
+                self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "pt_mask_btn"):
+                self.pt_mask_btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+            if self._views and not (0 <= self._selected_plate_idx < len(self._views)):
+                self._selected_plate_idx = 0
+            self._refresh_plate_transform_bar()
+            self.status_label.setText(
+                "Move / Align Plates: Click plate to select | Drag=Az/El | Shift+Drag or orange dot=Roll | "
+                "Corner handle or Shift+Wheel=FOV Scale | Ctrl+Drag=Lens Warp"
+            )
+        self.plate_transform_bar.setVisible(bool(checked))
+        self.preview_label.set_plate_edit_mode(checked)
+        self._update_preview_pixmap()
+
+    def _refresh_plate_transform_bar(self) -> None:
+        self._updating_plate_ui = True
+        try:
+            self.plate_sel_combo.clear()
+            for i, v in enumerate(self._views):
+                name = os.path.basename(v.source_path) if v.source_path else f"Plate #{i + 1}"
+                self.plate_sel_combo.addItem(f"#{i + 1}: {name}")
+            has_sel = 0 <= self._selected_plate_idx < len(self._views)
+            if has_sel:
+                self.plate_sel_combo.setCurrentIndex(self._selected_plate_idx)
+                v = self._views[self._selected_plate_idx]
+                self.pt_az_spin.setValue(float(v.cam_azimuth_deg))
+                self.pt_el_spin.setValue(float(v.cam_elevation_deg))
+                self.pt_roll_spin.setValue(float(v.cam_roll_deg))
+                self.pt_fov_spin.setValue(float(v.fov_h_deg))
+                self.pt_sx_spin.setValue(float(v.scale_x))
+                self.pt_sy_spin.setValue(float(v.scale_y))
+                self.pt_warp_spin.setValue(float(v.warp_k1))
+                self.pt_ev_spin.setValue(float(v.exposure_ev))
+                self.pt_vig_spin.setValue(float(v.vignette_v1))
+                self.pt_lens_combo.setCurrentText(str(v.lens_type or "rectilinear"))
+            for w in (
+                self.pt_az_spin,
+                self.pt_el_spin,
+                self.pt_roll_spin,
+                self.pt_fov_spin,
+                self.pt_sx_spin,
+                self.pt_sy_spin,
+                self.pt_warp_spin,
+                self.pt_ev_spin,
+                self.pt_vig_spin,
+                self.pt_lens_combo,
+                self.pt_mask_btn,
+                self.pt_clear_mask_btn,
+                self.pt_reset_btn,
+            ):
+                w.setEnabled(has_sel)
+        finally:
+            self._updating_plate_ui = False
+
+    def _sync_view_to_table_and_bar(self, idx: int) -> None:
+        if not (0 <= idx < len(self._views)):
+            return
+        v = self._views[idx]
+        if idx < self.multiview_table.rowCount():
+            item0 = self.multiview_table.item(idx, 0)
+            if item0 is not None:
+                item0.setData(
+                    Qt.UserRole + 1,
+                    {
+                        "roll": float(v.cam_roll_deg),
+                        "scale_x": float(v.scale_x),
+                        "scale_y": float(v.scale_y),
+                        "warp_k1": float(v.warp_k1),
+                        "lens_type": str(v.lens_type or "rectilinear"),
+                        "exposure_ev": float(v.exposure_ev),
+                        "vignette_v1": float(v.vignette_v1),
+                        "exclude_rects": [list(r) for r in (v.exclude_rects or [])],
+                    },
+                )
+            for col, text in (
+                (1, f"{v.cam_azimuth_deg:.1f}"),
+                (2, f"{v.cam_elevation_deg:.1f}"),
+                (3, f"{v.fov_h_deg:.1f}"),
+            ):
+                it = self.multiview_table.item(idx, col)
+                if it is not None:
+                    it.setText(text)
+        elif len(self._views) == 1 and idx == 0:
+            self.cam_az_spin.setValue(float(v.cam_azimuth_deg))
+            self.cam_el_spin.setValue(float(v.cam_elevation_deg))
+            self.fov_spin.setValue(float(v.fov_h_deg))
+        self._refresh_plate_transform_bar()
+
+    def _on_plate_combo_changed(self, idx: int) -> None:
+        if self._updating_plate_ui:
+            return
+        self._selected_plate_idx = int(idx)
+        self._refresh_plate_transform_bar()
+        self._update_preview_pixmap()
+
+    def _on_plate_spin_changed(self) -> None:
+        if self._updating_plate_ui:
+            return
+        idx = self._selected_plate_idx
+        if not (0 <= idx < len(self._views)):
+            return
+        v = self._views[idx]
+        v.cam_azimuth_deg = float(self.pt_az_spin.value())
+        v.cam_elevation_deg = float(self.pt_el_spin.value())
+        v.cam_roll_deg = float(self.pt_roll_spin.value())
+        v.fov_h_deg = float(self.pt_fov_spin.value())
+        v.scale_x = float(self.pt_sx_spin.value())
+        v.scale_y = float(self.pt_sy_spin.value())
+        v.warp_k1 = float(self.pt_warp_spin.value())
+        v.exposure_ev = float(self.pt_ev_spin.value())
+        v.vignette_v1 = float(self.pt_vig_spin.value())
+        v.lens_type = self.pt_lens_combo.currentText()
+        self._sync_view_to_table_and_bar(idx)
+        self._schedule_preview_update()
+
+    def _on_reset_plate_transform(self) -> None:
+        idx = self._selected_plate_idx
+        if not (0 <= idx < len(self._views)):
+            return
+        v = self._views[idx]
+        v.cam_roll_deg = 0.0
+        v.scale_x = 1.0
+        v.scale_y = 1.0
+        v.warp_k1 = 0.0
+        v.exposure_ev = 0.0
+        v.vignette_v1 = 0.0
+        v.lens_type = "rectilinear"
+        self._sync_view_to_table_and_bar(idx)
+        self._regenerate_preview(fast=False)
+
+    def _on_toggle_plate_mask_mode(self, checked: bool) -> None:
+        if checked:
+            self.preview_label.set_pick_mode("plate_mask", shape="rect")
+            self.status_label.setText(
+                f"Drag a box over Plate #{self._selected_plate_idx + 1} in the viewer to exclude that region."
+            )
+        else:
+            self.preview_label.set_pick_mode(None)
+
+    def _on_clear_plate_masks(self) -> None:
+        idx = self._selected_plate_idx
+        if not (0 <= idx < len(self._views)):
+            return
+        self._views[idx].exclude_rects = []
+        self._sync_view_to_table_and_bar(idx)
+        self._regenerate_preview(fast=False)
+        self.status_label.setText(f"Cleared exclude masks on Plate #{idx + 1}.")
+
+    def _on_viewer_plate_selected(self, idx: int) -> None:
+        self._selected_plate_idx = int(idx)
+        self._refresh_plate_transform_bar()
+        self._update_preview_pixmap()
+
+    def _on_viewer_plate_dragged(self, idx: int, du: float, dv: float, mode: str) -> None:
+        if not (0 <= idx < len(self._views)):
+            return
+        v = self._views[idx]
+        if mode == "move":
+            az = (v.cam_azimuth_deg + du * 360.0 + 180.0) % 360.0 - 180.0
+            el = float(np.clip(v.cam_elevation_deg - dv * 180.0, -89.0, 89.0))
+            v.cam_azimuth_deg = az
+            v.cam_elevation_deg = el
+        elif mode == "roll":
+            roll = (v.cam_roll_deg + du * 240.0 + 180.0) % 360.0 - 180.0
+            v.cam_roll_deg = roll
+        elif mode == "scale":
+            v.fov_h_deg = float(np.clip(v.fov_h_deg + (du - dv) * 140.0, 10.0, 165.0))
+        elif mode == "warp":
+            v.warp_k1 = float(np.clip(v.warp_k1 + du * 1.0, -0.45, 0.45))
+        self._refresh_plate_transform_bar()
+        self._regenerate_preview(fast=True)
+
+    def _on_viewer_plate_drag_finished(self, idx: int) -> None:
+        if 0 <= idx < len(self._views):
+            v = self._views[idx]
+            self._log_debug(
+                f"Plate #{idx + 1} aligned: Az={v.cam_azimuth_deg:.1f}, El={v.cam_elevation_deg:.1f}, "
+                f"Roll={v.cam_roll_deg:.1f}, FOV={v.fov_h_deg:.1f}, Warp={v.warp_k1:.2f}"
+            )
+        self._sync_view_to_table_and_bar(idx)
+        self._regenerate_preview(fast=False)
+
+    def _on_viewer_plate_wheel_scaled(self, idx: int, delta: float) -> None:
+        if not (0 <= idx < len(self._views)):
+            return
+        v = self._views[idx]
+        step = 2.0 if delta > 0 else -2.0
+        v.fov_h_deg = float(np.clip(v.fov_h_deg + step, 10.0, 165.0))
+        self._sync_view_to_table_and_bar(idx)
+        self._schedule_preview_update()
 
     def _on_undo_light(self) -> None:
         if self._light_regions:
@@ -1921,6 +2528,26 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self.pick_wb_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
             self._apply_neutral_wb_patch(rect)
+            return
+        elif mode == "plate_mask":
+            if hasattr(self, "pt_mask_btn"):
+                self.pt_mask_btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+            idx = self._selected_plate_idx
+            if 0 <= idx < len(self._views):
+                mapped = equirect_rect_to_plate_rect(
+                    self._views[idx],
+                    rect,
+                    azimuth_offset_deg=self.yaw_spin.value(),
+                    vertical_shift_deg=self.vshift_spin.value(),
+                )
+                if mapped is not None:
+                    self._views[idx].exclude_rects.append(mapped)
+                    self._sync_view_to_table_and_bar(idx)
+                    self._regenerate_preview(fast=False)
+                    self.status_label.setText(
+                        f"Added exclude mask to Plate #{idx + 1} ({len(self._views[idx].exclude_rects)} total)."
+                    )
             return
         else:
             shape = self._current_light_shape()
@@ -2079,16 +2706,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _on_analyze_clicked(self) -> None:
         n_mv = self.multiview_table.rowCount()
+        self._log_debug(f"Analyze clicked: multiview_rows={n_mv}")
         if n_mv > 0:
             try:
                 views: List[PlateViewInput] = []
                 for row in range(n_mv):
-                    fpath = self.multiview_table.item(row, 0).data(Qt.UserRole)
+                    item0 = self.multiview_table.item(row, 0)
+                    fpath = item0.data(Qt.UserRole)
+                    extra = item0.data(Qt.UserRole + 1) or {}
                     az = float(self.multiview_table.item(row, 1).text())
                     el = float(self.multiview_table.item(row, 2).text())
                     fov = float(self.multiview_table.item(row, 3).text())
                     cs = self.multiview_table.item(row, 4).text() or "Auto"
+                    self._log_debug(f"Reading multiview plate #{row + 1}: {fpath} (az={az}, el={el}, fov={fov}, cs={cs})")
                     plate = read_plate(fpath, colorspace=cs, max_dim=4096)
+                    self._log_debug(f"Loaded plate #{row + 1}: shape={plate.pixels.shape}, is_hdr={plate.is_hdr}")
                     views.append(
                         PlateViewInput(
                             pixels=plate.pixels,
@@ -2097,15 +2729,27 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                             fov_h_deg=fov,
                             cam_azimuth_deg=az,
                             cam_elevation_deg=el,
+                            cam_roll_deg=float(extra.get("roll", 0.0)),
+                            scale_x=float(extra.get("scale_x", 1.0)),
+                            scale_y=float(extra.get("scale_y", 1.0)),
+                            warp_k1=float(extra.get("warp_k1", 0.0)),
+                            lens_type=str(extra.get("lens_type", "rectilinear")),
+                            exposure_ev=float(extra.get("exposure_ev", 0.0)),
+                            vignette_v1=float(extra.get("vignette_v1", 0.0)),
+                            exclude_rects=[tuple(r) for r in (extra.get("exclude_rects") or [])],
                         )
                     )
                 self._views = views
+                self._selected_plate_idx = min(max(0, self._selected_plate_idx), len(views) - 1) if views else -1
+                self._refresh_plate_transform_bar()
                 self._frame_profiles = []
+                self._log_debug("Running analyze_multiview_plates...")
                 self._profile = analyze_multiview_plates(
                     views,
                     max_hotspots=self.max_hotspots_spin.value(),
                     ldr_highlight_boost=self.ldr_boost_spin.value(),
                 )
+                self._log_debug(f"Analysis done: CCT={self._profile.overall_cct_kelvin:.0f}K, hotspots={len(self._profile.hotspots)}")
                 self._populate_analysis_ui(self._profile, len(views))
                 self._regenerate_preview()
                 self.status_label.setText(
@@ -2114,6 +2758,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     f"Hotspots: {len(self._profile.hotspots)}."
                 )
             except Exception as exc:
+                self._log_debug(f"Multi-view analysis error: {exc}\n{traceback.format_exc()}")
                 self.status_label.setText(f"Multi-view analysis error: {exc}")
             return
 
@@ -2179,6 +2824,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 if len(self._frame_profiles) == 1
                 else merge_lighting_profiles(self._frame_profiles)
             )
+            self._selected_plate_idx = 0 if self._views else -1
+            self._refresh_plate_transform_bar()
             self._populate_analysis_ui(self._profile, len(self._frame_profiles))
             self._regenerate_preview()
             self.status_label.setText(
@@ -2187,6 +2834,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 f"Hotspots: {len(self._profile.hotspots)}."
             )
         except Exception as exc:
+            self._log_debug(f"Analysis error: {exc}\n{traceback.format_exc()}")
             self.status_label.setText(f"Analysis error: {exc}")
 
     def _populate_analysis_ui(self, prof: LightingProfile, n_frames: int) -> None:
@@ -2235,30 +2883,47 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.hotspot_table.setItem(row, col, item)
 
-    def _regenerate_preview(self) -> None:
+    def _regenerate_preview(self, fast: bool = False) -> None:
         if self._profile is None:
             return
-        # Crisp 2K preview (cached projection makes slider scrubbing fast)
-        p = self._current_synthesis_params()
-        p.width = min(p.width, 2048)
-        p.height = min(p.height, 1024)
-        hdri = generate_latlong_hdri(
-            self._profile,
-            p,
-            views=self._views if len(self._views) <= 12 else self._views[:1],
-        )
-        if self._light_regions:
-            hdri, extracted = extract_and_inpaint_multiple_hotspots(
-                hdri,
-                self._light_regions,
-                inpaint_hdri=self.remove_hotspot_chk.isChecked(),
-                region_blur=self.light_blur_slider.value(),
+        try:
+            # Crisp 2K preview (or 640x320 during interactive plate dragging)
+            p = self._current_synthesis_params()
+            if fast:
+                p.width = min(p.width, 400)
+                p.height = min(p.height, 200)
+                p.enable_inpaint = False
+            else:
+                p.width = min(p.width, 2048)
+                p.height = min(p.height, 1024)
+            if not fast:
+                self._log_debug(f"Regenerating preview ({p.width}x{p.height}), views={len(self._views)}")
+            hdri = generate_latlong_hdri(
+                self._profile,
+                p,
+                views=self._views if len(self._views) <= 12 else self._views[:1],
             )
-            self._extracted_lights = extracted
-        else:
-            self._extracted_lights = []
-        self._hdri_pixels = hdri
-        self._update_preview_pixmap()
+            if not fast:
+                self._log_debug(f"generate_latlong_hdri finished: shape={hdri.shape}")
+            if (not fast) and self._light_regions:
+                hdri, extracted = extract_and_inpaint_multiple_hotspots(
+                    hdri,
+                    self._light_regions,
+                    inpaint_hdri=self.remove_hotspot_chk.isChecked(),
+                    region_blur=self.light_blur_slider.value(),
+                )
+                self._extracted_lights = extracted
+            elif not self._light_regions:
+                self._extracted_lights = []
+            self._hdri_pixels = hdri
+            if not fast:
+                self._log_debug("Updating preview pixmap...")
+            self._update_preview_pixmap()
+            if not fast:
+                self._log_debug("Preview pixmap updated.")
+        except Exception as exc:
+            self._log_debug(f"Preview generation error: {exc}\n{traceback.format_exc()}")
+            self.status_label.setText(f"Preview error: {exc}")
 
     def _update_preview_pixmap(self) -> None:
         if self._hdri_pixels is None:
@@ -2266,8 +2931,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev = self.preview_ev_slider.value() / 10.0
         self.preview_ev_val.setText(f"{ev:+.1f} EV")
         tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
-        srgb = render_preview_srgb(self._hdri_pixels, preview_ev=ev, tonemap=tm_mode)
+        if tm_mode == "Overlap Diff" and self._views:
+            diff_rgb = compute_overlap_difference_map(
+                self._views if len(self._views) <= 12 else self._views[:1],
+                out_width=min(1024, self._hdri_pixels.shape[1]),
+                out_height=min(512, self._hdri_pixels.shape[0]),
+                azimuth_offset_deg=self.yaw_spin.value(),
+                vertical_shift_deg=self.vshift_spin.value(),
+            )
+            srgb = np.clip(diff_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+        else:
+            srgb = render_preview_srgb(self._hdri_pixels, preview_ev=ev, tonemap=tm_mode)
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
+        self.preview_label.set_plate_overlay(
+            self._views if len(self._views) <= 12 else self._views[:1],
+            self._selected_plate_idx,
+            self.yaw_spin.value(),
+            self.vshift_spin.value(),
+        )
         h, w, _ = srgb.shape
         qimg = QtGui.QImage(srgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg.copy())
@@ -2310,6 +2991,39 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             painter.end()
 
         self.preview_label.set_source_pixmap(pix)
+
+    def _on_export_sequence_exr(self) -> Optional[str]:
+        if not self._frame_profiles:
+            self.status_label.setText("Analyze a sequence first (Mode != Single Frame) before exporting sequence EXRs.")
+            return None
+        out_path = self.out_path_edit.text().strip()
+        if not out_path:
+            self.status_label.setText("Specify an Output EXR path first.")
+            return None
+        if "$F" not in out_path and "#" not in out_path:
+            stem, ext = os.path.splitext(out_path)
+            out_path = f"{stem}.$F4{ext or '.exr'}"
+        try:
+            p = self._current_synthesis_params()
+            cs = self.out_cs_combo.currentText()
+            pattern, written = export_hdri_sequence(
+                self._frame_profiles,
+                self._views,
+                p,
+                output_pattern=out_path,
+                output_colorspace=cs,
+                light_regions=self._light_regions,
+                inpaint_lights=self.remove_hotspot_chk.isChecked(),
+                light_blur=self.light_blur_slider.value(),
+            )
+            self.out_path_edit.setText(pattern)
+            self.status_label.setText(f"Exported {len(written)} 32-bit float EXR frame(s): {pattern}")
+            self._log_debug(f"Exported sequence ({len(written)} frames): {pattern}")
+            return pattern
+        except Exception as exc:
+            self._log_debug(f"Sequence export error: {exc}\n{traceback.format_exc()}")
+            self.status_label.setText(f"Sequence export error: {exc}")
+            return None
 
     def _on_export_exr(self) -> Optional[str]:
         if self._profile is None:
@@ -2611,6 +3325,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             _FLOATING_WINDOW = None
         super().closeEvent(event)
 
+    def _log_debug(self, msg: str) -> None:
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{ts}] {msg}"
+        self._debug_lines.append(line)
+        if len(self._debug_lines) > 2000:
+            self._debug_lines = self._debug_lines[-1500:]
+        if self._debug_dialog is not None and self._debug_dialog.isVisible():
+            self._debug_dialog.append_line(line)
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+        except Exception:
+            pass
+
+    def _on_open_debug_log(self) -> None:
+        if self._debug_dialog is None:
+            self._debug_dialog = DebugLogDialog(parent=self, log_path=DEBUG_LOG_PATH)
+        self._debug_dialog.set_lines(self._debug_lines)
+        self._debug_dialog.show()
+        self._debug_dialog.raise_()
+        self._debug_dialog.activateWindow()
+
     def _on_reload_code(self) -> None:
         self._auto_save_session()
         import hdri_maker
@@ -2623,13 +3360,23 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         """Serialize all UI settings, multi-view plates, and inpaint rects."""
         mv_rows = []
         for row in range(self.multiview_table.rowCount()):
+            item0 = self.multiview_table.item(row, 0)
+            extra = item0.data(Qt.UserRole + 1) or {}
             mv_rows.append(
                 {
-                    "path": self.multiview_table.item(row, 0).data(Qt.UserRole),
+                    "path": item0.data(Qt.UserRole),
                     "az": float(self.multiview_table.item(row, 1).text()),
                     "el": float(self.multiview_table.item(row, 2).text()),
                     "fov": float(self.multiview_table.item(row, 3).text()),
                     "colorspace": self.multiview_table.item(row, 4).text(),
+                    "roll": float(extra.get("roll", 0.0)),
+                    "scale_x": float(extra.get("scale_x", 1.0)),
+                    "scale_y": float(extra.get("scale_y", 1.0)),
+                    "warp_k1": float(extra.get("warp_k1", 0.0)),
+                    "lens_type": str(extra.get("lens_type", "rectilinear")),
+                    "exposure_ev": float(extra.get("exposure_ev", 0.0)),
+                    "vignette_v1": float(extra.get("vignette_v1", 0.0)),
+                    "exclude_rects": [list(r) for r in (extra.get("exclude_rects") or [])],
                 }
             )
         return {
@@ -2671,6 +3418,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "sky_blur": self.sky_blur_slider.value(),
             "ground_blur": self.gnd_blur_slider.value(),
             "hdri_blur": self.hdri_blur_slider.value(),
+            "physical_sky_fill": self.sky_fill_slider.value(),
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -2735,6 +3483,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     float(row_d.get("el", 0.0)),
                     float(row_d.get("fov", 90.0)),
                     str(row_d.get("colorspace", "Auto")),
+                    roll=float(row_d.get("roll", 0.0)),
+                    scale_x=float(row_d.get("scale_x", 1.0)),
+                    scale_y=float(row_d.get("scale_y", 1.0)),
+                    warp_k1=float(row_d.get("warp_k1", 0.0)),
+                    lens_type=str(row_d.get("lens_type", "rectilinear")),
+                    exposure_ev=float(row_d.get("exposure_ev", 0.0)),
+                    vignette_v1=float(row_d.get("vignette_v1", 0.0)),
+                    exclude_rects=[tuple(r) for r in (row_d.get("exclude_rects") or [])],
                 )
 
         if "resolution" in data:
@@ -2767,6 +3523,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.sky_blur_slider.setValue(float(data.get("sky_blur", 0.0)))
         self.gnd_blur_slider.setValue(float(data.get("ground_blur", 0.0)))
         self.hdri_blur_slider.setValue(float(data.get("hdri_blur", 0.0)))
+        self.sky_fill_slider.setValue(float(data.get("physical_sky_fill", 0.0)))
 
         sr = data.get("sky_rect")
         self._sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None

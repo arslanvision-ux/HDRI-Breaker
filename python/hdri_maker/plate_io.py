@@ -6,10 +6,11 @@ Uses OpenImageIO (bundled with Houdini 20+) with a PIL fallback for LDR plates.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -344,12 +345,10 @@ def downsample_image(pixels: np.ndarray, max_dim: int = 512) -> np.ndarray:
     x1 = np.minimum(x0 + 1, w - 1)
     fy = (yy - y0)[:, None, None]
     fx = (xx - x0)[None, :, None]
-    out = (
-        work[np.ix_(y0, x0)] * (1.0 - fx) * (1.0 - fy)
-        + work[np.ix_(y0, x1)] * fx * (1.0 - fy)
-        + work[np.ix_(y1, x0)] * (1.0 - fx) * fy
-        + work[np.ix_(y1, x1)] * fx * fy
-    )
+    out = work[np.ix_(y0, x0)] * ((1.0 - fx) * (1.0 - fy))
+    out += work[np.ix_(y0, x1)] * (fx * (1.0 - fy))
+    out += work[np.ix_(y1, x0)] * ((1.0 - fx) * fy)
+    out += work[np.ix_(y1, x1)] * (fx * fy)
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
@@ -516,3 +515,91 @@ def merge_ldr_brackets_to_hdr(
 
     merged = accum_hdr / np.maximum(accum_w, 1e-5)
     return np.ascontiguousarray(np.maximum(merged, 0.0), dtype=np.float32)
+
+
+def read_plate_metadata(path: str) -> Dict[str, Any]:
+    """
+    Extract camera FOV (horizontal degrees) and roll orientation (degrees) from
+    EXIF / OpenImageIO metadata when available.
+
+    Returns:
+        {"fov_h_deg": Optional[float], "roll_deg": float, "focal_mm": Optional[float]}
+    """
+    result: Dict[str, Any] = {"fov_h_deg": None, "roll_deg": 0.0, "focal_mm": None}
+    if not path or not os.path.isfile(path):
+        return result
+
+    focal_35: Optional[float] = None
+    focal_mm: Optional[float] = None
+    orient: int = 1
+    width: int = 0
+    height: int = 0
+
+    if HAS_OIIO:
+        try:
+            inp = oiio.ImageInput.open(path)
+            if inp is not None:
+                spec = inp.spec()
+                width, height = int(spec.width), int(spec.height)
+                for key in ("Exif:FocalLengthIn35mmFilm", "FocalLengthIn35mmFilm"):
+                    val = spec.get_float_attribute(key, 0.0)
+                    if val > 1.0:
+                        focal_35 = float(val)
+                        break
+                for key in ("Exif:FocalLength", "FocalLength", "cameraFocalLength"):
+                    val = spec.get_float_attribute(key, 0.0)
+                    if val > 1.0:
+                        focal_mm = float(val)
+                        break
+                orient = int(spec.get_int_attribute("Orientation", 1))
+                inp.close()
+        except Exception:
+            pass
+
+    if focal_35 is None and HAS_PIL:
+        try:
+            with Image.open(path) as im:
+                width, height = im.size
+                exif = im.getexif() if hasattr(im, "getexif") else None
+                if exif:
+                    # 41989 = FocalLengthIn35mmFilm, 37386 = FocalLength, 274 = Orientation
+                    f35 = exif.get(41989)
+                    if f35 and float(f35) > 1.0:
+                        focal_35 = float(f35)
+                    fl = exif.get(37386)
+                    if fl is not None:
+                        focal_mm = float(fl)
+                    ori = exif.get(274)
+                    if ori is not None:
+                        orient = int(ori)
+        except Exception:
+            pass
+
+    if orient == 6:
+        result["roll_deg"] = -90.0
+    elif orient == 8:
+        result["roll_deg"] = 90.0
+    elif orient == 3:
+        result["roll_deg"] = 180.0
+
+    used_focal = focal_35 if focal_35 is not None else focal_mm
+    if used_focal is not None and used_focal > 1.0:
+        # 36mm full-frame sensor width baseline; adjust if portrait aspect
+        sensor_w = 36.0 if width >= height or height == 0 else 24.0
+        fov_rad = 2.0 * math.atan(sensor_w / (2.0 * used_focal))
+        result["fov_h_deg"] = float(np.clip(math.degrees(fov_rad), 10.0, 165.0))
+        result["focal_mm"] = float(used_focal)
+    return result
+
+
+def format_frame_path(pattern: str, frame: int) -> str:
+    """Expand Houdini frame tokens ($F4, $F, ####) in an output path for a given frame."""
+    if "$F" in pattern:
+        def _repl_f(m: re.Match) -> str:
+            pad = int(m.group(1)) if m.group(1) else 1
+            return str(int(frame)).zfill(pad)
+        return re.sub(r"\$F(\d*)", _repl_f, pattern)
+    if "#" in pattern:
+        return re.sub(r"#+", lambda m: str(int(frame)).zfill(len(m.group(0))), pattern)
+    stem, ext = os.path.splitext(pattern)
+    return f"{stem}.{int(frame):04d}{ext or '.exr'}"

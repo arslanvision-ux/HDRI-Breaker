@@ -294,6 +294,14 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertTrue(g_mtl.IsValid())
         self.assertTrue(g_mtl.GetAttribute("outputs:karma:surface").IsValid())
         self.assertTrue(g_mtl.GetAttribute("outputs:arnold:surface").IsValid())
+        self.assertTrue(g_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
+        rs_std = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/RedshiftStd")
+        self.assertTrue(rs_std.IsValid())
+        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_weight").Get()), 0.0, places=5)
+        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:coat_weight").Get()), 0.0, places=5)
+        mb_mtl = stage.GetPrimAtPath("/lookdev/materials/macbeth_00")
+        self.assertTrue(mb_mtl.IsValid())
+        self.assertTrue(mb_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
 
         # Verify Shadow Catcher (Matte) sets Karma holdoutmode=2, Arnold shadow_matte, and Redshift matte primvars
         sc_lop = create_or_update_lookdev_and_ground(
@@ -439,6 +447,107 @@ class TestHDRIMaker(unittest.TestCase):
             self.assertAlmostEqual(sampled[0], gains[0], places=3)
             self.assertAlmostEqual(sampled[1], gains[1], places=3)
             self.assertAlmostEqual(sampled[2], gains[2], places=3)
+
+    def test_plate_transform_roll_scale_warp_and_hit_test(self):
+        from hdri_maker.lighting_analyzer import (
+            compute_plate_outline_uv,
+            hit_test_plate_uv,
+            project_multiview_plates_to_latlong,
+        )
+
+        img = np.zeros((64, 96, 3), dtype=np.float32)
+        img[:32, :, 0] = 1.0  # top half red
+        img[32:, :, 2] = 1.0  # bottom half blue
+
+        v0 = PlateViewInput(pixels=img, is_hdr=True, fov_h_deg=60.0, cam_azimuth_deg=0.0, cam_elevation_deg=0.0)
+        v1 = PlateViewInput(
+            pixels=img,
+            is_hdr=True,
+            fov_h_deg=60.0,
+            cam_azimuth_deg=90.0,
+            cam_elevation_deg=15.0,
+            cam_roll_deg=25.0,
+            scale_x=1.2,
+            scale_y=0.9,
+            warp_k1=0.2,
+        )
+
+        # Hit test center of v0 (u=0.5, v=0.5) and v1 (az=90 -> u=0.75, el=15 -> v=0.5 - 15/180)
+        self.assertEqual(hit_test_plate_uv([v0, v1], 0.5, 0.5), 0)
+        self.assertEqual(hit_test_plate_uv([v0, v1], 0.75, 0.5 - 15.0 / 180.0), 1)
+        self.assertIsNone(hit_test_plate_uv([v0, v1], 0.1, 0.1))
+
+        # Outline computation
+        outline = compute_plate_outline_uv(v1)
+        self.assertGreaterEqual(len(outline["polylines"]), 1)
+        self.assertEqual(len(outline["corners"]), 4)
+
+        # Projection with roll, scale, warp produces finite RGB and coverage
+        rgb, cov = project_multiview_plates_to_latlong([v0, v1], out_width=128, out_height=64)
+        self.assertEqual(rgb.shape, (64, 128, 3))
+        self.assertEqual(cov.shape, (64, 128))
+        self.assertTrue(np.all(np.isfinite(rgb)))
+        self.assertGreater(float(np.max(cov)), 0.8)
+
+    def test_advanced_ptgui_and_sequence_features(self):
+        from hdri_maker.hdri_generator import export_hdri_sequence
+        from hdri_maker.lighting_analyzer import (
+            auto_equalize_plate_exposures,
+            compute_overlap_difference_map,
+            equirect_rect_to_plate_rect,
+            project_multiview_plates_to_latlong,
+        )
+        from hdri_maker.plate_io import format_frame_path, read_plate_metadata
+
+        # 1. Fisheye, vignette, exposure_ev, exclude_rects
+        img_a = np.full((64, 64, 3), 0.4, dtype=np.float32)
+        img_b = np.full((64, 64, 3), 0.2, dtype=np.float32)  # 1 stop darker
+        va = PlateViewInput(
+            pixels=img_a, is_hdr=True, fov_h_deg=120.0, cam_azimuth_deg=0.0,
+            lens_type="fisheye_equidistant", vignette_v1=0.3,
+        )
+        vb = PlateViewInput(
+            pixels=img_b, is_hdr=True, fov_h_deg=120.0, cam_azimuth_deg=30.0,
+            lens_type="fisheye_equisolid", exclude_rects=[(0.0, 0.0, 0.2, 0.2)],
+        )
+        rgb, _ = project_multiview_plates_to_latlong([va, vb], 128, 64)
+        self.assertEqual(rgb.shape, (64, 128, 3))
+        self.assertTrue(np.all(np.isfinite(rgb)))
+
+        # 2. Auto-equalize EV & Overlap difference map
+        eq = auto_equalize_plate_exposures([va, vb])
+        self.assertGreater(eq[1].exposure_ev, 0.5)
+        diff = compute_overlap_difference_map(eq, 128, 64)
+        self.assertEqual(diff.shape, (64, 128, 3))
+
+        # 3. Equirect mask mapping
+        rect_p = equirect_rect_to_plate_rect(
+            PlateViewInput(pixels=img_a, is_hdr=True, fov_h_deg=90.0),
+            (0.45, 0.45, 0.55, 0.55),
+        )
+        self.assertIsNotNone(rect_p)
+
+        # 4. Physical sky fill
+        prof = analyze_plate(img_a, is_hdr=True, fov_h_deg=60.0)
+        hdri_sky = generate_latlong_hdri(
+            prof, HDRISynthesisParams(width=128, height=64, physical_sky_fill=0.8), views=[va]
+        )
+        self.assertEqual(hdri_sky.shape, (64, 128, 3))
+        self.assertTrue(np.all(np.isfinite(hdri_sky)))
+
+        # 5. Sequence export & metadata fallback
+        self.assertTrue(format_frame_path("out.$F4.exr", 12).endswith("out.0012.exr"))
+        pat, written = export_hdri_sequence(
+            [analyze_plate(img_a, is_hdr=True, frame=1), analyze_plate(img_b, is_hdr=True, frame=2)],
+            [va, vb],
+            HDRISynthesisParams(width=64, height=32),
+            os.path.join(self.tmpdir.name, "seq.$F4.exr"),
+        )
+        self.assertEqual(len(written), 2)
+        for wf in written:
+            self.assertTrue(os.path.isfile(wf))
+        meta = read_plate_metadata(written[0])
+        self.assertIn("roll_deg", meta)
 
 
 if __name__ == "__main__":

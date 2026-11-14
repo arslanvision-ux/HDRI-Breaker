@@ -7,7 +7,7 @@ Pure-numpy implementation compatible with Houdini 20+ (no scipy/cv2 required).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -109,6 +109,14 @@ class PlateViewInput:
     cam_azimuth_deg: float = 0.0
     cam_elevation_deg: float = 0.0
     weight: float = 1.0
+    cam_roll_deg: float = 0.0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    warp_k1: float = 0.0
+    lens_type: str = "rectilinear"
+    exposure_ev: float = 0.0
+    vignette_v1: float = 0.0
+    exclude_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
 
 def compute_luminance(rgb: np.ndarray) -> np.ndarray:
@@ -501,6 +509,191 @@ def merge_lighting_profiles(profiles: List[LightingProfile]) -> LightingProfile:
     )
 
 
+def _camera_basis(
+    view: PlateViewInput,
+    vertical_shift_deg: float = 0.0,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float], float, float, float]:
+    """Compute orthonormal camera basis (fwd, right, up), scaled half-FOV tangents, and clipped elevation."""
+    img = np.asarray(view.pixels)
+    ih, iw = img.shape[:2]
+    aspect = iw / float(max(ih, 1))
+    fov_h_rad = math.radians(np.clip(view.fov_h_deg, 5.0, 165.0) * 0.5)
+    tan_half_fov_x = math.tan(fov_h_rad) * max(0.1, float(view.scale_x))
+    tan_half_fov_y = (math.tan(fov_h_rad) / max(aspect, 0.1)) * max(0.1, float(view.scale_y))
+
+    az = math.radians(view.cam_azimuth_deg)
+    el_deg = float(np.clip(view.cam_elevation_deg + vertical_shift_deg, -89.0, 89.0))
+    el = math.radians(el_deg)
+
+    fwd_x = math.cos(el) * math.sin(az)
+    fwd_y = math.sin(el)
+    fwd_z = math.cos(el) * math.cos(az)
+
+    right0_x = math.cos(az)
+    right0_y = 0.0
+    right0_z = -math.sin(az)
+
+    up0_x = fwd_y * right0_z - fwd_z * right0_y
+    up0_y = fwd_z * right0_x - fwd_x * right0_z
+    up0_z = fwd_x * right0_y - fwd_y * right0_x
+
+    roll = math.radians(float(view.cam_roll_deg))
+    if abs(roll) > 1e-6:
+        cr = math.cos(roll)
+        sr = math.sin(roll)
+        right_x = right0_x * cr + up0_x * sr
+        right_y = right0_y * cr + up0_y * sr
+        right_z = right0_z * cr + up0_z * sr
+        up_x = -right0_x * sr + up0_x * cr
+        up_y = -right0_y * sr + up0_y * cr
+        up_z = -right0_z * sr + up0_z * cr
+    else:
+        right_x, right_y, right_z = right0_x, right0_y, right0_z
+        up_x, up_y, up_z = up0_x, up0_y, up0_z
+
+    return (
+        (fwd_x, fwd_y, fwd_z),
+        (right_x, right_y, right_z),
+        (up_x, up_y, up_z),
+        tan_half_fov_x,
+        tan_half_fov_y,
+        el_deg,
+    )
+
+
+def _dir_to_latlong_uv(
+    dx: float,
+    dy: float,
+    dz: float,
+    azimuth_offset_deg: float = 0.0,
+) -> Tuple[float, float]:
+    """Convert a 3D unit direction vector into equirectangular (u, v) in [0, 1]."""
+    phi = math.atan2(dx, dz) + math.radians(azimuth_offset_deg)
+    u = ((phi / (2.0 * math.pi)) + 0.5) % 1.0
+    theta = math.asin(max(-1.0, min(1.0, dy)))
+    v = 0.5 - theta / math.pi
+    return (u, v)
+
+
+def _invert_radial_warp(sx: float, sy: float, k1: float) -> Tuple[float, float]:
+    """Invert src = ndc * (1 + k1 * |ndc|^2) for outline/handle unprojection."""
+    if abs(k1) < 1e-6:
+        return (sx, sy)
+    nx, ny = sx, sy
+    for _ in range(4):
+        r2 = nx * nx + ny * ny
+        denom = max(0.2, 1.0 + k1 * r2)
+        nx = sx / denom
+        ny = sy / denom
+    return (nx, ny)
+
+
+def compute_plate_outline_uv(
+    view: PlateViewInput,
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
+    samples_per_edge: int = 16,
+) -> dict:
+    """
+    Compute projected equirectangular outline polylines and gizmo handle UVs for a plate.
+
+    Returns dict with:
+        - "polylines": list of [(u, v), ...] segments split at u=0/1 seam
+        - "center": (u, v) of plate center
+        - "corners": list of 4 (u, v) corner points (TL, TR, BR, BL)
+        - "roll_handle": (u, v) of top-center roll handle
+    """
+    fwd, right, up, thx, thy, _ = _camera_basis(view, vertical_shift_deg=vertical_shift_deg)
+    k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
+
+    def _ndc_to_uv(sx: float, sy: float) -> Tuple[float, float]:
+        nx, ny = _invert_radial_warp(sx, sy, k1)
+        vx = fwd[0] + nx * thx * right[0] + ny * thy * up[0]
+        vy = fwd[1] + nx * thx * right[1] + ny * thy * up[1]
+        vz = fwd[2] + nx * thx * right[2] + ny * thy * up[2]
+        norm = max(1e-8, math.sqrt(vx * vx + vy * vy + vz * vz))
+        return _dir_to_latlong_uv(vx / norm, vy / norm, vz / norm, azimuth_offset_deg=azimuth_offset_deg)
+
+    # Sample perimeter: top (-1->1, 1), right (1, 1->-1), bottom (1->-1, -1), left (-1, -1->1)
+    n = max(4, int(samples_per_edge))
+    ring: List[Tuple[float, float]] = []
+    for i in range(n):
+        t = -1.0 + 2.0 * (i / float(n))
+        ring.append(_ndc_to_uv(t, 1.0))
+    for i in range(n):
+        t = 1.0 - 2.0 * (i / float(n))
+        ring.append(_ndc_to_uv(1.0, t))
+    for i in range(n):
+        t = 1.0 - 2.0 * (i / float(n))
+        ring.append(_ndc_to_uv(t, -1.0))
+    for i in range(n):
+        t = -1.0 + 2.0 * (i / float(n))
+        ring.append(_ndc_to_uv(-1.0, t))
+    ring.append(ring[0])
+
+    polylines: List[List[Tuple[float, float]]] = []
+    cur: List[Tuple[float, float]] = [ring[0]]
+    for pt in ring[1:]:
+        if abs(pt[0] - cur[-1][0]) > 0.5:
+            if len(cur) >= 2:
+                polylines.append(cur)
+            cur = [pt]
+        else:
+            cur.append(pt)
+    if len(cur) >= 2:
+        polylines.append(cur)
+
+    return {
+        "polylines": polylines,
+        "center": _ndc_to_uv(0.0, 0.0),
+        "corners": [
+            _ndc_to_uv(-1.0, 1.0),
+            _ndc_to_uv(1.0, 1.0),
+            _ndc_to_uv(1.0, -1.0),
+            _ndc_to_uv(-1.0, -1.0),
+        ],
+        "roll_handle": _ndc_to_uv(0.0, 1.18),
+    }
+
+
+def hit_test_plate_uv(
+    views: List[PlateViewInput],
+    u: float,
+    v: float,
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
+) -> Optional[int]:
+    """Return index of the topmost PlateViewInput covering equirectangular (u, v), or None."""
+    if not views:
+        return None
+    phi = (float(u) - 0.5) * (2.0 * math.pi) - math.radians(azimuth_offset_deg)
+    theta = (0.5 - float(v)) * math.pi
+    dx = math.cos(theta) * math.sin(phi)
+    dy = math.sin(theta)
+    dz = math.cos(theta) * math.cos(phi)
+
+    for idx in range(len(views) - 1, -1, -1):
+        view = views[idx]
+        fwd, right, up, thx, thy, _ = _camera_basis(view, vertical_shift_deg=vertical_shift_deg)
+        cam_z = dx * fwd[0] + dy * fwd[1] + dz * fwd[2]
+        if cam_z <= 1e-4:
+            continue
+        cam_x = dx * right[0] + dy * right[1] + dz * right[2]
+        cam_y = dx * up[0] + dy * up[1] + dz * up[2]
+        nx = (cam_x / cam_z) / thx
+        ny = (cam_y / cam_z) / thy
+        r2 = nx * nx + ny * ny
+        k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
+        dist = 1.0 + k1 * r2
+        if dist <= 0.1 or r2 > 3.0:
+            continue
+        sx = nx * dist
+        sy = ny * dist
+        if abs(sx) <= 1.0 and abs(sy) <= 1.0:
+            return idx
+    return None
+
+
 def project_multiview_plates_to_latlong(
     views: List[PlateViewInput],
     out_width: int = 2048,
@@ -535,18 +728,13 @@ def project_multiview_plates_to_latlong(
     for view in views:
         img = np.asarray(view.pixels, dtype=np.float32)
         ih, iw = img.shape[:2]
-        aspect = iw / float(max(ih, 1))
-        fov_h_rad = math.radians(np.clip(view.fov_h_deg, 5.0, 165.0) * 0.5)
-        tan_half_fov_x = math.tan(fov_h_rad)
-        tan_half_fov_y = tan_half_fov_x / max(aspect, 0.1)
-        fov_v_deg = math.degrees(math.atan(tan_half_fov_y))
+        fwd, right, up, tan_half_fov_x, tan_half_fov_y, el_deg = _camera_basis(
+            view, vertical_shift_deg=vertical_shift_deg
+        )
+        k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
 
-        az = math.radians(view.cam_azimuth_deg)
-        el_deg = float(np.clip(view.cam_elevation_deg + vertical_shift_deg, -89.0, 89.0))
-        el = math.radians(el_deg)
-
-        # Restrict evaluation to the latitude row band covered by this view (+margin)
-        diag_half_deg = math.degrees(math.atan(math.hypot(tan_half_fov_x, tan_half_fov_y))) + 8.0
+        # Restrict evaluation to the latitude row band covered by this view (+margin for roll/warp)
+        diag_half_deg = math.degrees(math.atan(math.hypot(tan_half_fov_x, tan_half_fov_y))) * (1.25 if abs(k1) > 1e-4 else 1.0) + 12.0
         el_hi = el_deg + diag_half_deg
         el_lo = el_deg - diag_half_deg
         if el_hi >= 89.0 or el_lo <= -89.0:
@@ -557,44 +745,71 @@ def project_multiview_plates_to_latlong(
         if y_end <= y_start:
             continue
 
-        fwd_x = math.cos(el) * math.sin(az)
-        fwd_y = math.sin(el)
-        fwd_z = math.cos(el) * math.cos(az)
-
-        right_x = math.cos(az)
-        right_y = 0.0
-        right_z = -math.sin(az)
-
-        up_x = fwd_y * right_z - fwd_z * right_y
-        up_y = fwd_z * right_x - fwd_x * right_z
-        up_z = fwd_x * right_y - fwd_y * right_x
-
         dx_s = dx[y_start:y_end]
         dy_s = dy[y_start:y_end]
         dz_s = dz[y_start:y_end]
-        cam_z = dx_s * fwd_x + dy_s * fwd_y + dz_s * fwd_z
-        cam_x = dx_s * right_x + dy_s * right_y + dz_s * right_z
-        cam_y = dx_s * up_x + dy_s * up_y + dz_s * up_z
+        cam_z = dx_s * fwd[0] + dy_s * fwd[1] + dz_s * fwd[2]
+        cam_x = dx_s * right[0] + dy_s * right[1] + dz_s * right[2]
+        cam_y = dx_s * up[0] + dy_s * up[1] + dz_s * up[2]
 
-        in_front = cam_z > 1e-4
-        safe_z = np.where(in_front, cam_z, 1.0)
-        ndc_x = (cam_x / safe_z) / tan_half_fov_x
-        ndc_y = (cam_y / safe_z) / tan_half_fov_y
+        lens = getattr(view, "lens_type", "rectilinear") or "rectilinear"
+        if lens in ("fisheye_equidistant", "fisheye_equisolid"):
+            fov_h_rad = math.radians(np.clip(view.fov_h_deg, 10.0, 220.0) * 0.5)
+            aspect = iw / float(max(ih, 1))
+            r_xy = np.hypot(cam_x, cam_y)
+            theta_c = np.arctan2(r_xy, cam_z)
+            if lens == "fisheye_equisolid":
+                denom_f = max(1e-5, 2.0 * math.sin(fov_h_rad * 0.5))
+                r_norm = (2.0 * np.sin(theta_c * 0.5)) / denom_f
+            else:
+                r_norm = theta_c / max(1e-5, fov_h_rad)
+            safe_r = np.maximum(r_xy, 1e-8)
+            ndc_x = (cam_x / safe_r) * r_norm / max(0.1, float(view.scale_x))
+            ndc_y = (cam_y / safe_r) * (r_norm * aspect) / max(0.1, float(view.scale_y))
+            in_front = theta_c <= (fov_h_rad * 1.15)
+        else:
+            in_front = cam_z > 1e-4
+            safe_z = np.where(in_front, cam_z, 1.0)
+            ndc_x = (cam_x / safe_z) / tan_half_fov_x
+            ndc_y = (cam_y / safe_z) / tan_half_fov_y
 
-        inside = in_front & (np.abs(ndc_x) <= 1.0) & (np.abs(ndc_y) <= 1.0)
+        r2_all = ndc_x * ndc_x + ndc_y * ndc_y
+        if abs(k1) > 1e-6:
+            dist = 1.0 + k1 * r2_all
+            src_x = ndc_x * dist
+            src_y = ndc_y * dist
+            inside = in_front & (dist > 0.1) & (r2_all <= 3.0) & (np.abs(src_x) <= 1.0) & (np.abs(src_y) <= 1.0)
+        else:
+            src_x = ndc_x
+            src_y = ndc_y
+            inside = in_front & (np.abs(src_x) <= 1.0) & (np.abs(src_y) <= 1.0)
+
         iy_loc, ix = np.where(inside)
         if len(iy_loc) == 0:
             continue
         iy = iy_loc + y_start
 
-        nx_in = ndc_x[iy_loc, ix]
-        ny_in = ndc_y[iy_loc, ix]
+        nx_in = src_x[iy_loc, ix]
+        ny_in = src_y[iy_loc, ix]
+        r2_in = r2_all[iy_loc, ix]
 
         # Smooth edge feathering so overlapping views blend cleanly
         f_w = max(0.03, float(edge_feather))
         edge_x = np.clip((1.0 - np.abs(nx_in)) / f_w, 0.0, 1.0)
         edge_y = np.clip((1.0 - np.abs(ny_in)) / f_w, 0.0, 1.0)
         feather = (edge_x * edge_y).astype(np.float32)
+
+        # Exclude masked plate regions (u, v in [0, 1])
+        ex_rects = getattr(view, "exclude_rects", None)
+        if ex_rects:
+            u_plate = (nx_in + 1.0) * 0.5
+            v_plate = (1.0 - ny_in) * 0.5
+            for rx0, ry0, rx1, ry1 in ex_rects:
+                lo_x, hi_x = min(rx0, rx1), max(rx0, rx1)
+                lo_y, hi_y = min(ry0, ry1), max(ry0, ry1)
+                in_ex = (u_plate >= lo_x) & (u_plate <= hi_x) & (v_plate >= lo_y) & (v_plate <= hi_y)
+                feather = np.where(in_ex, 0.0, feather)
+
         w_in = feather * float(max(view.weight, 0.01))
 
         # Bilinear sample only at covered pixels
@@ -613,6 +828,14 @@ def project_multiview_plates_to_latlong(
             + img[y1, x0] * (1.0 - fx) * fy
             + img[y1, x1] * fx * fy
         )
+
+        # Radial vignette compensation & per-plate exposure offset
+        v1 = float(getattr(view, "vignette_v1", 0.0))
+        if abs(v1) > 1e-5:
+            sampled = sampled * np.clip(1.0 + v1 * r2_in, 0.2, 4.0)[:, None]
+        ev_off = float(getattr(view, "exposure_ev", 0.0))
+        if abs(ev_off) > 1e-5:
+            sampled = sampled * float(2.0 ** ev_off)
 
         # Inverse tone-mapping highlight expansion for LDR plates (preserves cloud/sun detail)
         if (not view.is_hdr) and ldr_highlight_boost > 1.0:
@@ -633,6 +856,114 @@ def project_multiview_plates_to_latlong(
     inv_w = np.where(valid, 1.0 / np.maximum(accum_w, 1e-6), 0.0).astype(np.float32)
     accum_rgb *= inv_w[..., None]
     return accum_rgb, np.clip(max_cov, 0.0, 1.0).astype(np.float32)
+
+
+def equirect_rect_to_plate_rect(
+    view: PlateViewInput,
+    rect_uv: Tuple[float, float, float, float],
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
+) -> Optional[Tuple[float, float, float, float]]:
+    """Map an equirectangular (u0, v0, u1, v1) selection box into normalized plate image coords."""
+    u0, v0, u1, v1 = rect_uv
+    fwd, right, up, thx, thy, _ = _camera_basis(view, vertical_shift_deg=vertical_shift_deg)
+    k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
+    pts_u, pts_v = [], []
+    for su in np.linspace(min(u0, u1), max(u0, u1), 5):
+        for sv in np.linspace(min(v0, v1), max(v0, v1), 5):
+            phi = (float(su) - 0.5) * (2.0 * math.pi) - math.radians(azimuth_offset_deg)
+            theta = (0.5 - float(sv)) * math.pi
+            dx = math.cos(theta) * math.sin(phi)
+            dy = math.sin(theta)
+            dz = math.cos(theta) * math.cos(phi)
+            cz = dx * fwd[0] + dy * fwd[1] + dz * fwd[2]
+            if cz <= 1e-4:
+                continue
+            cx = dx * right[0] + dy * right[1] + dz * right[2]
+            cy = dx * up[0] + dy * up[1] + dz * up[2]
+            nx = (cx / cz) / thx
+            ny = (cy / cz) / thy
+            dist = 1.0 + k1 * (nx * nx + ny * ny)
+            sx, sy = nx * dist, ny * dist
+            pu = (sx + 1.0) * 0.5
+            pv = (1.0 - sy) * 0.5
+            if -0.2 <= pu <= 1.2 and -0.2 <= pv <= 1.2:
+                pts_u.append(float(np.clip(pu, 0.0, 1.0)))
+                pts_v.append(float(np.clip(pv, 0.0, 1.0)))
+    if len(pts_u) < 2:
+        return None
+    return (min(pts_u), min(pts_v), max(pts_u), max(pts_v))
+
+
+def compute_overlap_difference_map(
+    views: List[PlateViewInput],
+    out_width: int = 512,
+    out_height: int = 256,
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
+) -> np.ndarray:
+    """
+    Visualize alignment & exposure discrepancies in overlapping plate regions.
+    Returns (H, W, 3) float32 sRGB-ready difference map (bright red/orange = seam mismatch).
+    """
+    if not views:
+        return np.zeros((out_height, out_width, 3), dtype=np.float32)
+    min_lum = np.full((out_height, out_width), 1e9, dtype=np.float32)
+    max_lum = np.full((out_height, out_width), -1e9, dtype=np.float32)
+    cov_count = np.zeros((out_height, out_width), dtype=np.int32)
+    base_rgb = np.zeros((out_height, out_width, 3), dtype=np.float32)
+
+    for v in views:
+        v_map, v_cov = project_multiview_plates_to_latlong(
+            [v],
+            out_width=out_width,
+            out_height=out_height,
+            ldr_highlight_boost=1.0,
+            edge_feather=0.05,
+            vertical_shift_deg=vertical_shift_deg,
+        )
+        mask = v_cov > 0.1
+        lum = compute_luminance(v_map)
+        min_lum = np.where(mask, np.minimum(min_lum, lum), min_lum)
+        max_lum = np.where(mask, np.maximum(max_lum, lum), max_lum)
+        cov_count += mask.astype(np.int32)
+        base_rgb = np.where(mask[..., None], v_map, base_rgb)
+
+    if abs(azimuth_offset_deg) > 1e-4:
+        shift_px = int(round((azimuth_offset_deg / 360.0) * out_width)) % out_width
+        if shift_px != 0:
+            min_lum = np.roll(min_lum, shift_px, axis=1)
+            max_lum = np.roll(max_lum, shift_px, axis=1)
+            cov_count = np.roll(cov_count, shift_px, axis=1)
+            base_rgb = np.roll(base_rgb, shift_px, axis=1)
+
+    overlap = cov_count >= 2
+    diff = np.where(overlap, np.abs(max_lum - min_lum), 0.0)
+    vis = base_rgb * 0.25
+    vis[overlap, 0] = np.clip(vis[overlap, 0] + diff[overlap] * 3.5, 0.0, 1.0)
+    vis[overlap, 1] = np.clip(vis[overlap, 1] + 0.15, 0.0, 1.0)
+    return vis.astype(np.float32)
+
+
+def auto_equalize_plate_exposures(views: List[PlateViewInput]) -> List[PlateViewInput]:
+    """Match exposure_ev across overlapping plates relative to plate #0."""
+    if len(views) < 2:
+        return list(views)
+    eq = [views[0]]
+    for i in range(1, len(views)):
+        prev = eq[-1]
+        curr = views[i]
+        p_map, p_cov = project_multiview_plates_to_latlong([prev], 256, 128, ldr_highlight_boost=1.0)
+        c_map, c_cov = project_multiview_plates_to_latlong([curr], 256, 128, ldr_highlight_boost=1.0)
+        overlap = (p_cov > 0.25) & (c_cov > 0.25)
+        if np.sum(overlap) >= 16:
+            p_lum = float(np.median(compute_luminance(p_map)[overlap]))
+            c_lum = float(np.median(compute_luminance(c_map)[overlap]))
+            if p_lum > 1e-5 and c_lum > 1e-5:
+                delta_ev = float(np.clip(math.log2(p_lum / c_lum), -3.0, 3.0))
+                curr = replace(curr, exposure_ev=float(np.clip(curr.exposure_ev + delta_ev, -4.0, 4.0)))
+        eq.append(curr)
+    return eq
 
 
 def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInput]:
@@ -663,6 +994,9 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
         curr = views[i]
         best_az = curr.cam_azimuth_deg
         best_el = curr.cam_elevation_deg
+        best_roll = curr.cam_roll_deg
+        best_fov = curr.fov_h_deg
+        best_k1 = curr.warp_k1
         best_score = -1e9
 
         prev_map, prev_cov = project_multiview_plates_to_latlong([prev], 256, 128, ldr_highlight_boost=1.0)
@@ -671,14 +1005,10 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
         # Stage 1: Coarse search (+-18 deg az, +-8 deg el)
         for d_az in (-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0):
             for d_el in (-8.0, -4.0, 0.0, 4.0, 8.0):
-                cand = PlateViewInput(
-                    pixels=curr.pixels,
-                    is_hdr=curr.is_hdr,
-                    source_path=curr.source_path,
-                    fov_h_deg=curr.fov_h_deg,
+                cand = replace(
+                    curr,
                     cam_azimuth_deg=curr.cam_azimuth_deg + d_az,
                     cam_elevation_deg=float(np.clip(curr.cam_elevation_deg + d_el, -85.0, 85.0)),
-                    weight=curr.weight,
                 )
                 score = _ncc_score(prev_lum, prev_cov, cand)
                 if score > best_score:
@@ -690,14 +1020,10 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
         coarse_az, coarse_el = best_az, best_el
         for d_az in (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0):
             for d_el in (-2.0, -1.0, 0.0, 1.0, 2.0):
-                cand = PlateViewInput(
-                    pixels=curr.pixels,
-                    is_hdr=curr.is_hdr,
-                    source_path=curr.source_path,
-                    fov_h_deg=curr.fov_h_deg,
+                cand = replace(
+                    curr,
                     cam_azimuth_deg=coarse_az + d_az,
                     cam_elevation_deg=float(np.clip(coarse_el + d_el, -85.0, 85.0)),
-                    weight=curr.weight,
                 )
                 score = _ncc_score(prev_lum, prev_cov, cand)
                 if score > best_score:
@@ -705,15 +1031,54 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
                     best_az = cand.cam_azimuth_deg
                     best_el = cand.cam_elevation_deg
 
-        aligned.append(
-            PlateViewInput(
-                pixels=curr.pixels,
-                is_hdr=curr.is_hdr,
-                source_path=curr.source_path,
-                fov_h_deg=curr.fov_h_deg,
+        # Stage 3: PTGui-style Roll, FOV, and Lens Warp (k1) refinement
+        for d_roll in (-6.0, -3.0, 0.0, 3.0, 6.0):
+            cand = replace(
+                curr,
                 cam_azimuth_deg=best_az,
                 cam_elevation_deg=best_el,
-                weight=curr.weight,
+                cam_roll_deg=curr.cam_roll_deg + d_roll,
+            )
+            score = _ncc_score(prev_lum, prev_cov, cand)
+            if score > best_score:
+                best_score = score
+                best_roll = cand.cam_roll_deg
+
+        for d_fov in (-4.0, -2.0, 0.0, 2.0, 4.0):
+            cand = replace(
+                curr,
+                cam_azimuth_deg=best_az,
+                cam_elevation_deg=best_el,
+                cam_roll_deg=best_roll,
+                fov_h_deg=float(np.clip(curr.fov_h_deg + d_fov, 10.0, 165.0)),
+            )
+            score = _ncc_score(prev_lum, prev_cov, cand)
+            if score > best_score:
+                best_score = score
+                best_fov = cand.fov_h_deg
+
+        for d_k1 in (-0.06, -0.03, 0.0, 0.03, 0.06):
+            cand = replace(
+                curr,
+                cam_azimuth_deg=best_az,
+                cam_elevation_deg=best_el,
+                cam_roll_deg=best_roll,
+                fov_h_deg=best_fov,
+                warp_k1=float(np.clip(curr.warp_k1 + d_k1, -0.45, 0.45)),
+            )
+            score = _ncc_score(prev_lum, prev_cov, cand)
+            if score > best_score:
+                best_score = score
+                best_k1 = cand.warp_k1
+
+        aligned.append(
+            replace(
+                curr,
+                cam_azimuth_deg=best_az,
+                cam_elevation_deg=best_el,
+                cam_roll_deg=best_roll,
+                fov_h_deg=best_fov,
+                warp_k1=best_k1,
             )
         )
     return aligned

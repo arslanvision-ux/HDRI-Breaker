@@ -429,7 +429,8 @@ def create_or_update_lookdev_and_ground(
          and a 24-patch Macbeth ColorChecker chart (ACEScg or Linear Rec.709).
       2. Circular Ground Disc (/lookdev/ground_disc) mapped with the top-down
          planar HDRI ground projection EXR + radial soft-blending transparency
-         supporting Karma MaterialX, Arnold Standard Surface, and UsdPreviewSurface.
+         supporting Karma MaterialX, Arnold Standard Surface, Redshift Standard Material,
+         and UsdPreviewSurface.
     """
     stage = _ensure_stage_context()
     lop = _create_lop(stage, ("pythonscript",), node_name)
@@ -514,6 +515,21 @@ def _make_pbr_mtl(mtl_path, color, metallic=0.0, roughness=0.5):
     ai.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness)))
     ai.CreateInput("specular_roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
     mat.CreateSurfaceOutput("arnold").ConnectToSource(ai.ConnectableAPI(), "shader")
+
+    # 4. Redshift Standard Material
+    rsm = UsdShade.Shader.Define(stage, f"{{mtl_path}}/RedshiftMaterial")
+    rsm.CreateIdAttr("redshift_usd_material")
+    rstd = UsdShade.Shader.Define(stage, f"{{mtl_path}}/RedshiftStd")
+    rstd.CreateIdAttr("redshift::StandardMaterial")
+    rstd.CreateInput("base_color_weight", Sdf.ValueTypeNames.Float).Set(1.0)
+    rstd.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).Set(c3)
+    rstd.CreateInput("metalness", Sdf.ValueTypeNames.Float).Set(float(metallic))
+    rstd.CreateInput("refl_weight", Sdf.ValueTypeNames.Float).Set(1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness)))
+    rstd.CreateInput("refl_roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+    rstd.CreateOutput("outColor", Sdf.ValueTypeNames.Color3f)
+    rsm.CreateInput("Surface", Sdf.ValueTypeNames.Token).ConnectToSource(rstd.ConnectableAPI(), "outColor")
+    rsm.CreateOutput("Shader", Sdf.ValueTypeNames.Token)
+    mat.CreateSurfaceOutput("Redshift").ConnectToSource(rsm.ConnectableAPI(), "Shader")
     return mat
 
 def _build_smooth_sphere(path, radius, rings=48, sectors=96):
@@ -814,6 +830,8 @@ rstd.CreateIdAttr("redshift::StandardMaterial")
 rstd.CreateInput("base_color_weight", Sdf.ValueTypeNames.Float).Set(1.0 if use_diffuse else 0.0)
 rstd.CreateInput("refl_weight", Sdf.ValueTypeNames.Float).Set(0.0)
 rstd.CreateInput("refl_roughness", Sdf.ValueTypeNames.Float).Set(1.0)
+rstd.CreateInput("coat_weight", Sdf.ValueTypeNames.Float).Set(0.0)
+rstd.CreateInput("sheen_weight", Sdf.ValueTypeNames.Float).Set(0.0)
 rtex = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/RedshiftColorTex")
 rtex.CreateIdAttr("redshift::TextureSampler")
 rtex.CreateInput("tex0", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))

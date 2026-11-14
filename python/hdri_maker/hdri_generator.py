@@ -56,6 +56,7 @@ class HDRISynthesisParams:
     ground_rect: Optional[Tuple[float, float, float, float]] = None
     light_rect: Optional[Tuple[float, float, float, float]] = None
     remove_hotspot_from_hdri: bool = True
+    physical_sky_fill: float = 0.0
 
 
 @dataclass
@@ -504,7 +505,20 @@ def generate_latlong_hdri(
             cache_key = None
             if w <= 2048:
                 views_sig = tuple(
-                    (id(v.pixels), float(v.cam_azimuth_deg), float(v.cam_elevation_deg), float(v.fov_h_deg))
+                    (
+                        id(v.pixels),
+                        float(v.cam_azimuth_deg),
+                        float(v.cam_elevation_deg),
+                        float(v.fov_h_deg),
+                        float(v.cam_roll_deg),
+                        float(v.scale_x),
+                        float(v.scale_y),
+                        float(v.warp_k1),
+                        str(getattr(v, "lens_type", "rectilinear")),
+                        float(getattr(v, "exposure_ev", 0.0)),
+                        float(getattr(v, "vignette_v1", 0.0)),
+                        tuple(getattr(v, "exclude_rects", ()) or ()),
+                    )
                     for v in views
                 )
                 cache_key = (
@@ -594,6 +608,35 @@ def generate_latlong_hdri(
 
             blend = float(np.clip(p.plate_projection_blend, 0.0, 1.0))
             hdri = hdri * (1.0 - blend) + stitched * blend
+            if p.physical_sky_fill > 1e-4:
+                sky_fill_amt = float(np.clip(p.physical_sky_fill, 0.0, 1.0))
+                uncovered_sky = (1.0 - np.clip(cov_w, 0.0, 1.0)) * _smoothstep(-0.04, 0.12, elev) * sky_fill_amt
+                if np.max(uncovered_sky) > 1e-4:
+                    dir_x_s = cos_theta * sin_phi
+                    dir_y_s = np.broadcast_to(sin_theta, (h, w))
+                    dir_z_s = cos_theta * cos_phi
+                    zenith_t = np.clip(np.sin(np.maximum(elev, 0.0)), 0.0, 1.0)
+                    zen_col = np.array(profile.zenith_color, dtype=np.float32)
+                    hor_col = np.array(profile.horizon_color, dtype=np.float32)
+                    # Rayleigh-like horizon-to-zenith sky gradient
+                    rayleigh = hor_col * np.power(1.0 - zenith_t, 2.2)[..., None] + zen_col * (1.0 - np.power(1.0 - zenith_t, 2.2))[..., None]
+                    if profile.hotspots:
+                        sun = profile.hotspots[0]
+                        s_az = math.radians(sun.azimuth_deg)
+                        s_el = math.radians(max(5.0, sun.elevation_deg))
+                        sun_col = np.array(cct_to_rgb(sun.cct_kelvin), dtype=np.float32)
+                        sun_peak = float(max(sun.peak_intensity, 4.0))
+                    else:
+                        s_az = math.radians(p.azimuth_offset_deg)
+                        s_el = math.radians(45.0)
+                        sun_col = np.array(cct_to_rgb(profile.key_cct_kelvin), dtype=np.float32)
+                        sun_peak = 8.0
+                    sx, sy, sz = math.cos(s_el) * math.sin(s_az), math.sin(s_el), math.cos(s_el) * math.cos(s_az)
+                    cos_sun = np.clip(dir_x_s * sx + dir_y_s * sy + dir_z_s * sz, -1.0, 1.0)
+                    mie_halo = np.power(np.maximum(cos_sun, 0.0), 12.0)[..., None] * sun_col * 0.65
+                    sun_disc = np.exp(-0.5 * (np.arccos(np.clip(cos_sun, -1.0, 1.0)) / math.radians(1.2)) ** 2)[..., None] * sun_col * sun_peak
+                    phys_sky = rayleigh + mie_halo + sun_disc
+                    hdri = hdri * (1.0 - uncovered_sky[..., None]) + phys_sky * uncovered_sky[..., None]
             del stitched, proj_rgb, cov_w
     elif abs(p.azimuth_offset_deg) > 1e-4:
         # When plate_projection_blend == 0, az_colors and dir_x/y/z already incorporate azimuth_offset_deg
@@ -983,3 +1026,48 @@ def compute_neutral_wb_gains(
     gg = float(np.clip(gg, 0.1, 10.0))
     gb = float(np.clip(gb, 0.1, 10.0))
     return (gr, gg, gb), float(cct), float(duv), float(lum)
+
+
+def export_hdri_sequence(
+    frame_profiles: List[LightingProfile],
+    frame_views: List[PlateViewInput],
+    params: HDRISynthesisParams,
+    output_pattern: str,
+    output_colorspace: str = "ACEScg",
+    light_regions: Optional[List[dict]] = None,
+    inpaint_lights: bool = False,
+    light_blur: float = 0.0,
+) -> Tuple[str, List[str]]:
+    """
+    Generate and export a per-frame sequence of 32-bit float Lat/Long EXR files.
+
+    Returns:
+        (solaris_pattern_path, list_of_written_exr_paths)
+    """
+    from .plate_io import format_frame_path, write_exr_32f
+
+    written: List[str] = []
+    if not frame_profiles:
+        raise ValueError("At least one LightingProfile is required for sequence export.")
+
+    for idx, prof in enumerate(frame_profiles):
+        fnum = prof.frame if prof.frame is not None else (idx + 1)
+        view_slice = [frame_views[idx]] if idx < len(frame_views) else None
+        hdri = generate_latlong_hdri(prof, params, views=view_slice)
+        if light_regions:
+            hdri, _ = extract_and_inpaint_multiple_hotspots(
+                hdri,
+                light_regions,
+                inpaint_hdri=inpaint_lights,
+                region_blur=light_blur,
+            )
+        out_file = format_frame_path(output_pattern, int(fnum))
+        written.append(
+            write_exr_32f(
+                out_file,
+                hdri,
+                output_colorspace=output_colorspace,
+                frame=int(fnum),
+            )
+        )
+    return output_pattern, written
