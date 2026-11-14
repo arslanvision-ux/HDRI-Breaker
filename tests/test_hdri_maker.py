@@ -295,19 +295,26 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertTrue(stage.GetPrimAtPath("/lookdev/ground_disc").IsValid())
         g_mtl = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl")
         self.assertTrue(g_mtl.IsValid())
-        self.assertTrue(g_mtl.GetAttribute("outputs:surface").IsValid())
         self.assertTrue(g_mtl.GetAttribute("outputs:mtlx:surface").IsValid())
-        self.assertTrue(g_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
-        rs_std = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/ground_rs_std")
-        self.assertTrue(rs_std.IsValid())
-        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_weight").Get()), 0.0, places=5)
-        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_roughness").Get()), 1.0, places=5)
         # Single unique macbeth_mtl shader instead of 24 per-patch materials
         mb_mtl = stage.GetPrimAtPath("/lookdev/materials/macbeth_mtl")
         self.assertTrue(mb_mtl.IsValid())
         self.assertTrue(mb_mtl.GetAttribute("outputs:mtlx:surface").IsValid())
-        self.assertTrue(mb_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
         self.assertFalse(stage.GetPrimAtPath("/lookdev/materials/macbeth_00").IsValid())
+
+        # Switch render_engine to Redshift and verify native Redshift Material Library outputs
+        rs_lib = create_or_update_lookdev_and_ground(
+            g_tex_exr, g_op_exr, parent_node=extra_light, colorspace="ACEScg", render_engine="Redshift"
+        )
+        rs_stage = rs_lib.stage()
+        rs_g_mtl = rs_stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl")
+        self.assertTrue(rs_g_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
+        rs_std = rs_stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/ground_rs_std")
+        self.assertTrue(rs_std.IsValid())
+        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_weight").Get()), 0.0, places=5)
+        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_roughness").Get()), 1.0, places=5)
+        rs_mb_mtl = rs_stage.GetPrimAtPath("/lookdev/materials/macbeth_mtl")
+        self.assertTrue(rs_mb_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
 
         # Verify Shadow Catcher (Matte) sets Karma holdoutmode=2 and Redshift matte primvars
         sc_lop = create_or_update_lookdev_and_ground(

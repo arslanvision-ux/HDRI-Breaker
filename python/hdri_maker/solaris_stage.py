@@ -466,50 +466,30 @@ def _set_vop_parm_tuple(node, name: str, value) -> None:
         pt.set(value)
 
 
-def _create_pbr_collect(
+def _normalize_render_engine(render_engine: Optional[str]) -> str:
+    eng = str(render_engine or "Karma").strip().lower()
+    if "redshift" in eng or eng == "rs":
+        return "redshift"
+    if "arnold" in eng or eng == "htoa":
+        return "arnold"
+    return "karma"
+
+
+def _create_pbr_shader_for_engine(
     ml,
     name: str,
     color_rgb: Tuple[float, float, float],
     metallic: float,
     roughness: float,
+    render_engine: str,
     vop_types,
     use_display_color: bool = False,
 ) -> str:
-    """Create a multi-renderer collect VOP inside a Solaris Material Library."""
-    col = ml.createNode("collect", f"{name}_collect")
+    """Create a dedicated single-renderer PBR shader inside a Solaris Material Library."""
+    eng = _normalize_render_engine(render_engine)
     spec_w = 1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness))
 
-    # 1. UsdPreviewSurface (GL / Storm fallback)
-    ups = ml.createNode("usdpreviewsurface", f"{name}_preview")
-    _set_vop_parm(ups, "metallic", float(metallic))
-    _set_vop_parm(ups, "roughness", float(roughness))
-    if use_display_color and "usdprimvarreader" in vop_types:
-        pvr = ml.createNode("usdprimvarreader", f"{name}_preview_dc")
-        _set_vop_parm(pvr, "signature", "float3")
-        _set_vop_parm(pvr, "varname", "displayColor")
-        _vop_connect(ups, "diffuseColor", pvr, "result")
-    else:
-        _set_vop_parm_tuple(ups, "diffuseColor", color_rgb)
-    col.setInput(0, ups, 0)
-
-    # 2. Karma MaterialX
-    if "mtlxstandard_surface" in vop_types:
-        ms = ml.createNode("mtlxstandard_surface", f"{name}_mtlx")
-        _set_vop_parm(ms, "base", 1.0)
-        _set_vop_parm(ms, "metalness", float(metallic))
-        _set_vop_parm(ms, "specular", spec_w)
-        _set_vop_parm(ms, "specular_roughness", float(roughness))
-        if use_display_color and "mtlxgeompropvalue" in vop_types:
-            mg = ml.createNode("mtlxgeompropvalue", f"{name}_mtlx_dc")
-            _set_vop_parm(mg, "signature", "color3")
-            _set_vop_parm(mg, "geomprop", "displayColor")
-            _vop_connect(ms, "base_color", mg, "out")
-        else:
-            _set_vop_parm_tuple(ms, "base_color", color_rgb)
-        col.setInput(1, ms, 0)
-
-    # 3. Redshift Standard Material
-    if "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
+    if eng == "redshift" and "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
         rsm = ml.createNode("redshift_usd_material", f"{name}_rs_mat")
         rstd = ml.createNode("redshift::StandardMaterial", f"{name}_rs_std")
         _set_vop_parm(rstd, "base_color_weight", 1.0)
@@ -523,10 +503,9 @@ def _create_pbr_collect(
         else:
             _set_vop_parm_tuple(rstd, "base_color", color_rgb)
         _vop_connect(rsm, "Surface", rstd, "outColor")
-        col.setNextInput(rsm, 0)
+        return rsm.name()
 
-    # 4. Arnold Standard Surface (when HtoA VOPs are available)
-    if "arnold::standard_surface" in vop_types:
+    if eng == "arnold" and "arnold::standard_surface" in vop_types:
         astd = ml.createNode("arnold::standard_surface", f"{name}_ai_std")
         _set_vop_parm(astd, "base", 1.0)
         _set_vop_parm(astd, "metalness", float(metallic))
@@ -545,14 +524,39 @@ def _create_pbr_collect(
         if "arnold_material" in vop_types:
             amat = ml.createNode("arnold_material", f"{name}_ai_mat")
             _vop_connect(amat, ("surface", "Surface"), astd, ("shader", "out", "rgb"), fallback_in=0)
-            col.setNextInput(amat, 0)
+            return amat.name()
+        return astd.name()
+
+    if "mtlxstandard_surface" in vop_types:
+        ms = ml.createNode("mtlxstandard_surface", f"{name}_mtlx")
+        _set_vop_parm(ms, "base", 1.0)
+        _set_vop_parm(ms, "metalness", float(metallic))
+        _set_vop_parm(ms, "specular", spec_w)
+        _set_vop_parm(ms, "specular_roughness", float(roughness))
+        if use_display_color and "mtlxgeompropvalue" in vop_types:
+            mg = ml.createNode("mtlxgeompropvalue", f"{name}_mtlx_dc")
+            _set_vop_parm(mg, "signature", "color3")
+            _set_vop_parm(mg, "geomprop", "displayColor")
+            _vop_connect(ms, "base_color", mg, "out")
         else:
-            col.setNextInput(astd, 0)
+            _set_vop_parm_tuple(ms, "base_color", color_rgb)
+        return ms.name()
 
-    return col.name()
+    # Fallback UsdPreviewSurface
+    ups = ml.createNode("usdpreviewsurface", f"{name}_preview")
+    _set_vop_parm(ups, "metallic", float(metallic))
+    _set_vop_parm(ups, "roughness", float(roughness))
+    if use_display_color and "usdprimvarreader" in vop_types:
+        pvr = ml.createNode("usdprimvarreader", f"{name}_preview_dc")
+        _set_vop_parm(pvr, "signature", "float3")
+        _set_vop_parm(pvr, "varname", "displayColor")
+        _vop_connect(ups, "diffuseColor", pvr, "result")
+    else:
+        _set_vop_parm_tuple(ups, "diffuseColor", color_rgb)
+    return ups.name()
 
 
-def _create_ground_proj_collect(
+def _create_ground_shader_for_engine(
     ml,
     ground_tex: str,
     ground_op_tex: str,
@@ -560,12 +564,102 @@ def _create_ground_proj_collect(
     use_emissive: bool,
     ground_emission: float,
     is_shadow_catcher: bool,
+    render_engine: str,
     vop_types,
 ) -> str:
-    """Create the multi-renderer ground_proj_mtl collect VOP inside a Solaris Material Library."""
-    col = ml.createNode("collect", "ground_proj_collect")
+    """Create the dedicated single-renderer ground_proj_mtl shader inside a Solaris Material Library."""
+    eng = _normalize_render_engine(render_engine)
 
-    # 1. UsdPreviewSurface
+    if eng == "redshift" and "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
+        rsm = ml.createNode("redshift_usd_material", "ground_rs_mat")
+        rstd = ml.createNode("redshift::StandardMaterial", "ground_rs_std")
+        _set_vop_parm(rstd, "base_color_weight", 1.0 if use_diffuse else 0.0)
+        _set_vop_parm(rstd, "refl_weight", 0.0)
+        _set_vop_parm(rstd, "refl_roughness", 1.0)
+        _set_vop_parm(rstd, "coat_weight", 0.0)
+        _set_vop_parm(rstd, "sheen_weight", 0.0)
+        _set_vop_parm(rstd, "emission_weight", ground_emission if use_emissive else 0.0)
+        rtex = ml.createNode("redshift::TextureSampler", "ground_rs_col")
+        _set_vop_parm(rtex, "tex0", ground_tex)
+        _set_vop_parm(rtex, "tex0_colorSpace", "Raw")
+        _set_vop_parm(rtex, "tspace_id", "st")
+        _set_vop_parm(rtex, "wrapU", 0)
+        _set_vop_parm(rtex, "wrapV", 0)
+        rop = ml.createNode("redshift::TextureSampler", "ground_rs_op")
+        _set_vop_parm(rop, "tex0", ground_op_tex)
+        _set_vop_parm(rop, "tex0_colorSpace", "Raw")
+        _set_vop_parm(rop, "tspace_id", "st")
+        _set_vop_parm(rop, "wrapU", 0)
+        _set_vop_parm(rop, "wrapV", 0)
+        _vop_connect(rstd, "base_color", rtex, "outColor")
+        _vop_connect(rstd, "emission_color", rtex, "outColor")
+        _vop_connect(rstd, "opacity_color", rop, "outColor")
+        _vop_connect(rsm, "Surface", rstd, "outColor")
+        return rsm.name()
+
+    if eng == "arnold" and "arnold::standard_surface" in vop_types:
+        atex = ml.createNode("arnold::image", "ground_ai_col")
+        _set_vop_parm(atex, "filename", ground_tex)
+        _set_vop_parm(atex, "color_space", "raw")
+        _set_vop_parm(atex, "swrap", "clamp")
+        _set_vop_parm(atex, "twrap", "clamp")
+        _set_vop_parm(atex, "uvset", "st")
+        aop = ml.createNode("arnold::image", "ground_ai_op")
+        _set_vop_parm(aop, "filename", ground_op_tex)
+        _set_vop_parm(aop, "color_space", "raw")
+        _set_vop_parm(aop, "swrap", "clamp")
+        _set_vop_parm(aop, "twrap", "clamp")
+        _set_vop_parm(aop, "uvset", "st")
+        if is_shadow_catcher and "arnold::shadow_matte" in vop_types:
+            ai = ml.createNode("arnold::shadow_matte", "ground_ai_matte")
+            _set_vop_parm(ai, "background_type", 0)
+            _set_vop_parm_tuple(ai, "background_color", (0.0, 0.0, 0.0))
+            _set_vop_parm_tuple(ai, "shadow_color", (0.0, 0.0, 0.0))
+            _set_vop_parm(ai, "shadow_opacity", 1.0)
+            _set_vop_parm(ai, "diffuse_intensity", 0.0)
+            _set_vop_parm(ai, "indirect_diffuse_enable", True)
+            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
+        else:
+            ai = ml.createNode("arnold::standard_surface", "ground_ai_std")
+            _set_vop_parm(ai, "base", 1.0 if use_diffuse else 0.0)
+            _set_vop_parm(ai, "specular", 0.0)
+            _set_vop_parm(ai, "specular_roughness", 1.0)
+            _set_vop_parm(ai, "emission", ground_emission if use_emissive else 0.0)
+            _vop_connect(ai, "base_color", atex, ("rgb", "out", "rgba"))
+            _vop_connect(ai, "emission_color", atex, ("rgb", "out", "rgba"))
+            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
+        if "arnold_material" in vop_types:
+            amat = ml.createNode("arnold_material", "ground_ai_mat")
+            _vop_connect(amat, ("surface", "Surface"), ai, ("shader", "out", "rgb"), fallback_in=0)
+            return amat.name()
+        return ai.name()
+
+    if "mtlxstandard_surface" in vop_types and "mtlximage" in vop_types:
+        ms = ml.createNode("mtlxstandard_surface", "ground_mtlx")
+        _set_vop_parm(ms, "base", 1.0 if use_diffuse else 0.0)
+        _set_vop_parm(ms, "specular", 0.0)
+        _set_vop_parm(ms, "specular_roughness", 1.0)
+        _set_vop_parm(ms, "emission", ground_emission if use_emissive else 0.0)
+        kuv = ml.createNode("mtlxtexcoord", "ground_mtlx_uv")
+        _set_vop_parm(kuv, "index", 0)
+        ktex = ml.createNode("mtlximage", "ground_mtlx_col")
+        _set_vop_parm(ktex, "signature", "color3")
+        _set_vop_parm(ktex, "file", ground_tex)
+        _set_vop_parm(ktex, "uaddressmode", "clamp")
+        _set_vop_parm(ktex, "vaddressmode", "clamp")
+        _vop_connect(ktex, "texcoord", kuv, "out")
+        kop = ml.createNode("mtlximage", "ground_mtlx_op")
+        _set_vop_parm(kop, "signature", "color3")
+        _set_vop_parm(kop, "file", ground_op_tex)
+        _set_vop_parm(kop, "uaddressmode", "clamp")
+        _set_vop_parm(kop, "vaddressmode", "clamp")
+        _vop_connect(kop, "texcoord", kuv, "out")
+        _vop_connect(ms, "base_color", ktex, "out")
+        _vop_connect(ms, "emission_color", ktex, "out")
+        _vop_connect(ms, "opacity", kop, "out")
+        return ms.name()
+
+    # Fallback UsdPreviewSurface
     ups = ml.createNode("usdpreviewsurface", "ground_preview")
     _set_vop_parm(ups, "roughness", 1.0)
     _set_vop_parm(ups, "metallic", 0.0)
@@ -601,102 +695,7 @@ def _create_ground_proj_collect(
     _set_vop_parm(uop, "wrapT", "clamp")
     _vop_connect(uop, "st", pvr, "result")
     _vop_connect(ups, "opacity", uop, "r")
-    col.setInput(0, ups, 0)
-
-    # 2. Karma MaterialX
-    if "mtlxstandard_surface" in vop_types and "mtlximage" in vop_types:
-        ms = ml.createNode("mtlxstandard_surface", "ground_mtlx")
-        _set_vop_parm(ms, "base", 1.0 if use_diffuse else 0.0)
-        _set_vop_parm(ms, "specular", 0.0)
-        _set_vop_parm(ms, "specular_roughness", 1.0)
-        _set_vop_parm(ms, "emission", ground_emission if use_emissive else 0.0)
-        kuv = ml.createNode("mtlxtexcoord", "ground_mtlx_uv")
-        _set_vop_parm(kuv, "index", 0)
-        ktex = ml.createNode("mtlximage", "ground_mtlx_col")
-        _set_vop_parm(ktex, "signature", "color3")
-        _set_vop_parm(ktex, "file", ground_tex)
-        _set_vop_parm(ktex, "uaddressmode", "clamp")
-        _set_vop_parm(ktex, "vaddressmode", "clamp")
-        _vop_connect(ktex, "texcoord", kuv, "out")
-        kop = ml.createNode("mtlximage", "ground_mtlx_op")
-        _set_vop_parm(kop, "signature", "color3")
-        _set_vop_parm(kop, "file", ground_op_tex)
-        _set_vop_parm(kop, "uaddressmode", "clamp")
-        _set_vop_parm(kop, "vaddressmode", "clamp")
-        _vop_connect(kop, "texcoord", kuv, "out")
-        _vop_connect(ms, "base_color", ktex, "out")
-        _vop_connect(ms, "emission_color", ktex, "out")
-        _vop_connect(ms, "opacity", kop, "out")
-        col.setInput(1, ms, 0)
-
-    # 3. Redshift Standard Material
-    if "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
-        rsm = ml.createNode("redshift_usd_material", "ground_rs_mat")
-        rstd = ml.createNode("redshift::StandardMaterial", "ground_rs_std")
-        _set_vop_parm(rstd, "base_color_weight", 1.0 if use_diffuse else 0.0)
-        _set_vop_parm(rstd, "refl_weight", 0.0)
-        _set_vop_parm(rstd, "refl_roughness", 1.0)
-        _set_vop_parm(rstd, "coat_weight", 0.0)
-        _set_vop_parm(rstd, "sheen_weight", 0.0)
-        _set_vop_parm(rstd, "emission_weight", ground_emission if use_emissive else 0.0)
-        rtex = ml.createNode("redshift::TextureSampler", "ground_rs_col")
-        _set_vop_parm(rtex, "tex0", ground_tex)
-        _set_vop_parm(rtex, "tex0_colorSpace", "Raw")
-        _set_vop_parm(rtex, "tspace_id", "st")
-        _set_vop_parm(rtex, "wrapU", 0)
-        _set_vop_parm(rtex, "wrapV", 0)
-        rop = ml.createNode("redshift::TextureSampler", "ground_rs_op")
-        _set_vop_parm(rop, "tex0", ground_op_tex)
-        _set_vop_parm(rop, "tex0_colorSpace", "Raw")
-        _set_vop_parm(rop, "tspace_id", "st")
-        _set_vop_parm(rop, "wrapU", 0)
-        _set_vop_parm(rop, "wrapV", 0)
-        _vop_connect(rstd, "base_color", rtex, "outColor")
-        _vop_connect(rstd, "emission_color", rtex, "outColor")
-        _vop_connect(rstd, "opacity_color", rop, "outColor")
-        _vop_connect(rsm, "Surface", rstd, "outColor")
-        col.setNextInput(rsm, 0)
-
-    # 4. Arnold Standard Surface / Shadow Matte (when HtoA VOPs are available)
-    if "arnold::standard_surface" in vop_types:
-        atex = ml.createNode("arnold::image", "ground_ai_col")
-        _set_vop_parm(atex, "filename", ground_tex)
-        _set_vop_parm(atex, "color_space", "raw")
-        _set_vop_parm(atex, "swrap", "clamp")
-        _set_vop_parm(atex, "twrap", "clamp")
-        _set_vop_parm(atex, "uvset", "st")
-        aop = ml.createNode("arnold::image", "ground_ai_op")
-        _set_vop_parm(aop, "filename", ground_op_tex)
-        _set_vop_parm(aop, "color_space", "raw")
-        _set_vop_parm(aop, "swrap", "clamp")
-        _set_vop_parm(aop, "twrap", "clamp")
-        _set_vop_parm(aop, "uvset", "st")
-        if is_shadow_catcher and "arnold::shadow_matte" in vop_types:
-            ai = ml.createNode("arnold::shadow_matte", "ground_ai_matte")
-            _set_vop_parm(ai, "background_type", 0)
-            _set_vop_parm_tuple(ai, "background_color", (0.0, 0.0, 0.0))
-            _set_vop_parm_tuple(ai, "shadow_color", (0.0, 0.0, 0.0))
-            _set_vop_parm(ai, "shadow_opacity", 1.0)
-            _set_vop_parm(ai, "diffuse_intensity", 0.0)
-            _set_vop_parm(ai, "indirect_diffuse_enable", True)
-            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
-        else:
-            ai = ml.createNode("arnold::standard_surface", "ground_ai_std")
-            _set_vop_parm(ai, "base", 1.0 if use_diffuse else 0.0)
-            _set_vop_parm(ai, "specular", 0.0)
-            _set_vop_parm(ai, "specular_roughness", 1.0)
-            _set_vop_parm(ai, "emission", ground_emission if use_emissive else 0.0)
-            _vop_connect(ai, "base_color", atex, ("rgb", "out", "rgba"))
-            _vop_connect(ai, "emission_color", atex, ("rgb", "out", "rgba"))
-            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
-        if "arnold_material" in vop_types:
-            amat = ml.createNode("arnold_material", "ground_ai_mat")
-            _vop_connect(amat, ("surface", "Surface"), ai, ("shader", "out", "rgb"), fallback_in=0)
-            col.setNextInput(amat, 0)
-        else:
-            col.setNextInput(ai, 0)
-
-    return col.name()
+    return ups.name()
 
 
 def _build_lookdev_material_library(
@@ -709,8 +708,9 @@ def _build_lookdev_material_library(
     use_emissive: bool,
     ground_emission: float,
     is_shadow_catcher: bool,
+    render_engine: str = "Karma (MaterialX)",
 ):
-    """Create or rebuild the Solaris Material Library LOP with 5 unique multi-renderer materials."""
+    """Create or rebuild the Solaris Material Library LOP with 5 unique materials for the chosen render engine."""
     ml = _create_lop(stage_net, ("materiallibrary",), mat_lib_name)
     for child in list(ml.children()):
         try:
@@ -723,27 +723,29 @@ def _build_lookdev_material_library(
 
     entries = [
         (
-            _create_pbr_collect(ml, "tripod_stand_mtl", (0.08, 0.08, 0.09), 0.85, 0.35, vop_types),
+            _create_pbr_shader_for_engine(ml, "tripod_stand_mtl", (0.08, 0.08, 0.09), 0.85, 0.35, render_engine, vop_types),
             "/lookdev/materials/tripod_stand_mtl",
             "/lookdev/tripod/stand/* /lookdev/tripod/macbeth/chart/backing",
         ),
         (
-            _create_pbr_collect(ml, "chrome_mtl", (0.95, 0.95, 0.95), 1.0, 0.001, vop_types),
+            _create_pbr_shader_for_engine(ml, "chrome_mtl", (0.95, 0.95, 0.95), 1.0, 0.001, render_engine, vop_types),
             "/lookdev/materials/chrome_mtl",
             "/lookdev/tripod/spheres/chrome_sphere",
         ),
         (
-            _create_pbr_collect(ml, "grey_18_mtl", (0.18, 0.18, 0.18), 0.0, 0.6, vop_types),
+            _create_pbr_shader_for_engine(ml, "grey_18_mtl", (0.18, 0.18, 0.18), 0.0, 0.6, render_engine, vop_types),
             "/lookdev/materials/grey_18_mtl",
             "/lookdev/tripod/spheres/grey_sphere",
         ),
         (
-            _create_pbr_collect(ml, "macbeth_mtl", (0.18, 0.18, 0.18), 0.0, 0.85, vop_types, use_display_color=True),
+            _create_pbr_shader_for_engine(
+                ml, "macbeth_mtl", (0.18, 0.18, 0.18), 0.0, 0.85, render_engine, vop_types, use_display_color=True
+            ),
             "/lookdev/materials/macbeth_mtl",
             "/lookdev/tripod/macbeth/chart/patch_*",
         ),
         (
-            _create_ground_proj_collect(
+            _create_ground_shader_for_engine(
                 ml,
                 ground_tex=ground_tex,
                 ground_op_tex=ground_op_tex,
@@ -751,6 +753,7 @@ def _build_lookdev_material_library(
                 use_emissive=use_emissive,
                 ground_emission=ground_emission,
                 is_shadow_catcher=is_shadow_catcher,
+                render_engine=render_engine,
                 vop_types=vop_types,
             ),
             "/lookdev/materials/ground_proj_mtl",
@@ -782,6 +785,7 @@ def create_or_update_lookdev_and_ground(
     tripod_height: float = 1.5,
     ground_emission: float = 0.5,
     ground_shader_mode: str = "Emissive + Diffuse",
+    render_engine: str = "Karma (MaterialX)",
     node_name: str = "hdri_maker_lookdev",
     set_display_flag: bool = True,
 ):
@@ -1040,6 +1044,7 @@ if is_shadow_catcher:
         use_emissive=bool(use_emissive),
         ground_emission=max(0.0, float(ground_emission)),
         is_shadow_catcher=bool(is_shadow_catcher),
+        render_engine=render_engine,
     )
 
     try:

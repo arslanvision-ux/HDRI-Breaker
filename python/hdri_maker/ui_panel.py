@@ -1817,6 +1817,17 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.ground_feather_slider.setToolTip("Radial opacity feather width for the circular ground projection (0 = sharp edge, 1 = full radius fade)")
         self.ground_emission_slider = SliderResetControl(0.0, 2.0, 0.5, 0.05, decimals=2)
         self.ground_emission_slider.setToolTip("Self-illumination / emission multiplier for the projected ground texture (helps match HDRI ground brightness)")
+        self.render_engine_combo = QtWidgets.QComboBox()
+        self.render_engine_combo.addItems([
+            "Karma (MaterialX)",
+            "Redshift",
+            "Arnold",
+        ])
+        self.render_engine_combo.setToolTip(
+            "Target Solaris render engine for the Material Library (/stage/hdri_maker_materials).\n"
+            "Creates native shaders for the selected renderer and assigns them to the Lookdev Tripod and Ground Disc."
+        )
+        self.render_engine_combo.currentIndexChanged.connect(self._on_render_engine_changed)
         self.ground_shader_combo = QtWidgets.QComboBox()
         self.ground_shader_combo.addItems([
             "Emissive + Diffuse",
@@ -1836,6 +1847,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         lookdev_form.addRow("Ground Proj Blur:", self.ground_proj_blur_slider)
         lookdev_form.addRow("Ground Feather:", self.ground_feather_slider)
         lookdev_form.addRow("Ground Emission:", self.ground_emission_slider)
+        lookdev_form.addRow("Render Engine:", self.render_engine_combo)
         lookdev_form.addRow("Ground Shader:", self.ground_shader_combo)
         layout.addLayout(lookdev_form)
 
@@ -3179,9 +3191,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 tripod_height=tripod_h,
                 ground_emission=self.ground_emission_slider.value(),
                 ground_shader_mode=self.ground_shader_combo.currentText(),
+                render_engine=self.render_engine_combo.currentText(),
             )
             return " + Lookdev Tripod & Ground (/lookdev)"
         return f" + Ground Proj EXR: {g_tex_path}"
+
+    def _on_render_engine_changed(self) -> None:
+        if HAS_HOU and self._profile is not None and self._last_exr_path and self.lookdev_chk.isChecked():
+            self._on_update_lookdev_clicked()
 
     def _on_update_lookdev_clicked(self) -> None:
         if self._profile is None:
@@ -3435,6 +3452,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "ground_proj_blur": self.ground_proj_blur_slider.value(),
             "ground_feather": self.ground_feather_slider.value(),
             "ground_emission": self.ground_emission_slider.value(),
+            "render_engine": self.render_engine_combo.currentText(),
             "ground_shader_mode": self.ground_shader_combo.currentText(),
             "preview_ev": self.preview_ev_slider.value(),
             "preview_tonemap": self.preview_tonemap_combo.currentText(),
@@ -3552,6 +3570,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.ground_proj_blur_slider.setValue(float(data.get("ground_proj_blur", 0.0)))
         self.ground_feather_slider.setValue(float(data.get("ground_feather", 0.45)))
         self.ground_emission_slider.setValue(float(data.get("ground_emission", 0.5)))
+        if "render_engine" in data:
+            self.render_engine_combo.setCurrentText(str(data["render_engine"]))
         if "ground_shader_mode" in data:
             self.ground_shader_combo.setCurrentText(str(data["ground_shader_mode"]))
 
