@@ -354,11 +354,24 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertAlmostEqual(widget.preview_label.zoom_factor(), 1.0)
         widget.yaw_spin.setValue(45.0)
         widget.vshift_spin.setValue(-10.0)
+        widget.render_engine_combo.setCurrentText("Arnold")
         state = widget.get_state_dict()
         widget2 = HDRIMakerWidget(restore_session=False)
         widget2.apply_state_dict(state, auto_analyze=False)
         self.assertAlmostEqual(widget2.yaw_spin.value(), 45.0)
         self.assertAlmostEqual(widget2.vshift_spin.value(), -10.0)
+        self.assertEqual(widget2.render_engine_combo.currentText(), "Arnold")
+
+        # Verify scene-level userData persistence across close & reopen
+        import hou
+        widget.plate_path_edit.setText("")
+        widget._auto_save_session()
+        self.assertTrue(bool(hou.node("/").userData("hdri_maker_state")))
+        widget3 = HDRIMakerWidget(restore_session=True)
+        self.assertAlmostEqual(widget3.yaw_spin.value(), 45.0)
+        self.assertEqual(widget3.render_engine_combo.currentText(), "Arnold")
+        widget3.close()
+
         widget.yaw_spin.reset()
         self.assertAlmostEqual(widget.yaw_spin.value(), 0.0)
         widget.close()

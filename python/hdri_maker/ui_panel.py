@@ -2840,6 +2840,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._refresh_plate_transform_bar()
             self._populate_analysis_ui(self._profile, len(self._frame_profiles))
             self._regenerate_preview()
+            self._auto_save_session()
             self.status_label.setText(
                 f"Analyzed {len(self._frame_profiles)} frame(s). "
                 f"Overall CCT: {self._profile.overall_cct_kelvin:.0f} K, "
@@ -3588,21 +3589,50 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _auto_save_session(self) -> None:
         try:
+            state_json = json.dumps(self.get_state_dict(), indent=2)
             with open(SESSION_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.get_state_dict(), f, indent=2)
+                f.write(state_json)
+            if HAS_HOU:
+                try:
+                    root_node = hou.node("/")
+                    if root_node is not None:
+                        root_node.setUserData("hdri_maker_state", state_json)
+                except Exception:
+                    pass
         except Exception:
             pass
 
+    def _auto_analyze_restored_plates(self) -> None:
+        if self.multiview_table.rowCount() > 0 or self.plate_path_edit.text().strip():
+            self._on_analyze_clicked()
+
     def _auto_load_session(self) -> None:
-        if not os.path.isfile(SESSION_STATE_PATH):
+        data = None
+        if HAS_HOU:
+            try:
+                root_node = hou.node("/")
+                if root_node is not None:
+                    raw = root_node.userData("hdri_maker_state")
+                    if raw:
+                        data = json.loads(raw)
+            except Exception:
+                data = None
+        if data is None and os.path.isfile(SESSION_STATE_PATH):
+            try:
+                with open(SESSION_STATE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
             return
         try:
-            with open(SESSION_STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
             self.apply_state_dict(data, auto_analyze=False)
-            self.status_label.setText(
-                "Restored last session settings. Click 'Analyze Plate(s)' to regenerate preview."
-            )
+            has_plates = self.multiview_table.rowCount() > 0 or bool(self.plate_path_edit.text().strip())
+            if has_plates:
+                self.status_label.setText("Restored scene session; reloading plates and preview...")
+                QtCore.QTimer.singleShot(50, self._auto_analyze_restored_plates)
+            else:
+                self.status_label.setText("Restored last session settings.")
         except Exception:
             pass
 
