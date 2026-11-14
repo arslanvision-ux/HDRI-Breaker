@@ -315,6 +315,10 @@ class TestHDRIMaker(unittest.TestCase):
         i0, i1, i2 = c_idx[f_off], c_idx[f_off + 1], c_idx[f_off + 2]
         face_nrm = Gf.Cross(c_pts[i1] - c_pts[i0], c_pts[i2] - c_pts[i0])
         self.assertGreater(Gf.Dot(face_nrm, c_nrms[i0]), 0.0)
+        # Verify ground_disc sets arnold:opaque=False so Arnold evaluates feathered opacity
+        disc_prim = stage.GetPrimAtPath("/lookdev/ground_disc")
+        self.assertTrue(disc_prim.IsValid())
+        self.assertIs(disc_prim.GetAttribute("primvars:arnold:opaque").Get(), False)
 
         # Switch render_engine to Redshift and verify native Redshift Material Library outputs
         rs_lib = create_or_update_lookdev_and_ground(

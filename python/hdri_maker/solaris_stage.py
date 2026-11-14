@@ -1006,11 +1006,13 @@ disc.GetFaceVertexCountsAttr().Set(g_counts)
 disc.GetFaceVertexIndicesAttr().Set(g_indices)
 disc.GetNormalsAttr().Set(g_nrms)
 disc.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
-UsdGeom.PrimvarsAPI(disc).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(g_uvs)
-UsdGeom.PrimvarsAPI(disc).CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set(g_opacities)
+disc_pv = UsdGeom.PrimvarsAPI(disc)
+disc_pv.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(g_uvs)
+disc_pv.CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set(g_opacities)
+# Arnold requires opaque=False on polymesh prims to evaluate feathered shader opacity
+disc_pv.CreatePrimvar("arnold:opaque", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(False)
 
 if is_shadow_catcher:
-    disc_pv = UsdGeom.PrimvarsAPI(disc)
     # Karma native Shadow Catcher (Shadows-Only Holdout Mode = 2)
     disc_pv.CreatePrimvar("karma:object:matte", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
     disc_pv.CreatePrimvar("karma:object:holdoutmode", Sdf.ValueTypeNames.Int, UsdGeom.Tokens.constant).Set(2)
