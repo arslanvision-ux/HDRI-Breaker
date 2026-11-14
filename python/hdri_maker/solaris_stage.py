@@ -868,7 +868,8 @@ def _build_smooth_sphere(path, radius, rings=48, sectors=96):
             p0 = r * (sectors + 1) + s
             p1 = (r + 1) * (sectors + 1) + s
             counts.append(4)
-            indices.extend([p0, p1, p1 + 1, p0 + 1])
+            # Counter-clockwise outward right-handed winding matching vertex normals
+            indices.extend([p0, p0 + 1, p1 + 1, p1])
     mesh.GetPointsAttr().Set(pts)
     mesh.GetFaceVertexCountsAttr().Set(counts)
     mesh.GetFaceVertexIndicesAttr().Set(indices)
