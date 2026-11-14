@@ -18,7 +18,7 @@
 
 ## Quick Installation
 
-### Linux (Rocky Linux 8 / Rocky Linux 9 / AlmaLinux / RHEL / Ubuntu)
+### Linux (Rocky Linux 9 / AlmaLinux / RHEL / Ubuntu)
 
 Runs out-of-the-box with zero external dependencies (works even if `.sh` executable permissions were stripped by `.zip` downloads or if `~/houdini20.5` / `~/houdini21.0` has not been created yet):
 
