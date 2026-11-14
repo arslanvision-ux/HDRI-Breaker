@@ -266,14 +266,16 @@ class TestHDRIMaker(unittest.TestCase):
         write_exr_32f(g_tex_exr, g_rgb, output_colorspace="ACEScg")
         write_exr_32f(g_op_exr, g_op, output_colorspace="Linear Rec.709")
 
-        lookdev_lop = create_or_update_lookdev_and_ground(
+        mat_lib = create_or_update_lookdev_and_ground(
             g_tex_exr, g_op_exr, parent_node=dome, colorspace="ACEScg"
         )
+        self.assertEqual(mat_lib.type().name(), "materiallibrary")
+        lookdev_lop = mat_lib.inputs()[0]
         # Even when parent_node=dome is passed, lookdev_lop must wire after the last light (disk_light)
         self.assertEqual(lookdev_lop.inputs()[0].path(), disk_light.path())
-        self.assertTrue(lookdev_lop.isDisplayFlagSet())
+        self.assertTrue(mat_lib.isDisplayFlagSet())
 
-        # Creating/updating a new area light after lookdev_lop already exists must keep lookdev_lop at the end
+        # Creating/updating a new area light after lookdev_lop already exists must keep lookdev_lop + mat_lib at the end
         extra_light = create_or_update_area_light_from_hotspot(
             light_info,
             light_tex_exr_path=light_exr,
@@ -283,27 +285,31 @@ class TestHDRIMaker(unittest.TestCase):
             set_display_flag=True,
         )
         self.assertEqual(lookdev_lop.inputs()[0].path(), extra_light.path())
-        self.assertTrue(lookdev_lop.isDisplayFlagSet())
+        self.assertEqual(mat_lib.inputs()[0].path(), lookdev_lop.path())
+        self.assertTrue(mat_lib.isDisplayFlagSet())
 
-        stage = lookdev_lop.stage()
+        stage = mat_lib.stage()
         self.assertTrue(stage.GetPrimAtPath("/lookdev/tripod/spheres/chrome_sphere").IsValid())
         self.assertTrue(stage.GetPrimAtPath("/lookdev/tripod/spheres/grey_sphere").IsValid())
         self.assertTrue(stage.GetPrimAtPath("/lookdev/tripod/macbeth/chart/patch_00").IsValid())
         self.assertTrue(stage.GetPrimAtPath("/lookdev/ground_disc").IsValid())
         g_mtl = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl")
         self.assertTrue(g_mtl.IsValid())
-        self.assertTrue(g_mtl.GetAttribute("outputs:karma:surface").IsValid())
-        self.assertTrue(g_mtl.GetAttribute("outputs:arnold:surface").IsValid())
+        self.assertTrue(g_mtl.GetAttribute("outputs:surface").IsValid())
+        self.assertTrue(g_mtl.GetAttribute("outputs:mtlx:surface").IsValid())
         self.assertTrue(g_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
-        rs_std = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/RedshiftStd")
+        rs_std = stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/ground_rs_std")
         self.assertTrue(rs_std.IsValid())
         self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_weight").Get()), 0.0, places=5)
-        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:coat_weight").Get()), 0.0, places=5)
-        mb_mtl = stage.GetPrimAtPath("/lookdev/materials/macbeth_00")
+        self.assertAlmostEqual(float(rs_std.GetAttribute("inputs:refl_roughness").Get()), 1.0, places=5)
+        # Single unique macbeth_mtl shader instead of 24 per-patch materials
+        mb_mtl = stage.GetPrimAtPath("/lookdev/materials/macbeth_mtl")
         self.assertTrue(mb_mtl.IsValid())
+        self.assertTrue(mb_mtl.GetAttribute("outputs:mtlx:surface").IsValid())
         self.assertTrue(mb_mtl.GetAttribute("outputs:Redshift:surface").IsValid())
+        self.assertFalse(stage.GetPrimAtPath("/lookdev/materials/macbeth_00").IsValid())
 
-        # Verify Shadow Catcher (Matte) sets Karma holdoutmode=2, Arnold shadow_matte, and Redshift matte primvars
+        # Verify Shadow Catcher (Matte) sets Karma holdoutmode=2 and Redshift matte primvars
         sc_lop = create_or_update_lookdev_and_ground(
             g_tex_exr,
             g_op_exr,
@@ -319,9 +325,6 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertTrue(sc_disc.GetAttribute("primvars:redshift:object:RS_objprop_matte_showbackg").Get())
         self.assertTrue(sc_disc.GetAttribute("primvars:redshift:object:RS_objprop_matte_shadowenable").Get())
         self.assertTrue(sc_disc.GetAttribute("primvars:redshift:object:RS_objprop_matte_shadowalpha").Get())
-        sc_arnold_shader = sc_stage.GetPrimAtPath("/lookdev/materials/ground_proj_mtl/ArnoldShadowMatte")
-        self.assertTrue(sc_arnold_shader.IsValid())
-        self.assertEqual(sc_arnold_shader.GetAttribute("info:id").Get(), "arnold:shadow_matte")
 
         # Verify UI widget instantiates cleanly under current Qt binding (PySide2 or PySide6)
         from hdri_maker.qt_compat import QtWidgets

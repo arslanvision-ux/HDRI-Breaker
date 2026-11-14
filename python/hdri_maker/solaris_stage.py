@@ -36,10 +36,12 @@ def _resolve_valid_parent_lop(stage_net, parent_node):
     if parent_node is not None:
         try:
             parent_node.path()
-            if parent_node.name() == "hdri_maker_lookdev":
-                ins = parent_node.inputs()
-                if ins and ins[0] is not None:
-                    return ins[0]
+            if parent_node.name() in ("hdri_maker_lookdev", "hdri_maker_materials"):
+                lookdev_node = stage_net.node("hdri_maker_lookdev") if parent_node.name() == "hdri_maker_materials" else parent_node
+                if lookdev_node is not None:
+                    ins = lookdev_node.inputs()
+                    if ins and ins[0] is not None:
+                        return ins[0]
             return parent_node
         except Exception:
             pass
@@ -116,9 +118,20 @@ def _rewire_lookdev_to_tail(stage_net, tail_light_node, set_display_flag: bool =
             lookdev.moveToGoodPosition()
         except Exception:
             pass
+    try:
+        mat_lib = stage_net.node("hdri_maker_materials")
+    except Exception:
+        mat_lib = None
+    if mat_lib is not None:
+        try:
+            mat_lib.setInput(0, lookdev)
+            mat_lib.moveToGoodPosition()
+        except Exception:
+            pass
+    display_target = mat_lib if mat_lib is not None else lookdev
     if set_display_flag:
         try:
-            lookdev.setDisplayFlag(True)
+            display_target.setDisplayFlag(True)
         except Exception:
             pass
     return True
@@ -411,6 +424,328 @@ def create_hotspot_light_rig(
     return created
 
 
+def _vop_connect(dst, input_name: str, src, output_name: Optional[str] = None) -> None:
+    """Connect `src` output to `dst` named input if both exist."""
+    idx = dst.inputIndex(input_name)
+    if idx < 0:
+        return
+    out_idx = 0
+    if output_name:
+        oi = src.outputIndex(output_name)
+        if oi >= 0:
+            out_idx = oi
+    dst.setInput(idx, src, out_idx)
+
+
+def _set_vop_parm(node, name: str, value) -> None:
+    p = node.parm(name)
+    if p is not None:
+        p.set(value)
+
+
+def _set_vop_parm_tuple(node, name: str, value) -> None:
+    pt = node.parmTuple(name)
+    if pt is not None:
+        pt.set(value)
+
+
+def _create_pbr_collect(
+    ml,
+    name: str,
+    color_rgb: Tuple[float, float, float],
+    metallic: float,
+    roughness: float,
+    vop_types,
+    use_display_color: bool = False,
+) -> str:
+    """Create a multi-renderer collect VOP inside a Solaris Material Library."""
+    col = ml.createNode("collect", f"{name}_collect")
+    spec_w = 1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness))
+
+    # 1. UsdPreviewSurface (GL / Storm fallback)
+    ups = ml.createNode("usdpreviewsurface", f"{name}_preview")
+    _set_vop_parm(ups, "metallic", float(metallic))
+    _set_vop_parm(ups, "roughness", float(roughness))
+    if use_display_color and "usdprimvarreader" in vop_types:
+        pvr = ml.createNode("usdprimvarreader", f"{name}_preview_dc")
+        _set_vop_parm(pvr, "signature", "float3")
+        _set_vop_parm(pvr, "varname", "displayColor")
+        _vop_connect(ups, "diffuseColor", pvr, "result")
+    else:
+        _set_vop_parm_tuple(ups, "diffuseColor", color_rgb)
+    col.setInput(0, ups, 0)
+
+    # 2. Karma MaterialX
+    if "mtlxstandard_surface" in vop_types:
+        ms = ml.createNode("mtlxstandard_surface", f"{name}_mtlx")
+        _set_vop_parm(ms, "base", 1.0)
+        _set_vop_parm(ms, "metalness", float(metallic))
+        _set_vop_parm(ms, "specular", spec_w)
+        _set_vop_parm(ms, "specular_roughness", float(roughness))
+        if use_display_color and "mtlxgeompropvalue" in vop_types:
+            mg = ml.createNode("mtlxgeompropvalue", f"{name}_mtlx_dc")
+            _set_vop_parm(mg, "signature", "color3")
+            _set_vop_parm(mg, "geomprop", "displayColor")
+            _vop_connect(ms, "base_color", mg, "out")
+        else:
+            _set_vop_parm_tuple(ms, "base_color", color_rgb)
+        col.setInput(1, ms, 0)
+
+    # 3. Redshift Standard Material
+    if "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
+        rsm = ml.createNode("redshift_usd_material", f"{name}_rs_mat")
+        rstd = ml.createNode("redshift::StandardMaterial", f"{name}_rs_std")
+        _set_vop_parm(rstd, "base_color_weight", 1.0)
+        _set_vop_parm(rstd, "metalness", float(metallic))
+        _set_vop_parm(rstd, "refl_weight", spec_w)
+        _set_vop_parm(rstd, "refl_roughness", float(roughness))
+        if use_display_color and "redshift::RSUserDataColor" in vop_types:
+            rud = ml.createNode("redshift::RSUserDataColor", f"{name}_rs_dc")
+            _set_vop_parm(rud, "attribute", "displayColor")
+            _vop_connect(rstd, "base_color", rud, "out")
+        else:
+            _set_vop_parm_tuple(rstd, "base_color", color_rgb)
+        _vop_connect(rsm, "Surface", rstd, "outColor")
+        col.setNextInput(rsm, 0)
+
+    # 4. Arnold Standard Surface (when HtoA VOPs are available)
+    if "arnold_material" in vop_types and "arnold::standard_surface" in vop_types:
+        amat = ml.createNode("arnold_material", f"{name}_ai_mat")
+        astd = ml.createNode("arnold::standard_surface", f"{name}_ai_std")
+        _set_vop_parm(astd, "base", 1.0)
+        _set_vop_parm(astd, "metalness", float(metallic))
+        _set_vop_parm(astd, "specular", spec_w)
+        _set_vop_parm(astd, "specular_roughness", float(roughness))
+        if use_display_color and "arnold::user_data_rgb" in vop_types:
+            aud = ml.createNode("arnold::user_data_rgb", f"{name}_ai_dc")
+            _set_vop_parm(aud, "attribute", "displayColor")
+            _vop_connect(astd, "base_color", aud, "out")
+        else:
+            _set_vop_parm_tuple(astd, "base_color", color_rgb)
+        _vop_connect(amat, "surface", astd, "out")
+        col.setNextInput(amat, 0)
+
+    return col.name()
+
+
+def _create_ground_proj_collect(
+    ml,
+    ground_tex: str,
+    ground_op_tex: str,
+    use_diffuse: bool,
+    use_emissive: bool,
+    ground_emission: float,
+    is_shadow_catcher: bool,
+    vop_types,
+) -> str:
+    """Create the multi-renderer ground_proj_mtl collect VOP inside a Solaris Material Library."""
+    col = ml.createNode("collect", "ground_proj_collect")
+
+    # 1. UsdPreviewSurface
+    ups = ml.createNode("usdpreviewsurface", "ground_preview")
+    _set_vop_parm(ups, "roughness", 1.0)
+    _set_vop_parm(ups, "metallic", 0.0)
+    _set_vop_parm(ups, "opacityThreshold", 0.0)
+    pvr = ml.createNode("usdprimvarreader", "ground_preview_uv")
+    _set_vop_parm(pvr, "signature", "float2")
+    _set_vop_parm(pvr, "varname", "st")
+    utex = ml.createNode("usduvtexture", "ground_preview_col")
+    _set_vop_parm(utex, "file", ground_tex)
+    _set_vop_parm(utex, "sourceColorSpace", "raw")
+    _set_vop_parm(utex, "wrapS", "clamp")
+    _set_vop_parm(utex, "wrapT", "clamp")
+    _vop_connect(utex, "st", pvr, "result")
+    if use_diffuse:
+        _vop_connect(ups, "diffuseColor", utex, "rgb")
+    else:
+        _set_vop_parm_tuple(ups, "diffuseColor", (0.0, 0.0, 0.0))
+    if use_emissive and ground_emission > 0.0:
+        uem = ml.createNode("usduvtexture", "ground_preview_em")
+        _set_vop_parm(uem, "file", ground_tex)
+        _set_vop_parm(uem, "sourceColorSpace", "raw")
+        _set_vop_parm(uem, "wrapS", "clamp")
+        _set_vop_parm(uem, "wrapT", "clamp")
+        _set_vop_parm_tuple(uem, "scale", (ground_emission, ground_emission, ground_emission, 1.0))
+        _vop_connect(uem, "st", pvr, "result")
+        _vop_connect(ups, "emissiveColor", uem, "rgb")
+    else:
+        _set_vop_parm_tuple(ups, "emissiveColor", (0.0, 0.0, 0.0))
+    uop = ml.createNode("usduvtexture", "ground_preview_op")
+    _set_vop_parm(uop, "file", ground_op_tex)
+    _set_vop_parm(uop, "sourceColorSpace", "raw")
+    _set_vop_parm(uop, "wrapS", "clamp")
+    _set_vop_parm(uop, "wrapT", "clamp")
+    _vop_connect(uop, "st", pvr, "result")
+    _vop_connect(ups, "opacity", uop, "r")
+    col.setInput(0, ups, 0)
+
+    # 2. Karma MaterialX
+    if "mtlxstandard_surface" in vop_types and "mtlximage" in vop_types:
+        ms = ml.createNode("mtlxstandard_surface", "ground_mtlx")
+        _set_vop_parm(ms, "base", 1.0 if use_diffuse else 0.0)
+        _set_vop_parm(ms, "specular", 0.0)
+        _set_vop_parm(ms, "specular_roughness", 1.0)
+        _set_vop_parm(ms, "emission", ground_emission if use_emissive else 0.0)
+        kuv = ml.createNode("mtlxtexcoord", "ground_mtlx_uv")
+        _set_vop_parm(kuv, "index", 0)
+        ktex = ml.createNode("mtlximage", "ground_mtlx_col")
+        _set_vop_parm(ktex, "signature", "color3")
+        _set_vop_parm(ktex, "file", ground_tex)
+        _set_vop_parm(ktex, "uaddressmode", "clamp")
+        _set_vop_parm(ktex, "vaddressmode", "clamp")
+        _vop_connect(ktex, "texcoord", kuv, "out")
+        kop = ml.createNode("mtlximage", "ground_mtlx_op")
+        _set_vop_parm(kop, "signature", "color3")
+        _set_vop_parm(kop, "file", ground_op_tex)
+        _set_vop_parm(kop, "uaddressmode", "clamp")
+        _set_vop_parm(kop, "vaddressmode", "clamp")
+        _vop_connect(kop, "texcoord", kuv, "out")
+        _vop_connect(ms, "base_color", ktex, "out")
+        _vop_connect(ms, "emission_color", ktex, "out")
+        _vop_connect(ms, "opacity", kop, "out")
+        col.setInput(1, ms, 0)
+
+    # 3. Redshift Standard Material
+    if "redshift_usd_material" in vop_types and "redshift::StandardMaterial" in vop_types:
+        rsm = ml.createNode("redshift_usd_material", "ground_rs_mat")
+        rstd = ml.createNode("redshift::StandardMaterial", "ground_rs_std")
+        _set_vop_parm(rstd, "base_color_weight", 1.0 if use_diffuse else 0.0)
+        _set_vop_parm(rstd, "refl_weight", 0.0)
+        _set_vop_parm(rstd, "refl_roughness", 1.0)
+        _set_vop_parm(rstd, "coat_weight", 0.0)
+        _set_vop_parm(rstd, "sheen_weight", 0.0)
+        _set_vop_parm(rstd, "emission_weight", ground_emission if use_emissive else 0.0)
+        rtex = ml.createNode("redshift::TextureSampler", "ground_rs_col")
+        _set_vop_parm(rtex, "tex0", ground_tex)
+        _set_vop_parm(rtex, "tex0_colorSpace", "Raw")
+        _set_vop_parm(rtex, "tspace_id", "st")
+        _set_vop_parm(rtex, "wrapU", 0)
+        _set_vop_parm(rtex, "wrapV", 0)
+        rop = ml.createNode("redshift::TextureSampler", "ground_rs_op")
+        _set_vop_parm(rop, "tex0", ground_op_tex)
+        _set_vop_parm(rop, "tex0_colorSpace", "Raw")
+        _set_vop_parm(rop, "tspace_id", "st")
+        _set_vop_parm(rop, "wrapU", 0)
+        _set_vop_parm(rop, "wrapV", 0)
+        _vop_connect(rstd, "base_color", rtex, "outColor")
+        _vop_connect(rstd, "emission_color", rtex, "outColor")
+        _vop_connect(rstd, "opacity_color", rop, "outColor")
+        _vop_connect(rsm, "Surface", rstd, "outColor")
+        col.setNextInput(rsm, 0)
+
+    # 4. Arnold Standard Surface / Shadow Matte (when HtoA VOPs are available)
+    if "arnold_material" in vop_types and "arnold::standard_surface" in vop_types:
+        amat = ml.createNode("arnold_material", "ground_ai_mat")
+        atex = ml.createNode("arnold::image", "ground_ai_col")
+        _set_vop_parm(atex, "filename", ground_tex)
+        _set_vop_parm(atex, "color_space", "raw")
+        _set_vop_parm(atex, "swrap", "clamp")
+        _set_vop_parm(atex, "twrap", "clamp")
+        _set_vop_parm(atex, "uvset", "st")
+        aop = ml.createNode("arnold::image", "ground_ai_op")
+        _set_vop_parm(aop, "filename", ground_op_tex)
+        _set_vop_parm(aop, "color_space", "raw")
+        _set_vop_parm(aop, "swrap", "clamp")
+        _set_vop_parm(aop, "twrap", "clamp")
+        _set_vop_parm(aop, "uvset", "st")
+        if is_shadow_catcher and "arnold::shadow_matte" in vop_types:
+            ai = ml.createNode("arnold::shadow_matte", "ground_ai_matte")
+            _set_vop_parm(ai, "background_type", 0)
+            _set_vop_parm_tuple(ai, "background_color", (0.0, 0.0, 0.0))
+            _set_vop_parm_tuple(ai, "shadow_color", (0.0, 0.0, 0.0))
+            _set_vop_parm(ai, "shadow_opacity", 1.0)
+            _set_vop_parm(ai, "diffuse_intensity", 0.0)
+            _set_vop_parm(ai, "indirect_diffuse_enable", True)
+            _vop_connect(ai, "opacity", aop, "rgb")
+        else:
+            ai = ml.createNode("arnold::standard_surface", "ground_ai_std")
+            _set_vop_parm(ai, "base", 1.0 if use_diffuse else 0.0)
+            _set_vop_parm(ai, "specular", 0.0)
+            _set_vop_parm(ai, "specular_roughness", 1.0)
+            _set_vop_parm(ai, "emission", ground_emission if use_emissive else 0.0)
+            _vop_connect(ai, "base_color", atex, "rgb")
+            _vop_connect(ai, "emission_color", atex, "rgb")
+            _vop_connect(ai, "opacity", aop, "rgb")
+        _vop_connect(amat, "surface", ai, "out")
+        col.setNextInput(amat, 0)
+
+    return col.name()
+
+
+def _build_lookdev_material_library(
+    stage_net,
+    lookdev_lop,
+    mat_lib_name: str,
+    ground_tex: str,
+    ground_op_tex: str,
+    use_diffuse: bool,
+    use_emissive: bool,
+    ground_emission: float,
+    is_shadow_catcher: bool,
+):
+    """Create or rebuild the Solaris Material Library LOP with 5 unique multi-renderer materials."""
+    ml = _create_lop(stage_net, ("materiallibrary",), mat_lib_name)
+    for child in list(ml.children()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
+
+    vop_types = hou.vopNodeTypeCategory().nodeTypes()
+    _set_vop_parm(ml, "matpathprefix", "/lookdev/materials/")
+
+    entries = [
+        (
+            _create_pbr_collect(ml, "tripod_stand_mtl", (0.08, 0.08, 0.09), 0.85, 0.35, vop_types),
+            "/lookdev/materials/tripod_stand_mtl",
+            "/lookdev/tripod/stand/* /lookdev/tripod/macbeth/chart/backing",
+        ),
+        (
+            _create_pbr_collect(ml, "chrome_mtl", (0.95, 0.95, 0.95), 1.0, 0.001, vop_types),
+            "/lookdev/materials/chrome_mtl",
+            "/lookdev/tripod/spheres/chrome_sphere",
+        ),
+        (
+            _create_pbr_collect(ml, "grey_18_mtl", (0.18, 0.18, 0.18), 0.0, 0.6, vop_types),
+            "/lookdev/materials/grey_18_mtl",
+            "/lookdev/tripod/spheres/grey_sphere",
+        ),
+        (
+            _create_pbr_collect(ml, "macbeth_mtl", (0.18, 0.18, 0.18), 0.0, 0.85, vop_types, use_display_color=True),
+            "/lookdev/materials/macbeth_mtl",
+            "/lookdev/tripod/macbeth/chart/patch_*",
+        ),
+        (
+            _create_ground_proj_collect(
+                ml,
+                ground_tex=ground_tex,
+                ground_op_tex=ground_op_tex,
+                use_diffuse=use_diffuse,
+                use_emissive=use_emissive,
+                ground_emission=ground_emission,
+                is_shadow_catcher=is_shadow_catcher,
+                vop_types=vop_types,
+            ),
+            "/lookdev/materials/ground_proj_mtl",
+            "/lookdev/ground_disc",
+        ),
+    ]
+
+    _set_vop_parm(ml, "materials", len(entries))
+    for i, (vop_name, mat_path, geo_path) in enumerate(entries, start=1):
+        _set_vop_parm(ml, f"matnode{i}", vop_name)
+        _set_vop_parm(ml, f"matpath{i}", mat_path)
+        _set_vop_parm(ml, f"assign{i}", 1)
+        _set_vop_parm(ml, f"geopath{i}", geo_path)
+
+    ml.layoutChildren()
+    ml.setInput(0, lookdev_lop)
+    ml.bypass(False)
+    ml.moveToGoodPosition()
+    ml.cook(force=True)
+    return ml
+
+
 def create_or_update_lookdev_and_ground(
     ground_tex_exr_path: str,
     ground_opacity_exr_path: str,
@@ -484,54 +819,6 @@ def _rec709_to_acescg(c):
         0.020616 * r + 0.109570 * g + 0.869815 * b,
     )
 
-def _make_pbr_mtl(mtl_path, color, metallic=0.0, roughness=0.5):
-    mat = UsdShade.Material.Define(stage, mtl_path)
-    c3 = Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))
-
-    # 1. UsdPreviewSurface (GL viewport)
-    ups = UsdShade.Shader.Define(stage, f"{{mtl_path}}/PreviewSurface")
-    ups.CreateIdAttr("UsdPreviewSurface")
-    ups.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(c3)
-    ups.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
-    ups.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
-    mat.CreateSurfaceOutput().ConnectToSource(ups.ConnectableAPI(), "surface")
-
-    # 2. Karma MaterialX
-    km = UsdShade.Shader.Define(stage, f"{{mtl_path}}/KarmaMtlX")
-    km.CreateIdAttr("ND_standard_surface_surfaceshader")
-    km.CreateInput("base", Sdf.ValueTypeNames.Float).Set(1.0)
-    km.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).Set(c3)
-    km.CreateInput("metalness", Sdf.ValueTypeNames.Float).Set(float(metallic))
-    km.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness)))
-    km.CreateInput("specular_roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
-    mat.CreateSurfaceOutput("karma").ConnectToSource(km.ConnectableAPI(), "out")
-
-    # 3. Arnold Standard Surface
-    ai = UsdShade.Shader.Define(stage, f"{{mtl_path}}/ArnoldStandardSurface")
-    ai.CreateIdAttr("arnold:standard_surface")
-    ai.CreateInput("base", Sdf.ValueTypeNames.Float).Set(1.0)
-    ai.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).Set(c3)
-    ai.CreateInput("metalness", Sdf.ValueTypeNames.Float).Set(float(metallic))
-    ai.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness)))
-    ai.CreateInput("specular_roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
-    mat.CreateSurfaceOutput("arnold").ConnectToSource(ai.ConnectableAPI(), "shader")
-
-    # 4. Redshift Standard Material
-    rsm = UsdShade.Shader.Define(stage, f"{{mtl_path}}/RedshiftMaterial")
-    rsm.CreateIdAttr("redshift_usd_material")
-    rstd = UsdShade.Shader.Define(stage, f"{{mtl_path}}/RedshiftStd")
-    rstd.CreateIdAttr("redshift::StandardMaterial")
-    rstd.CreateInput("base_color_weight", Sdf.ValueTypeNames.Float).Set(1.0)
-    rstd.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).Set(c3)
-    rstd.CreateInput("metalness", Sdf.ValueTypeNames.Float).Set(float(metallic))
-    rstd.CreateInput("refl_weight", Sdf.ValueTypeNames.Float).Set(1.0 if metallic > 0.5 else max(0.0, 1.0 - float(roughness)))
-    rstd.CreateInput("refl_roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
-    rstd.CreateOutput("outColor", Sdf.ValueTypeNames.Color3f)
-    rsm.CreateInput("Surface", Sdf.ValueTypeNames.Token).ConnectToSource(rstd.ConnectableAPI(), "outColor")
-    rsm.CreateOutput("Shader", Sdf.ValueTypeNames.Token)
-    mat.CreateSurfaceOutput("Redshift").ConnectToSource(rsm.ConnectableAPI(), "Shader")
-    return mat
-
 def _build_smooth_sphere(path, radius, rings=48, sectors=96):
     mesh = UsdGeom.Mesh.Define(stage, path)
     pts, nrms, uvs, counts, indices = [], [], [], [], []
@@ -561,16 +848,10 @@ def _build_smooth_sphere(path, radius, rings=48, sectors=96):
 
 root = "/lookdev"
 _ensure_scope(root)
-_ensure_scope(f"{{root}}/materials")
 _ensure_scope(f"{{root}}/tripod")
 _ensure_scope(f"{{root}}/tripod/stand")
 _ensure_scope(f"{{root}}/tripod/spheres")
 _ensure_scope(f"{{root}}/tripod/macbeth")
-
-# Materials
-stand_mtl = _make_pbr_mtl(f"{{root}}/materials/tripod_stand_mtl", (0.08, 0.08, 0.09), metallic=0.85, roughness=0.35)
-chrome_mtl = _make_pbr_mtl(f"{{root}}/materials/chrome_mtl", (0.95, 0.95, 0.95), metallic=1.0, roughness=0.001)
-grey_mtl = _make_pbr_mtl(f"{{root}}/materials/grey_18_mtl", (0.18, 0.18, 0.18), metallic=0.0, roughness=0.6)
 
 # 1. Tripod Stand (Mast + 3 Legs + Crossbar)
 sphere_r = 0.14
@@ -585,7 +866,6 @@ mast.GetAxisAttr().Set("Y")
 xf_m = UsdGeom.Xformable(mast.GetPrim())
 xf_m.ClearXformOpOrder()
 xf_m.AddTranslateOp().Set(Gf.Vec3d(0.0, crossbar_y * 0.5, 0.0))
-UsdShade.MaterialBindingAPI.Apply(mast.GetPrim()).Bind(stand_mtl)
 
 collar_h = min(0.35, crossbar_y * 0.4)
 foot_spread = 0.42
@@ -602,7 +882,6 @@ for i in range(3):
     xf_l.AddTranslateOp().Set(Gf.Vec3d(lx * 0.5, collar_h * 0.5, lz * 0.5))
     xf_l.AddRotateYOp().Set(math.degrees(math.atan2(lx, lz)))
     xf_l.AddRotateXOp().Set(math.degrees(math.atan2(math.sqrt(lx * lx + lz * lz), collar_h)))
-    UsdShade.MaterialBindingAPI.Apply(leg.GetPrim()).Bind(stand_mtl)
 
 cbar = UsdGeom.Cylinder.Define(stage, f"{{root}}/tripod/stand/crossbar")
 cbar.GetRadiusAttr().Set(0.012)
@@ -611,20 +890,17 @@ cbar.GetAxisAttr().Set("X")
 xf_c = UsdGeom.Xformable(cbar.GetPrim())
 xf_c.ClearXformOpOrder()
 xf_c.AddTranslateOp().Set(Gf.Vec3d(0.0, crossbar_y, 0.0))
-UsdShade.MaterialBindingAPI.Apply(cbar.GetPrim()).Bind(stand_mtl)
 
 # 2. Chrome & 18% Gray Reference Spheres
 chrome = _build_smooth_sphere(f"{{root}}/tripod/spheres/chrome_sphere", sphere_r)
 xf_ch = UsdGeom.Xformable(chrome.GetPrim())
 xf_ch.ClearXformOpOrder()
 xf_ch.AddTranslateOp().Set(Gf.Vec3d(-spacing * 0.5, ball_y, 0.0))
-UsdShade.MaterialBindingAPI.Apply(chrome.GetPrim()).Bind(chrome_mtl)
 
 grey = _build_smooth_sphere(f"{{root}}/tripod/spheres/grey_sphere", sphere_r)
 xf_gr = UsdGeom.Xformable(grey.GetPrim())
 xf_gr.ClearXformOpOrder()
 xf_gr.AddTranslateOp().Set(Gf.Vec3d(spacing * 0.5, ball_y, 0.0))
-UsdShade.MaterialBindingAPI.Apply(grey.GetPrim()).Bind(grey_mtl)
 
 # 3. Macbeth ColorChecker Chart (ACEScg or Linear Rec.709)
 macbeth_srgb = [
@@ -649,7 +925,6 @@ hw, hh = tot_w * 0.55, tot_h * 0.55
 backing.GetPointsAttr().Set([Gf.Vec3f(-hw, -hh, -0.002), Gf.Vec3f(hw, -hh, -0.002), Gf.Vec3f(hw, hh, -0.002), Gf.Vec3f(-hw, hh, -0.002)])
 backing.GetFaceVertexCountsAttr().Set([4])
 backing.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
-UsdShade.MaterialBindingAPI.Apply(backing.GetPrim()).Bind(stand_mtl)
 
 for idx, cs in enumerate(macbeth_srgb):
     r_i, c_i = idx // cols, idx % cols
@@ -665,8 +940,9 @@ for idx, cs in enumerate(macbeth_srgb):
     pm.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
     lin = _srgb_to_lin_rec709(cs)
     col_out = _rec709_to_acescg(lin) if use_acescg else lin
-    mb_mtl = _make_pbr_mtl(f"{{root}}/materials/macbeth_{{idx:02d}}", col_out, metallic=0.0, roughness=0.85)
-    UsdShade.MaterialBindingAPI.Apply(pm.GetPrim()).Bind(mb_mtl)
+    pm.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set(
+        [Gf.Vec3f(float(col_out[0]), float(col_out[1]), float(col_out[2]))]
+    )
 
 # 4. Circular Ground Disc with Top-Down Planar HDRI Projection + Soft Blending Transparency
 disc = UsdGeom.Mesh.Define(stage, f"{{root}}/ground_disc")
@@ -701,163 +977,6 @@ disc.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
 UsdGeom.PrimvarsAPI(disc).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(g_uvs)
 UsdGeom.PrimvarsAPI(disc).CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set(g_opacities)
 
-# Multi-renderer Ground Projection Material (UsdPreviewSurface + Karma MtlX + Arnold Standard Surface)
-g_mtl_path = f"{{root}}/materials/ground_proj_mtl"
-g_mat = UsdShade.Material.Define(stage, g_mtl_path)
-
-# UsdPreviewSurface
-ups = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/PreviewSurface")
-ups.CreateIdAttr("UsdPreviewSurface")
-ups.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
-ups.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-pvr = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/PreviewUV")
-pvr.CreateIdAttr("UsdPrimvarReader_float2")
-pvr.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
-pvr.CreateOutput("result", Sdf.ValueTypeNames.Float2)
-utex = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/PreviewColorTex")
-utex.CreateIdAttr("UsdUVTexture")
-utex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))
-utex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
-utex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
-utex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
-utex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(pvr.ConnectableAPI(), "result")
-utex.CreateOutput("rgb", Sdf.ValueTypeNames.Color3f)
-if use_diffuse:
-    ups.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(utex.ConnectableAPI(), "rgb")
-else:
-    ups.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))
-if use_emissive and ground_emission > 0.0:
-    uem = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/PreviewEmissiveTex")
-    uem.CreateIdAttr("UsdUVTexture")
-    uem.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))
-    uem.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
-    uem.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
-    uem.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
-    uem.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(Gf.Vec4f(ground_emission, ground_emission, ground_emission, 1.0))
-    uem.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(pvr.ConnectableAPI(), "result")
-    uem.CreateOutput("rgb", Sdf.ValueTypeNames.Color3f)
-    ups.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(uem.ConnectableAPI(), "rgb")
-else:
-    ups.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))
-uop = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/PreviewOpacityTex")
-uop.CreateIdAttr("UsdUVTexture")
-uop.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_op_tex))
-uop.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
-uop.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
-uop.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
-uop.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(pvr.ConnectableAPI(), "result")
-uop.CreateOutput("r", Sdf.ValueTypeNames.Float)
-ups.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(uop.ConnectableAPI(), "r")
-ups.CreateInput("opacityThreshold", Sdf.ValueTypeNames.Float).Set(0.0)
-g_mat.CreateSurfaceOutput().ConnectToSource(ups.ConnectableAPI(), "surface")
-
-# Karma MaterialX
-km = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/KarmaMtlX")
-km.CreateIdAttr("ND_standard_surface_surfaceshader")
-km.CreateInput("base", Sdf.ValueTypeNames.Float).Set(1.0 if use_diffuse else 0.0)
-km.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(0.0)
-km.CreateInput("specular_roughness", Sdf.ValueTypeNames.Float).Set(1.0)
-kuv = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/KarmaUV")
-kuv.CreateIdAttr("ND_texcoord_vector2")
-kuv.CreateInput("index", Sdf.ValueTypeNames.Int).Set(0)
-kuv.CreateOutput("out", Sdf.ValueTypeNames.Float2)
-ktex = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/KarmaColorTex")
-ktex.CreateIdAttr("ND_image_color3")
-ktex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))
-ktex.CreateInput("uaddressmode", Sdf.ValueTypeNames.String).Set("clamp")
-ktex.CreateInput("vaddressmode", Sdf.ValueTypeNames.String).Set("clamp")
-ktex.CreateInput("texcoord", Sdf.ValueTypeNames.Float2).ConnectToSource(kuv.ConnectableAPI(), "out")
-ktex.CreateOutput("out", Sdf.ValueTypeNames.Color3f)
-kop = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/KarmaOpacityTex")
-kop.CreateIdAttr("ND_image_color3")
-kop.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_op_tex))
-kop.CreateInput("uaddressmode", Sdf.ValueTypeNames.String).Set("clamp")
-kop.CreateInput("vaddressmode", Sdf.ValueTypeNames.String).Set("clamp")
-kop.CreateInput("texcoord", Sdf.ValueTypeNames.Float2).ConnectToSource(kuv.ConnectableAPI(), "out")
-kop.CreateOutput("out", Sdf.ValueTypeNames.Color3f)
-km.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(ktex.ConnectableAPI(), "out")
-km.CreateInput("emission", Sdf.ValueTypeNames.Float).Set(ground_emission if use_emissive else 0.0)
-km.CreateInput("emission_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(ktex.ConnectableAPI(), "out")
-km.CreateInput("opacity", Sdf.ValueTypeNames.Color3f).ConnectToSource(kop.ConnectableAPI(), "out")
-g_mat.CreateSurfaceOutput("karma").ConnectToSource(km.ConnectableAPI(), "out")
-g_mat.CreateSurfaceOutput("mtlx").ConnectToSource(km.ConnectableAPI(), "out")
-
-# Arnold Standard Surface (or Arnold Shadow Matte when Shadow Catcher mode is active)
-atex = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/ArnoldColorTex")
-atex.CreateIdAttr("arnold:image")
-atex.CreateInput("filename", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))
-atex.CreateInput("color_space", Sdf.ValueTypeNames.String).Set("raw")
-atex.CreateInput("swrap", Sdf.ValueTypeNames.String).Set("clamp")
-atex.CreateInput("twrap", Sdf.ValueTypeNames.String).Set("clamp")
-atex.CreateInput("uvset", Sdf.ValueTypeNames.String).Set("st")
-atex.CreateOutput("rgb", Sdf.ValueTypeNames.Color3f)
-aop = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/ArnoldOpacityTex")
-aop.CreateIdAttr("arnold:image")
-aop.CreateInput("filename", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_op_tex))
-aop.CreateInput("color_space", Sdf.ValueTypeNames.String).Set("raw")
-aop.CreateInput("swrap", Sdf.ValueTypeNames.String).Set("clamp")
-aop.CreateInput("twrap", Sdf.ValueTypeNames.String).Set("clamp")
-aop.CreateInput("uvset", Sdf.ValueTypeNames.String).Set("st")
-aop.CreateOutput("rgb", Sdf.ValueTypeNames.Color3f)
-if is_shadow_catcher:
-    ai = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/ArnoldShadowMatte")
-    ai.CreateIdAttr("arnold:shadow_matte")
-    ai.CreateInput("background_type", Sdf.ValueTypeNames.Int).Set(0)
-    ai.CreateInput("background_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    ai.CreateInput("shadow_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    ai.CreateInput("shadow_opacity", Sdf.ValueTypeNames.Float).Set(1.0)
-    ai.CreateInput("diffuse_intensity", Sdf.ValueTypeNames.Float).Set(0.0)
-    ai.CreateInput("indirect_diffuse_enable", Sdf.ValueTypeNames.Bool).Set(True)
-    ai.CreateInput("opacity", Sdf.ValueTypeNames.Color3f).ConnectToSource(aop.ConnectableAPI(), "rgb")
-    g_mat.CreateSurfaceOutput("arnold").ConnectToSource(ai.ConnectableAPI(), "shader")
-else:
-    ai = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/ArnoldStandardSurface")
-    ai.CreateIdAttr("arnold:standard_surface")
-    ai.CreateInput("base", Sdf.ValueTypeNames.Float).Set(1.0 if use_diffuse else 0.0)
-    ai.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(0.0)
-    ai.CreateInput("specular_roughness", Sdf.ValueTypeNames.Float).Set(1.0)
-    ai.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(atex.ConnectableAPI(), "rgb")
-    ai.CreateInput("emission", Sdf.ValueTypeNames.Float).Set(ground_emission if use_emissive else 0.0)
-    ai.CreateInput("emission_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(atex.ConnectableAPI(), "rgb")
-    ai.CreateInput("opacity", Sdf.ValueTypeNames.Color3f).ConnectToSource(aop.ConnectableAPI(), "rgb")
-    g_mat.CreateSurfaceOutput("arnold").ConnectToSource(ai.ConnectableAPI(), "shader")
-
-# Redshift Standard Material
-rsm = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/RedshiftMaterial")
-rsm.CreateIdAttr("redshift_usd_material")
-rstd = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/RedshiftStd")
-rstd.CreateIdAttr("redshift::StandardMaterial")
-rstd.CreateInput("base_color_weight", Sdf.ValueTypeNames.Float).Set(1.0 if use_diffuse else 0.0)
-rstd.CreateInput("refl_weight", Sdf.ValueTypeNames.Float).Set(0.0)
-rstd.CreateInput("refl_roughness", Sdf.ValueTypeNames.Float).Set(1.0)
-rstd.CreateInput("coat_weight", Sdf.ValueTypeNames.Float).Set(0.0)
-rstd.CreateInput("sheen_weight", Sdf.ValueTypeNames.Float).Set(0.0)
-rtex = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/RedshiftColorTex")
-rtex.CreateIdAttr("redshift::TextureSampler")
-rtex.CreateInput("tex0", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_tex))
-rtex.CreateInput("tex0_colorSpace", Sdf.ValueTypeNames.String).Set("Raw")
-rtex.CreateInput("tspace_id", Sdf.ValueTypeNames.String).Set("st")
-rtex.CreateInput("wrapU", Sdf.ValueTypeNames.Int).Set(0)
-rtex.CreateInput("wrapV", Sdf.ValueTypeNames.Int).Set(0)
-rtex.CreateOutput("outColor", Sdf.ValueTypeNames.Color3f)
-rop = UsdShade.Shader.Define(stage, f"{{g_mtl_path}}/RedshiftOpacityTex")
-rop.CreateIdAttr("redshift::TextureSampler")
-rop.CreateInput("tex0", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(ground_op_tex))
-rop.CreateInput("tex0_colorSpace", Sdf.ValueTypeNames.String).Set("Raw")
-rop.CreateInput("tspace_id", Sdf.ValueTypeNames.String).Set("st")
-rop.CreateInput("wrapU", Sdf.ValueTypeNames.Int).Set(0)
-rop.CreateInput("wrapV", Sdf.ValueTypeNames.Int).Set(0)
-rop.CreateOutput("outColor", Sdf.ValueTypeNames.Color3f)
-rstd.CreateInput("base_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(rtex.ConnectableAPI(), "outColor")
-rstd.CreateInput("emission_weight", Sdf.ValueTypeNames.Float).Set(ground_emission if use_emissive else 0.0)
-rstd.CreateInput("emission_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(rtex.ConnectableAPI(), "outColor")
-rstd.CreateInput("opacity_color", Sdf.ValueTypeNames.Color3f).ConnectToSource(rop.ConnectableAPI(), "outColor")
-rstd.CreateOutput("outColor", Sdf.ValueTypeNames.Color3f)
-rsm.CreateInput("Surface", Sdf.ValueTypeNames.Token).ConnectToSource(rstd.ConnectableAPI(), "outColor")
-rsm.CreateOutput("Shader", Sdf.ValueTypeNames.Token)
-g_mat.CreateSurfaceOutput("Redshift").ConnectToSource(rsm.ConnectableAPI(), "Shader")
-
-UsdShade.MaterialBindingAPI.Apply(disc.GetPrim()).Bind(g_mat)
 if is_shadow_catcher:
     disc_pv = UsdGeom.PrimvarsAPI(disc)
     # Karma native Shadow Catcher (Shadows-Only Holdout Mode = 2)
@@ -882,6 +1001,20 @@ if is_shadow_catcher:
     lop.bypass(False)
     lop.moveToGoodPosition()
     lop.cook(force=True)
+
+    mat_lib_name = "hdri_maker_materials" if node_name == "hdri_maker_lookdev" else f"{node_name}_materials"
+    mat_lib = _build_lookdev_material_library(
+        stage_net=stage,
+        lookdev_lop=lop,
+        mat_lib_name=mat_lib_name,
+        ground_tex=ground_tex_norm,
+        ground_op_tex=ground_op_norm,
+        use_diffuse=bool(use_diffuse),
+        use_emissive=bool(use_emissive),
+        ground_emission=max(0.0, float(ground_emission)),
+        is_shadow_catcher=bool(is_shadow_catcher),
+    )
+
     try:
         hou.hscript("texcache -c")
         hou.hscript("glcache -c")
@@ -889,7 +1022,7 @@ if is_shadow_catcher:
         pass
     if set_display_flag:
         try:
-            lop.setDisplayFlag(True)
+            mat_lib.setDisplayFlag(True)
         except Exception:
             pass
-    return lop
+    return mat_lib
