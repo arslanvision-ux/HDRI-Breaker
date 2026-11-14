@@ -424,16 +424,33 @@ def create_hotspot_light_rig(
     return created
 
 
-def _vop_connect(dst, input_name: str, src, output_name: Optional[str] = None) -> None:
-    """Connect `src` output to `dst` named input if both exist."""
-    idx = dst.inputIndex(input_name)
+def _vop_connect(
+    dst,
+    input_name,
+    src,
+    output_name=None,
+    fallback_in: Optional[int] = None,
+) -> None:
+    """Connect `src` output to `dst` named input (supports candidate name tuples)."""
+    in_names = (input_name,) if isinstance(input_name, str) else tuple(input_name)
+    idx = -1
+    for nm in in_names:
+        idx = dst.inputIndex(nm)
+        if idx >= 0:
+            break
     if idx < 0:
-        return
+        if fallback_in is None:
+            return
+        idx = int(fallback_in)
+
     out_idx = 0
     if output_name:
-        oi = src.outputIndex(output_name)
-        if oi >= 0:
-            out_idx = oi
+        out_names = (output_name,) if isinstance(output_name, str) else tuple(output_name)
+        for onm in out_names:
+            oi = src.outputIndex(onm)
+            if oi >= 0:
+                out_idx = oi
+                break
     dst.setInput(idx, src, out_idx)
 
 
@@ -509,21 +526,28 @@ def _create_pbr_collect(
         col.setNextInput(rsm, 0)
 
     # 4. Arnold Standard Surface (when HtoA VOPs are available)
-    if "arnold_material" in vop_types and "arnold::standard_surface" in vop_types:
-        amat = ml.createNode("arnold_material", f"{name}_ai_mat")
+    if "arnold::standard_surface" in vop_types:
         astd = ml.createNode("arnold::standard_surface", f"{name}_ai_std")
         _set_vop_parm(astd, "base", 1.0)
         _set_vop_parm(astd, "metalness", float(metallic))
         _set_vop_parm(astd, "specular", spec_w)
         _set_vop_parm(astd, "specular_roughness", float(roughness))
-        if use_display_color and "arnold::user_data_rgb" in vop_types:
-            aud = ml.createNode("arnold::user_data_rgb", f"{name}_ai_dc")
+        ai_dc_type = next(
+            (t for t in ("arnold::user_data_rgb", "arnold::user_data_color", "arnold::user_data_rgba") if t in vop_types),
+            None,
+        )
+        if use_display_color and ai_dc_type is not None:
+            aud = ml.createNode(ai_dc_type, f"{name}_ai_dc")
             _set_vop_parm(aud, "attribute", "displayColor")
-            _vop_connect(astd, "base_color", aud, "out")
+            _vop_connect(astd, "base_color", aud, ("out", "rgb", "rgba"))
         else:
             _set_vop_parm_tuple(astd, "base_color", color_rgb)
-        _vop_connect(amat, "surface", astd, "out")
-        col.setNextInput(amat, 0)
+        if "arnold_material" in vop_types:
+            amat = ml.createNode("arnold_material", f"{name}_ai_mat")
+            _vop_connect(amat, ("surface", "Surface"), astd, ("shader", "out", "rgb"), fallback_in=0)
+            col.setNextInput(amat, 0)
+        else:
+            col.setNextInput(astd, 0)
 
     return col.name()
 
@@ -634,8 +658,7 @@ def _create_ground_proj_collect(
         col.setNextInput(rsm, 0)
 
     # 4. Arnold Standard Surface / Shadow Matte (when HtoA VOPs are available)
-    if "arnold_material" in vop_types and "arnold::standard_surface" in vop_types:
-        amat = ml.createNode("arnold_material", "ground_ai_mat")
+    if "arnold::standard_surface" in vop_types:
         atex = ml.createNode("arnold::image", "ground_ai_col")
         _set_vop_parm(atex, "filename", ground_tex)
         _set_vop_parm(atex, "color_space", "raw")
@@ -656,18 +679,22 @@ def _create_ground_proj_collect(
             _set_vop_parm(ai, "shadow_opacity", 1.0)
             _set_vop_parm(ai, "diffuse_intensity", 0.0)
             _set_vop_parm(ai, "indirect_diffuse_enable", True)
-            _vop_connect(ai, "opacity", aop, "rgb")
+            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
         else:
             ai = ml.createNode("arnold::standard_surface", "ground_ai_std")
             _set_vop_parm(ai, "base", 1.0 if use_diffuse else 0.0)
             _set_vop_parm(ai, "specular", 0.0)
             _set_vop_parm(ai, "specular_roughness", 1.0)
             _set_vop_parm(ai, "emission", ground_emission if use_emissive else 0.0)
-            _vop_connect(ai, "base_color", atex, "rgb")
-            _vop_connect(ai, "emission_color", atex, "rgb")
-            _vop_connect(ai, "opacity", aop, "rgb")
-        _vop_connect(amat, "surface", ai, "out")
-        col.setNextInput(amat, 0)
+            _vop_connect(ai, "base_color", atex, ("rgb", "out", "rgba"))
+            _vop_connect(ai, "emission_color", atex, ("rgb", "out", "rgba"))
+            _vop_connect(ai, "opacity", aop, ("rgb", "out", "rgba"))
+        if "arnold_material" in vop_types:
+            amat = ml.createNode("arnold_material", "ground_ai_mat")
+            _vop_connect(amat, ("surface", "Surface"), ai, ("shader", "out", "rgb"), fallback_in=0)
+            col.setNextInput(amat, 0)
+        else:
+            col.setNextInput(ai, 0)
 
     return col.name()
 
