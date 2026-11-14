@@ -868,11 +868,14 @@ if is_shadow_catcher:
     disc_pv.CreatePrimvar("arnold:matte", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
     # Redshift Solaris Matte / Shadow Catcher
     disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_enable", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_showbackg", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
     disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_alpha", Sdf.ValueTypeNames.Float, UsdGeom.Tokens.constant).Set(0.0)
-    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_shadow_enable", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
-    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_shadow_affect_alpha", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
-    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_background_is_env", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
-    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_abyss_color", Sdf.ValueTypeNames.Color3f, UsdGeom.Tokens.constant).Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_shadowenable", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_shadowalpha", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_shadowsFromM", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_diffscale", Sdf.ValueTypeNames.Float, UsdGeom.Tokens.constant).Set(0.0)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_reflscale", Sdf.ValueTypeNames.Float, UsdGeom.Tokens.constant).Set(0.0)
+    disc_pv.CreatePrimvar("redshift:object:RS_objprop_matte_refrscale", Sdf.ValueTypeNames.Float, UsdGeom.Tokens.constant).Set(0.0)
 '''
 
     lop.parm("python").set(code)

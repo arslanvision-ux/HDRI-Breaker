@@ -14,6 +14,10 @@
   <img src="docs/hdri_breaker_solaris_result.jpg" alt="Houdini Solaris Lookdev & Karma Result" width="100%" />
 </p>
 
+<p align="center">
+  <img src="docs/hdri_breaker_solaris_example2.jpg" alt="Houdini Solaris Lookdev Tripod & Karma Result" width="100%" />
+</p>
+
 ---
 
 ## Quick Installation
