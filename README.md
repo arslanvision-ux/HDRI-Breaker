@@ -1,4 +1,8 @@
-# HDRI Breaker — Solaris 32-bit Float Lat/Long Studio
+<p align="center">
+  <img src="houdini/config/Icons/hdri_breaker.png" alt="HDRI Breaker Logo" width="160" />
+</p>
+
+<h1 align="center">HDRI Breaker — Solaris 32-bit Float Lat/Long Studio</h1>
 
 **HDRI Breaker** is a Houdini 20.0 / 20.5 / 21.0+ Solaris (`/stage`) Lookdev & Lighting studio that extracts physical lighting metrics from single plates, multi-view camera angles, exposure brackets, or image sequences and synthesizes true **32-bit float Lat/Long (2:1) EXR** environment maps, extracted area light textures, and multi-renderer Solaris lookdev rigs (**Karma CPU/XPU**, **Redshift**, **Arnold**, and **Storm / UsdPreviewSurface**).
 
