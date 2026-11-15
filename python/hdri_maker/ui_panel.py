@@ -1227,6 +1227,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._brush_undo_stack: List[np.ndarray] = []
         self._pre_brush_hdri: Optional[np.ndarray] = None
         self._baked_canvas_hdri: Optional[np.ndarray] = None
+        self._baked_azimuth_offset_deg: float = 0.0
+        self._pre_bake_snapshot: Optional[Dict[str, Any]] = None
         self._active_brush_stroke: Optional[Dict[str, Any]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
@@ -2000,9 +2002,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
         clear_brush_btn.clicked.connect(self._on_clear_brush)
         self.bake_edits_btn = QtWidgets.QPushButton("Apply / Collapse")
+        self.bake_edits_btn.setCheckable(False)
+        self.bake_edits_btn.setAutoDefault(False)
+        self.bake_edits_btn.setDefault(False)
         self.bake_edits_btn.setStyleSheet(
-            "QPushButton { background-color: #0e7490; color: #ffffff; font-weight: bold; padding: 3px 8px; }"
-            "QPushButton:hover { background-color: #0891b2; }"
+            "QPushButton { border: 1px solid #0891b2; font-weight: bold; padding: 3px 8px; }"
+            "QPushButton:hover { background-color: #0e7490; color: #ffffff; }"
         )
         self.bake_edits_btn.setToolTip(
             "Apply & collapse plate stitching, sky/ground/light inpainting, and brush strokes into a fast 32-bit canvas\n"
@@ -2432,9 +2437,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         """Update cached views, lighting profile, and preview canvas after removing/clearing plates."""
         n_rows = self.multiview_table.rowCount()
         self._baked_canvas_hdri = None
+        self._baked_azimuth_offset_deg = 0.0
+        self._pre_bake_snapshot = None
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
-            self.bake_edits_btn.setText("Apply / Collapse")
         if n_rows == 0:
             self._views = []
             self._profile = None
@@ -2487,9 +2493,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         """Re-analyze and redraw canvas using only currently enabled plates."""
         n_rows = self.multiview_table.rowCount()
         self._baked_canvas_hdri = None
+        self._baked_azimuth_offset_deg = 0.0
+        self._pre_bake_snapshot = None
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
-            self.bake_edits_btn.setText("Apply / Collapse")
         if len(self._views) != n_rows or not self._views:
             return
 
@@ -3477,15 +3484,30 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("Analyze a plate first before baking edits.")
             return
         try:
+            # Ensure no interactive pick/brush button remains stuck checked after collapsing
+            for btn in (
+                self.pick_sky_btn,
+                self.pick_gnd_btn,
+                self.pick_light_btn,
+                self.pick_wb_btn,
+            ):
+                btn.setChecked(False)
+            if self.brush_btn.isChecked():
+                self.brush_btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+
             p = self._current_synthesis_params()
-            # Bake geometry, stitching, sky/ground/light inpainting, and brush strokes at up to 4K
-            # while leaving global post-adjustments (EV, CCT, Saturation, Blur, etc.) live.
+            enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
+            # Bake geometry, stitching, yaw-aligned sky/ground/light inpainting, and brush strokes
+            # at up to 4K while leaving global post-adjustments (EV, CCT, Saturation, Blur, delta Yaw) live.
             bake_p = HDRISynthesisParams(
                 width=min(p.width, 4096),
                 height=min(p.height, 2048),
                 hotspot_boost=p.hotspot_boost,
                 hotspot_softness=p.hotspot_softness,
                 ambient_wrap=p.ambient_wrap,
+                horizon_softness=p.horizon_softness,
+                azimuth_offset_deg=p.azimuth_offset_deg,
                 plate_projection_blend=p.plate_projection_blend,
                 vertical_shift_deg=p.vertical_shift_deg,
                 stitch_blend=p.stitch_blend,
@@ -3501,14 +3523,22 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
                 physical_sky_fill=p.physical_sky_fill,
             )
-            if self._baked_canvas_hdri is not None:
+            has_new_regions = (self._sky_rect is not None) or (self._ground_rect is not None)
+            if self._baked_canvas_hdri is not None and not has_new_regions:
                 baked = self._baked_canvas_hdri.copy()
+                delta_yaw = float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg)
+                if abs(delta_yaw) > 1e-4:
+                    shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
+                    if shift_px != 0:
+                        baked = np.roll(baked, shift_px, axis=1)
+                self._baked_azimuth_offset_deg = float(p.azimuth_offset_deg)
             else:
                 baked = generate_latlong_hdri(
                     self._profile,
                     bake_p,
-                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                    views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 )
+                self._baked_azimuth_offset_deg = float(p.azimuth_offset_deg)
             if self._light_regions:
                 baked, extracted = extract_and_inpaint_multiple_hotspots(
                     baked,
@@ -3520,6 +3550,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if self._brush_strokes:
                 baked = apply_brush_strokes(baked, self._brush_strokes)
 
+            if self._pre_bake_snapshot is None:
+                self._pre_bake_snapshot = {
+                    "sky_rect": self._sky_rect,
+                    "ground_rect": self._ground_rect,
+                    "light_regions": [dict(r) for r in self._light_regions],
+                    "brush_strokes": [dict(s) for s in self._brush_strokes],
+                }
+
             self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
             self._sky_rect = None
             self._ground_rect = None
@@ -3528,7 +3566,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
             self.unbake_edits_btn.setEnabled(True)
-            self.bake_edits_btn.setText("Re-Apply / Collapse")
+            self.bake_edits_btn.clearFocus()
             self._regenerate_preview()
             self.status_label.setText(
                 f"Applied & collapsed all edits into fast {baked.shape[1]}x{baked.shape[0]} 32-bit canvas. "
@@ -3541,10 +3579,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if self._baked_canvas_hdri is None:
             return
         self._baked_canvas_hdri = None
+        self._baked_azimuth_offset_deg = 0.0
+        if self._pre_bake_snapshot is not None:
+            self._sky_rect = self._pre_bake_snapshot.get("sky_rect")
+            self._ground_rect = self._pre_bake_snapshot.get("ground_rect")
+            self._light_regions = [dict(r) for r in self._pre_bake_snapshot.get("light_regions", [])]
+            self._brush_strokes = [dict(s) for s in self._pre_bake_snapshot.get("brush_strokes", [])]
+            self._pre_bake_snapshot = None
         self.unbake_edits_btn.setEnabled(False)
-        self.bake_edits_btn.setText("Apply / Collapse")
         self._regenerate_preview()
-        self.status_label.setText("Unbaked: returned to live multi-plate synthesis pipeline.")
+        self.status_label.setText("Unbaked: restored live layers & multi-plate synthesis pipeline.")
 
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -3781,7 +3825,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if not fast:
                 self._log_debug(f"Regenerating preview ({p.width}x{p.height}), views={len(self._views)}")
             if self._baked_canvas_hdri is not None:
-                hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, p, self._profile)
+                from dataclasses import replace as _dc_replace
+
+                post_p = _dc_replace(
+                    p,
+                    azimuth_offset_deg=float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg),
+                )
+                hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_p, self._profile)
             else:
                 enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                 hdri = generate_latlong_hdri(
@@ -4054,12 +4104,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 return out_path
             else:
                 if self._baked_canvas_hdri is not None:
-                    hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, params, self._profile)
+                    from dataclasses import replace as _dc_replace
+
+                    post_params = _dc_replace(
+                        params,
+                        azimuth_offset_deg=float(params.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg),
+                    )
+                    hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_params, self._profile)
                 else:
+                    enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                     hdri = generate_latlong_hdri(
                         self._profile,
                         params,
-                        views=self._views if self._views else None,
+                        views=enabled_views if enabled_views else None,
                     )
                 light_msg = ""
                 self._last_light_exr_paths = []
