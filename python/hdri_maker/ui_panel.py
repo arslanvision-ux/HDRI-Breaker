@@ -297,6 +297,7 @@ class PreviewLabel(QtWidgets.QLabel):
         self._brush_adjust_last_x: float = 0.0
         self._brush_adjust_moved: bool = False
         self._brush_hud_text: str = ""
+        self._cached_plate_outlines: Dict[int, tuple] = {}
 
     def set_brush_state(
         self,
@@ -405,6 +406,7 @@ class PreviewLabel(QtWidgets.QLabel):
         self._selected_plate_idx = int(selected_idx)
         self._plate_az_offset = float(az_offset)
         self._plate_v_shift = float(v_shift)
+        self._cached_plate_outlines.clear()
         self.update()
 
     def _hit_test_plate_handles(self, u: float, v: float) -> Optional[str]:
@@ -796,12 +798,31 @@ class PreviewLabel(QtWidgets.QLabel):
                     if not getattr(view, "enabled", True):
                         continue
                     is_sel = idx == self._selected_plate_idx
-                    info = compute_plate_outline_uv(
-                        view,
-                        azimuth_offset_deg=self._plate_az_offset,
-                        vertical_shift_deg=self._plate_v_shift,
-                        samples_per_edge=14 if is_sel else 8,
+                    o_key = (
+                        id(view),
+                        float(view.cam_azimuth_deg),
+                        float(view.cam_elevation_deg),
+                        float(view.cam_roll_deg),
+                        float(view.fov_h_deg),
+                        float(view.scale_x),
+                        float(view.scale_y),
+                        float(view.warp_k1),
+                        str(getattr(view, "lens_type", "rectilinear")),
+                        is_sel,
+                        self._plate_az_offset,
+                        self._plate_v_shift,
                     )
+                    cached_o = self._cached_plate_outlines.get(idx)
+                    if cached_o is not None and cached_o[0] == o_key:
+                        info = cached_o[1]
+                    else:
+                        info = compute_plate_outline_uv(
+                            view,
+                            azimuth_offset_deg=self._plate_az_offset,
+                            vertical_shift_deg=self._plate_v_shift,
+                            samples_per_edge=14 if is_sel else 8,
+                        )
+                        self._cached_plate_outlines[idx] = (o_key, info)
                     if is_sel:
                         pen = QtGui.QPen(QtGui.QColor(0, 225, 255), 2, Qt.SolidLine)
                     else:
@@ -1247,9 +1268,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._suppress_auto_preview: bool = False
         self._debug_lines: List[str] = []
         self._debug_dialog: Optional[DebugLogDialog] = None
+        self._preview_fast_timer = QtCore.QTimer(self)
+        self._preview_fast_timer.setSingleShot(True)
+        self._preview_fast_timer.setInterval(20)
+        self._preview_fast_timer.timeout.connect(lambda: self._regenerate_preview(fast=True))
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(120)
+        self._preview_timer.setInterval(200)
         self._preview_timer.timeout.connect(self._regenerate_preview)
         self._display_timer = QtCore.QTimer(self)
         self._display_timer.setSingleShot(True)
@@ -1756,9 +1781,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._update_preview_pixmap()
 
     def _schedule_preview_update(self, *_args) -> None:
-        """Debounce live preview regeneration when synthesis parameters change."""
+        """Debounce live preview regeneration: instant low-res drag, crisp 2K on settle."""
         if self._profile is not None and not self._suppress_auto_preview:
-            self._preview_timer.start()
+            if self._baked_canvas_hdri is not None:
+                self._preview_timer.setInterval(60)
+                self._preview_timer.start()
+            else:
+                if not self._preview_fast_timer.isActive():
+                    self._preview_fast_timer.start()
+                self._preview_timer.setInterval(200)
+                self._preview_timer.start()
 
     def _apply_ui_scale(self, scale: float) -> None:
         """Apply selected UI theme and scale fonts, button heights, and table rows inside HDRIMakerWidget."""
@@ -3332,10 +3364,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     enable_inpaint=False,
                     ldr_highlight_boost=1.0,
                 )
+                enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                 self._raw_hdri_pixels = generate_latlong_hdri(
                     self._profile,
                     raw_p,
-                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                    views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 )
             self._update_preview_pixmap()
         else:
@@ -3679,6 +3712,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     fov = float(self.multiview_table.item(row, 3).text())
                     cs = self.multiview_table.item(row, 4).text() or "Auto"
                     self._log_debug(f"Reading multiview plate #{row + 1}: {fpath} (az={az}, el={el}, fov={fov}, cs={cs})")
+                    self.status_label.setText(
+                        f"Loading plate {row + 1}/{n_mv}: {os.path.basename(fpath)}..."
+                    )
+                    QtWidgets.QApplication.processEvents()
                     plate = read_plate(fpath, colorspace=cs, max_dim=4096)
                     self._log_debug(f"Loaded plate #{row + 1}: shape={plate.pixels.shape}, is_hdr={plate.is_hdr}")
                     enabled = (item0.checkState() == Qt.Checked) if item0 is not None else True
@@ -3717,8 +3754,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._refresh_plate_transform_bar()
                 self._frame_profiles = []
                 self._log_debug("Running analyze_multiview_plates...")
+                self.status_label.setText("Analyzing lighting across enabled plates...")
+                QtWidgets.QApplication.processEvents()
+                from dataclasses import replace as _dc_replace
+
+                stat_views = []
+                for idx in enabled_indices:
+                    v = views[idx]
+                    px = v.pixels
+                    step = max(1, max(px.shape[:2]) // 512)
+                    stat_views.append(_dc_replace(v, pixels=px[::step, ::step]) if step > 1 else v)
                 self._profile = analyze_multiview_plates(
-                    views,
+                    stat_views,
                     max_hotspots=self.max_hotspots_spin.value(),
                     ldr_highlight_boost=self.ldr_boost_spin.value(),
                     include_spherical_map=False,
@@ -3917,10 +3964,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     enable_inpaint=False,
                     ldr_highlight_boost=1.0,
                 )
+                enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                 self._raw_hdri_pixels = generate_latlong_hdri(
                     self._profile,
                     raw_p,
-                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                    views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 )
             elif not hasattr(self, "ab_split_btn") or not self.ab_split_btn.isChecked():
                 self._raw_hdri_pixels = None
@@ -3940,8 +3988,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_ev_val.setText(f"{ev:+.1f} EV")
         tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
         if tm_mode == "Overlap Diff" and self._views:
+            enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
             diff_rgb = compute_overlap_difference_map(
-                self._views if len(self._views) <= 12 else self._views[:1],
+                enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 out_width=min(1024, self._hdri_pixels.shape[1]),
                 out_height=min(512, self._hdri_pixels.shape[0]),
                 azimuth_offset_deg=self.yaw_spin.value(),
