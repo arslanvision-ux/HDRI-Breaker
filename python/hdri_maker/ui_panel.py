@@ -244,6 +244,7 @@ class PreviewLabel(QtWidgets.QLabel):
     brushStrokeMoved = Signal(float, float)
     brushStrokeFinished = Signal()
     brushCloneSourcePicked = Signal(float, float)
+    brushParamAdjusted = Signal(str, float)
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
@@ -286,23 +287,34 @@ class PreviewLabel(QtWidgets.QLabel):
         self._brush_enabled: bool = False
         self._brush_mode: str = "heal"
         self._brush_radius_u: float = 0.025
+        self._brush_softness: float = 0.65
         self._brush_hover_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_painting: bool = False
+        self._brush_adjust_mode: Optional[str] = None
+        self._brush_adjust_start_pos: Optional[QtCore.QPoint] = None
+        self._brush_adjust_last_x: float = 0.0
+        self._brush_adjust_moved: bool = False
+        self._brush_hud_text: str = ""
 
     def set_brush_state(
         self,
         enabled: bool,
         mode: str = "heal",
         radius_u: float = 0.025,
+        softness: float = 0.65,
         clone_src_uv: Optional[Tuple[float, float]] = None,
+        hud_text: str = "",
     ) -> None:
         self._brush_enabled = bool(enabled)
         self._brush_mode = str(mode)
         self._brush_radius_u = float(radius_u)
+        self._brush_softness = float(softness)
         self._brush_clone_src_uv = clone_src_uv
+        if hud_text:
+            self._brush_hud_text = hud_text
         if self._brush_enabled:
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(Qt.CrossCursor if self._brush_adjust_mode is None else Qt.SizeHorCursor)
         elif self._pick_mode is None:
             self.setCursor(Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor)
         self.update()
@@ -492,6 +504,24 @@ class PreviewLabel(QtWidgets.QLabel):
     def mousePressEvent(self, event) -> None:
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
         is_alt = bool(event.modifiers() & Qt.AltModifier)
+        if self._brush_enabled and self._pick_mode is None:
+            mods = event.modifiers()
+            if (mods & Qt.ControlModifier) and event.button() == Qt.LeftButton:
+                self._brush_adjust_mode = "size"
+            elif (mods & Qt.ControlModifier) and event.button() == Qt.RightButton:
+                self._brush_adjust_mode = "strength"
+            elif (mods & Qt.ShiftModifier) and event.button() == Qt.LeftButton:
+                self._brush_adjust_mode = "soft"
+            if self._brush_adjust_mode is not None:
+                self._brush_adjust_start_pos = pos
+                self._brush_adjust_last_x = float(pos.x())
+                self._brush_adjust_moved = False
+                uv_h = self._pos_to_uv(pos)
+                if uv_h is not None:
+                    self._brush_hover_uv = (float(uv_h[0]), float(uv_h[1]))
+                self.setCursor(Qt.SizeHorCursor)
+                event.accept()
+                return
         if event.button() in (Qt.MiddleButton, Qt.RightButton) or (is_alt and event.button() == Qt.LeftButton):
             if self._zoom > 1.001:
                 self._panning = True
@@ -509,11 +539,6 @@ class PreviewLabel(QtWidgets.QLabel):
             if self._brush_enabled:
                 uv_b = self._pos_to_uv(pos)
                 if uv_b is not None and 0.0 <= uv_b[0] <= 1.0 and 0.0 <= uv_b[1] <= 1.0:
-                    if bool(event.modifiers() & Qt.ControlModifier) and self._brush_mode == "clone":
-                        self._brush_clone_src_uv = (float(uv_b[0]), float(uv_b[1]))
-                        self.brushCloneSourcePicked.emit(float(uv_b[0]), float(uv_b[1]))
-                        self.update()
-                        return
                     self._brush_painting = True
                     self.brushStrokeStarted.emit(float(uv_b[0]), float(uv_b[1]))
                     return
@@ -573,6 +598,15 @@ class PreviewLabel(QtWidgets.QLabel):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        if self._brush_adjust_mode is not None:
+            dx = float(pos.x() - self._brush_adjust_last_x)
+            self._brush_adjust_last_x = float(pos.x())
+            if self._brush_adjust_start_pos is not None and abs(pos.x() - self._brush_adjust_start_pos.x()) >= 4:
+                self._brush_adjust_moved = True
+            if abs(dx) > 0.0:
+                self.brushParamAdjusted.emit(self._brush_adjust_mode, dx)
+            self.update()
+            return
         if self._panning and self._pan_start_pos is not None:
             fit_w, fit_h = self._fit_size()
             zw = max(1.0, fit_w * self._zoom)
@@ -675,6 +709,21 @@ class PreviewLabel(QtWidgets.QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._brush_adjust_mode is not None:
+            mode_done = self._brush_adjust_mode
+            moved = self._brush_adjust_moved
+            self._brush_adjust_mode = None
+            self._brush_adjust_start_pos = None
+            self._brush_hud_text = ""
+            self.setCursor(Qt.CrossCursor if self._brush_enabled else Qt.ArrowCursor)
+            if mode_done == "size" and (not moved) and self._brush_mode == "clone":
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                uv_b = self._pos_to_uv(pos)
+                if uv_b is not None and 0.0 <= uv_b[0] <= 1.0 and 0.0 <= uv_b[1] <= 1.0:
+                    self._brush_clone_src_uv = (float(uv_b[0]), float(uv_b[1]))
+                    self.brushCloneSourcePicked.emit(float(uv_b[0]), float(uv_b[1]))
+            self.update()
+            return
         if self._brush_painting:
             self._brush_painting = False
             self.brushStrokeFinished.emit()
@@ -823,6 +872,13 @@ class PreviewLabel(QtWidgets.QLabel):
                     )
                     painter.setPen(QtGui.QPen(b_col, 1.5, Qt.SolidLine))
                     painter.drawEllipse(QtCore.QPointF(bx, by), rx, ry)
+                    inner_scale = max(0.0, 1.0 - self._brush_softness)
+                    if inner_scale > 0.02:
+                        painter.setPen(QtGui.QPen(b_col, 1.0, Qt.DotLine))
+                        painter.drawEllipse(QtCore.QPointF(bx, by), rx * inner_scale, ry * inner_scale)
+                    if self._brush_adjust_mode is not None and self._brush_hud_text:
+                        painter.setPen(QtGui.QPen(QtGui.QColor(255, 230, 100), 1))
+                        painter.drawText(int(bx + rx + 8), int(by + 4), self._brush_hud_text)
             painter.end()
             return
         super().paintEvent(event)
@@ -1944,6 +2000,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.brushStrokeStarted.connect(self._on_brush_stroke_started)
         self.preview_label.brushStrokeMoved.connect(self._on_brush_stroke_moved)
         self.preview_label.brushStrokeFinished.connect(self._on_brush_stroke_finished)
+        self.preview_label.brushParamAdjusted.connect(self._on_brush_param_adjusted)
 
         self.plate_transform_bar = QtWidgets.QWidget()
         pt_layout = QtWidgets.QHBoxLayout(self.plate_transform_bar)
@@ -3125,8 +3182,36 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             enabled=self.brush_btn.isChecked(),
             mode=self._current_brush_mode(),
             radius_u=self.brush_size_slider.value() / 1000.0,
+            softness=self.brush_soft_slider.value() / 100.0,
             clone_src_uv=self._brush_clone_src_uv,
         )
+
+    def _on_brush_param_adjusted(self, param: str, dx: float) -> None:
+        step = int(round(dx * 0.5))
+        if step == 0 and abs(dx) > 0.2:
+            step = 1 if dx > 0 else -1
+        hud = ""
+        if param == "size":
+            val = int(np.clip(self.brush_size_slider.value() + step, self.brush_size_slider.minimum(), self.brush_size_slider.maximum()))
+            self.brush_size_slider.setValue(val)
+            hud = f"Size: {val / 10.0:.1f}%"
+        elif param == "strength":
+            val = int(np.clip(self.brush_strength_slider.value() + step, self.brush_strength_slider.minimum(), self.brush_strength_slider.maximum()))
+            self.brush_strength_slider.setValue(val)
+            hud = f"Strength: {val}%"
+        elif param == "soft":
+            val = int(np.clip(self.brush_soft_slider.value() + step, self.brush_soft_slider.minimum(), self.brush_soft_slider.maximum()))
+            self.brush_soft_slider.setValue(val)
+            hud = f"Soft: {val}%"
+        if hud:
+            self.preview_label.set_brush_state(
+                enabled=self.brush_btn.isChecked(),
+                mode=self._current_brush_mode(),
+                radius_u=self.brush_size_slider.value() / 1000.0,
+                softness=self.brush_soft_slider.value() / 100.0,
+                clone_src_uv=self._brush_clone_src_uv,
+                hud_text=hud,
+            )
 
     def _on_brush_clone_src_picked(self, u: float, v: float) -> None:
         self._brush_clone_src_uv = (float(u), float(v))
