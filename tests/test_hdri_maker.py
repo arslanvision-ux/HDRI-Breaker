@@ -593,6 +593,102 @@ class TestHDRIMaker(unittest.TestCase):
         meta = read_plate_metadata(written[0])
         self.assertIn("roll_deg", meta)
 
+    def test_environment_mapping_enhancements(self):
+        from hdri_maker.hdri_generator import (
+            HDRISynthesisParams,
+            export_hdri_sequence,
+            generate_diffuse_irradiance_hdri,
+            generate_latlong_hdri,
+            recover_clipped_highlights,
+            render_preview_srgb,
+        )
+        from hdri_maker.lighting_analyzer import (
+            PlateViewInput,
+            analyze_plate,
+            estimate_horizon_roll_deg,
+            estimate_radial_vignette,
+            project_multiview_plates_to_latlong,
+        )
+
+        # 1. Chrome ball unwrap
+        ball = np.full((64, 64, 3), 0.35, dtype=np.float32)
+        ball[24:40, 24:40] = [1.0, 0.8, 0.6]
+        cb_view = PlateViewInput(pixels=ball, is_hdr=False, lens_type="chrome_ball")
+        cb_rgb, cb_cov = project_multiview_plates_to_latlong([cb_view], out_width=128, out_height=64)
+        self.assertEqual(cb_rgb.shape, (64, 128, 3))
+        self.assertGreater(float(np.mean(cb_cov)), 0.5)
+
+        # 2. Roll & Vignette estimation
+        img_vig = np.full((64, 64, 3), 0.8, dtype=np.float32)
+        img_vig[:10, :10] = 0.2
+        img_vig[:10, -10:] = 0.2
+        img_vig[-10:, :10] = 0.2
+        img_vig[-10:, -10:] = 0.2
+        self.assertGreater(estimate_radial_vignette(img_vig), 0.2)
+        self.assertTrue(-25.0 <= estimate_horizon_roll_deg(img_vig) <= 25.0)
+
+        # 3. Highlight recovery, nadir cleanup, neutralize, roughness preview, diffuse split
+        clipped = np.full((64, 128, 3), 0.2, dtype=np.float32)
+        clipped[:, :, 0] = 0.45  # warm cast
+        clipped[24:40, 56:72] = 1.0
+        rec = recover_clipped_highlights(clipped, strength=3.0)
+        self.assertGreater(float(np.max(rec)), 1.5)
+
+        prof = analyze_plate(img_vig, is_hdr=False, fov_h_deg=90.0)
+        synth = generate_latlong_hdri(
+            prof,
+            HDRISynthesisParams(
+                width=128,
+                height=64,
+                highlight_recovery=2.0,
+                nadir_cleanup=0.75,
+                neutralize_environment=True,
+            ),
+            views=[PlateViewInput(pixels=img_vig, is_hdr=False, fov_h_deg=90.0)],
+        )
+        self.assertEqual(synth.shape, (64, 128, 3))
+        self.assertTrue(np.all(np.isfinite(synth)))
+
+        diff_exr = generate_diffuse_irradiance_hdri(rec)
+        self.assertEqual(diff_exr.shape, rec.shape)
+        self.assertLessEqual(float(np.max(diff_exr)), float(np.max(rec)))
+
+        rough_srgb = render_preview_srgb(synth, roughness_preview=0.6)
+        self.assertEqual(rough_srgb.dtype, np.uint8)
+
+        # 4. Temporal stabilize + diffuse split sequence export
+        p1 = analyze_plate(np.full((32, 32, 3), 0.2, dtype=np.float32), is_hdr=True, frame=1)
+        p2 = analyze_plate(np.full((32, 32, 3), 0.8, dtype=np.float32), is_hdr=True, frame=2)
+        _, seq_paths = export_hdri_sequence(
+            [p1, p2],
+            [],
+            HDRISynthesisParams(width=64, height=32, temporal_stabilize=0.8),
+            os.path.join(self.tmpdir.name, "stab.$F4.exr"),
+            export_diffuse_split=True,
+        )
+        self.assertEqual(len(seq_paths), 2)
+        for sp in seq_paths:
+            stem, ext = os.path.splitext(sp)
+            self.assertTrue(os.path.isfile(f"{stem}_diffuse{ext}"))
+
+        # 5. Solaris distant sun & USD rig export (if hou available)
+        try:
+            import hou  # noqa: F401
+            from hdri_maker.solaris_stage import (
+                create_or_update_distant_sun_from_hotspot,
+                export_solaris_rig_usd,
+                list_scene_cameras,
+            )
+
+            _ = list_scene_cameras()
+            if prof.hotspots:
+                sun = create_or_update_distant_sun_from_hotspot(prof.hotspots[0])
+                self.assertIsNotNone(sun)
+                usd_out = os.path.join(self.tmpdir.name, "test_rig.usda")
+                self.assertTrue(os.path.isfile(export_solaris_rig_usd(usd_out)))
+        except ImportError:
+            pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

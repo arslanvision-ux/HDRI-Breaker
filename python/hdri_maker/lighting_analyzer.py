@@ -733,11 +733,12 @@ def project_multiview_plates_to_latlong(
         )
         k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
 
+        lens = getattr(view, "lens_type", "rectilinear") or "rectilinear"
         # Restrict evaluation to the latitude row band covered by this view (+margin for roll/warp)
         diag_half_deg = math.degrees(math.atan(math.hypot(tan_half_fov_x, tan_half_fov_y))) * (1.25 if abs(k1) > 1e-4 else 1.0) + 12.0
         el_hi = el_deg + diag_half_deg
         el_lo = el_deg - diag_half_deg
-        if el_hi >= 89.0 or el_lo <= -89.0:
+        if lens == "chrome_ball" or el_hi >= 89.0 or el_lo <= -89.0:
             y_start, y_end = 0, out_height
         else:
             y_start = max(0, int(math.floor((0.5 - el_hi / 180.0) * out_height)))
@@ -752,8 +753,17 @@ def project_multiview_plates_to_latlong(
         cam_x = dx_s * right[0] + dy_s * right[1] + dz_s * right[2]
         cam_y = dx_s * up[0] + dy_s * up[1] + dz_s * up[2]
 
-        lens = getattr(view, "lens_type", "rectilinear") or "rectilinear"
-        if lens in ("fisheye_equidistant", "fisheye_equisolid"):
+        if lens == "chrome_ball":
+            # Debevec mirror-ball unwrap: V_cam = (0, 0, -1), N = normalize(R + V_cam)
+            nx_b = cam_x
+            ny_b = cam_y
+            nz_b = cam_z - 1.0
+            n_len = np.maximum(np.sqrt(nx_b * nx_b + ny_b * ny_b + nz_b * nz_b), 1e-6)
+            ndc_x = (nx_b / n_len) / max(0.1, float(view.scale_x))
+            ndc_y = (ny_b / n_len) / max(0.1, float(view.scale_y))
+            r_ball = np.hypot(ndc_x, ndc_y)
+            in_front = (cam_z < 0.992) & (r_ball <= 0.985)
+        elif lens in ("fisheye_equidistant", "fisheye_equisolid"):
             fov_h_rad = math.radians(np.clip(view.fov_h_deg, 10.0, 220.0) * 0.5)
             aspect = iw / float(max(ih, 1))
             r_xy = np.hypot(cam_x, cam_y)
@@ -1227,3 +1237,69 @@ def estimate_horizon_shift_deg(
     # Elevation of detected horizon in degrees: +90 at v=0, 0 at v=0.5, -90 at v=1
     detected_el_deg = (0.5 - v_horizon) * 180.0
     return float(np.clip(-detected_el_deg, -40.0, 40.0))
+
+
+def estimate_horizon_roll_deg(pixels: np.ndarray) -> float:
+    """
+    Estimate camera horizon roll angle (in degrees, [-25, 25]) from dominant
+    near-horizontal edge gradients in the middle vertical band of a plate.
+    """
+    img = np.asarray(pixels, dtype=np.float32)
+    if img.ndim != 3 or img.shape[0] < 16 or img.shape[1] < 16:
+        return 0.0
+    h, w = img.shape[:2]
+    step = max(1, min(h, w) // 256)
+    small = img[::step, ::step]
+    lum = np.log1p(np.maximum(compute_luminance(small), 0.0))
+    sh, sw = lum.shape
+    y0 = max(1, int(sh * 0.22))
+    y1 = min(sh - 1, int(sh * 0.78))
+    if y1 <= y0 + 2 or sw < 6:
+        return 0.0
+
+    gx = lum[y0:y1, 2:] - lum[y0:y1, :-2]
+    gy = lum[y0 + 1 : y1 + 1, 1:-1] - lum[y0 - 1 : y1 - 1, 1:-1]
+    gx = gx[:, :]
+    mag = np.hypot(gx, gy)
+    # Focus on strong near-horizontal edges (|gy| > |gx|)
+    mask = (mag > float(np.percentile(mag, 75))) & (np.abs(gy) > 1.5 * np.abs(gx))
+    if not np.any(mask):
+        return 0.0
+    angles = np.degrees(np.arctan2(-gx[mask], np.where(gy[mask] >= 0, gy[mask], -gy[mask]) * np.sign(gy[mask] + 1e-6)))
+    # Use weighted median of small tilt angles
+    angles = angles[np.abs(angles) <= 25.0]
+    if angles.size < 8:
+        return 0.0
+    return float(np.clip(np.median(angles), -25.0, 25.0))
+
+
+def estimate_radial_vignette(pixels: np.ndarray) -> float:
+    """
+    Estimate radial corner vignetting coefficient `vignette_v1` in [0.0, 0.70]
+    by comparing mid-band center brightness against outer corner brightness.
+    """
+    img = np.asarray(pixels, dtype=np.float32)
+    if img.ndim != 3 or img.shape[0] < 16 or img.shape[1] < 16:
+        return 0.0
+    lum = compute_luminance(img)
+    h, w = lum.shape
+    cy0, cy1 = int(h * 0.35), int(h * 0.65)
+    cx0, cx1 = int(w * 0.35), int(w * 0.65)
+    center_med = float(np.median(lum[cy0:cy1, cx0:cx1]))
+    if center_med <= 1e-5:
+        return 0.0
+
+    ch, cw = max(2, int(h * 0.14)), max(2, int(w * 0.14))
+    corners = np.concatenate([
+        lum[:ch, :cw].ravel(),
+        lum[:ch, -cw:].ravel(),
+        lum[-ch:, :cw].ravel(),
+        lum[-ch:, -cw:].ravel(),
+    ])
+    corner_med = float(np.median(corners))
+    ratio = corner_med / center_med
+    # If corners are significantly darker than center, estimate v1 for (1 + v1 * r^2) lift
+    if ratio >= 0.92:
+        return 0.0
+    v1 = (1.0 / max(ratio, 0.35) - 1.0) * 0.55
+    return float(np.clip(v1, 0.0, 0.70))

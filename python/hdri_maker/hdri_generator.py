@@ -57,6 +57,10 @@ class HDRISynthesisParams:
     light_rect: Optional[Tuple[float, float, float, float]] = None
     remove_hotspot_from_hdri: bool = True
     physical_sky_fill: float = 0.0
+    highlight_recovery: float = 0.0
+    nadir_cleanup: float = 0.0
+    neutralize_environment: bool = False
+    temporal_stabilize: float = 0.0
 
 
 @dataclass
@@ -684,6 +688,29 @@ def generate_latlong_hdri(
         if float(np.max(np.abs(wb - 1.0))) > 1e-4:
             hdri *= wb[None, None, :]
 
+    # 4c. Optional Clipped Highlight / Sun Core Recovery
+    if p.highlight_recovery > 1e-4:
+        hdri = recover_clipped_highlights(hdri, strength=p.highlight_recovery)
+
+    # 4d. Optional Seam-Aware Nadir / Tripod Cleanup
+    if p.nadir_cleanup > 1e-4:
+        hdri = _apply_nadir_cleanup(hdri, strength=p.nadir_cleanup)
+
+    # 4e. Optional One-Click Neutralize Environment (turntable WB)
+    if p.neutralize_environment:
+        mean_rgb = np.mean(hdri, axis=(0, 1))
+        mr, mg, mb = max(float(mean_rgb[0]), 1e-5), max(float(mean_rgb[1]), 1e-5), max(float(mean_rgb[2]), 1e-5)
+        mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
+        neut_gains = np.array(
+            [
+                float(np.clip(mlum / mr, 0.25, 4.0)),
+                float(np.clip(mlum / mg, 0.25, 4.0)),
+                float(np.clip(mlum / mb, 0.25, 4.0)),
+            ],
+            dtype=np.float32,
+        )
+        hdri *= neut_gains[None, None, :]
+
     # 5. Saturation adjustment in linear space
     if abs(p.saturation - 1.0) > 1e-4:
         lum = compute_luminance(hdri)[..., None]
@@ -701,16 +728,99 @@ def generate_latlong_hdri(
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
 
 
+def recover_clipped_highlights(
+    hdri_pixels: np.ndarray,
+    strength: float = 1.0,
+    threshold: float = 0.94,
+) -> np.ndarray:
+    """
+    Reconstruct smooth physical HDR peak energy inside clipped LDR highlight cores
+    (such as clamped suns or softboxes) using blurred core-distance falloff.
+    """
+    s = float(max(0.0, strength))
+    if s <= 1e-4:
+        return hdri_pixels
+    img = hdri_pixels.astype(np.float32, copy=True)
+    h, w = img.shape[:2]
+    max_ch = np.max(img, axis=-1)
+    clipped = (max_ch >= float(threshold)).astype(np.float32)
+    if float(np.max(clipped)) < 0.5:
+        return img
+
+    # Smooth the binary clipped mask to obtain an interior-peaking distance proxy
+    rx = max(2, w // 96)
+    ry = max(2, h // 48)
+    dist_proxy = _separable_box_blur(clipped[..., None], rx, ry, wrap_x=True)[..., 0]
+    core = np.clip(dist_proxy * clipped, 0.0, 1.0)
+    # Reconstruct peak energy while preserving local highlight chromaticity
+    boost = 1.0 + s * (core * core) * 4.0
+    return np.ascontiguousarray(img * boost[..., None], dtype=np.float32)
+
+
+def _apply_nadir_cleanup(hdri_pixels: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """
+    Seam-aware nadir/tripod cleanup: blends a smoothly wrapped, pole-converged
+    ring sampled just above the nadir zone down across the bottom cap.
+    """
+    s = float(np.clip(strength, 0.0, 1.0))
+    if s <= 1e-4:
+        return hdri_pixels
+    img = hdri_pixels.astype(np.float32, copy=True)
+    h, w = img.shape[:2]
+    y_ring0 = max(0, int(h * 0.72))
+    y_ring1 = max(y_ring0 + 2, int(h * 0.84))
+    y_nadir_start = int(h * 0.80)
+    cap_h = h - y_nadir_start
+    if cap_h < 4:
+        return img
+
+    ring = img[y_ring0:y_ring1]
+    tile = _build_seamless_tile(ring)
+    patch = _tile_fill_region(tile, cap_h, w, flip_vertical=False)
+    patch = _smooth_pole_cap(patch, is_zenith=False, blur_amount=0.45 + 0.45 * s)
+
+    ys = np.arange(cap_h, dtype=np.float32)
+    w_blend = _smoothstep(0.0, max(2.0, cap_h * 0.45), ys)[:, None, None] * s
+    img[y_nadir_start:] = img[y_nadir_start:] * (1.0 - w_blend) + patch * w_blend
+    return np.ascontiguousarray(img, dtype=np.float32)
+
+
+def generate_diffuse_irradiance_hdri(
+    hdri_pixels: np.ndarray,
+    clamp_percentile: float = 99.5,
+) -> np.ndarray:
+    """
+    Generate a firefly-free diffuse/irradiance companion Lat/Long HDRI by softly
+    clamping extreme specular spikes and applying wide wrap-safe spherical blur.
+    """
+    img = np.maximum(hdri_pixels.astype(np.float32, copy=False), 0.0)
+    lum = compute_luminance(img)
+    p_hi = float(np.percentile(lum, float(np.clip(clamp_percentile, 90.0, 99.95))))
+    p_hi = max(p_hi, 1e-3)
+    # Soft-knee rolloff above p_hi to prevent path-tracer fireflies while keeping energy
+    excess = np.maximum(lum - p_hi, 0.0)
+    target_lum = p_hi + p_hi * np.tanh(excess / p_hi)
+    scale = np.where(lum > p_hi, target_lum / np.maximum(lum, 1e-6), 1.0)
+    clamped = img * scale[..., None]
+    return blur_latlong_hdri(clamped, blur_amount=0.45)
+
+
 def render_preview_srgb(
     hdri_pixels: np.ndarray,
     preview_ev: float = 0.0,
     tonemap: str = "aces",
+    roughness_preview: float = 0.0,
 ) -> np.ndarray:
     """
     Tone-map a 32-bit float HDRI into 8-bit sRGB (H, W, 3) uint8 for UI display.
-    Supports 'aces', 'false_color', 'reinhard', and 'linear'.
+    Supports 'aces', 'false_color', 'reinhard', and 'linear', plus optional
+    roughness mip-blur simulation in [0, 1].
     """
-    img = hdri_pixels.astype(np.float32) * float(2.0 ** preview_ev)
+    src = hdri_pixels.astype(np.float32)
+    r_prev = float(np.clip(roughness_preview, 0.0, 1.0))
+    if r_prev > 1e-3:
+        src = blur_latlong_hdri(src, blur_amount=min(1.0, (r_prev ** 1.45) * 0.85))
+    img = src * float(2.0 ** preview_ev)
     tm = str(tonemap or "aces").strip().lower()
 
     if "false" in tm:
@@ -1037,23 +1147,66 @@ def export_hdri_sequence(
     light_regions: Optional[List[dict]] = None,
     inpaint_lights: bool = False,
     light_blur: float = 0.0,
+    temporal_stabilize: Optional[float] = None,
+    export_diffuse_split: bool = False,
 ) -> Tuple[str, List[str]]:
     """
     Generate and export a per-frame sequence of 32-bit float Lat/Long EXR files.
+    Supports optional temporal EV/WB stabilization and diffuse irradiance split EXRs.
 
     Returns:
         (solaris_pattern_path, list_of_written_exr_paths)
     """
+    import os
     from .plate_io import format_frame_path, write_exr_32f
 
     written: List[str] = []
     if not frame_profiles:
         raise ValueError("At least one LightingProfile is required for sequence export.")
 
+    t_stab = float(
+        np.clip(
+            params.temporal_stabilize if temporal_stabilize is None else temporal_stabilize,
+            0.0,
+            1.0,
+        )
+    )
+    n_frames = len(frame_profiles)
+    ev_mults = [1.0] * n_frames
+    wb_mults = [(1.0, 1.0, 1.0)] * n_frames
+
+    if t_stab > 1e-4 and n_frames > 1:
+        log_lums = np.array(
+            [math.log(max(float(p.mean_luminance), 1e-5)) for p in frame_profiles],
+            dtype=np.float32,
+        )
+        cols = np.array([p.overall_color for p in frame_profiles], dtype=np.float32)
+        radius = max(1, int(round(1 + t_stab * 4)))
+        sigma = max(0.75, radius * 0.55)
+        for i in range(n_frames):
+            lo = max(0, i - radius)
+            hi = min(n_frames, i + radius + 1)
+            offsets = np.arange(lo, hi, dtype=np.float32) - float(i)
+            w = np.exp(-0.5 * (offsets / sigma) ** 2)
+            w /= np.sum(w)
+            target_log_lum = float(np.sum(log_lums[lo:hi] * w))
+            ev_mults[i] = float(np.clip(math.exp((target_log_lum - float(log_lums[i])) * t_stab), 0.25, 4.0))
+
+            target_col = np.sum(cols[lo:hi] * w[:, None], axis=0)
+            src_col = np.maximum(cols[i], 1e-4)
+            ratio = np.clip(target_col / src_col, 0.5, 2.0)
+            r_lum = max(0.2126 * float(ratio[0]) + 0.7152 * float(ratio[1]) + 0.0722 * float(ratio[2]), 1e-5)
+            ratio /= r_lum
+            blended = (1.0 - t_stab) + t_stab * ratio
+            wb_mults[i] = (float(blended[0]), float(blended[1]), float(blended[2]))
+
     for idx, prof in enumerate(frame_profiles):
         fnum = prof.frame if prof.frame is not None else (idx + 1)
         view_slice = [frame_views[idx]] if idx < len(frame_views) else None
         hdri = generate_latlong_hdri(prof, params, views=view_slice)
+        if t_stab > 1e-4 and n_frames > 1:
+            wb = np.array(wb_mults[idx], dtype=np.float32) * float(ev_mults[idx])
+            hdri = hdri * wb[None, None, :]
         if light_regions:
             hdri, _ = extract_and_inpaint_multiple_hotspots(
                 hdri,
@@ -1070,4 +1223,14 @@ def export_hdri_sequence(
                 frame=int(fnum),
             )
         )
+        if export_diffuse_split:
+            stem, ext = os.path.splitext(out_file)
+            diff_file = f"{stem}_diffuse{ext or '.exr'}"
+            diff_hdri = generate_diffuse_irradiance_hdri(hdri)
+            write_exr_32f(
+                diff_file,
+                diff_hdri,
+                output_colorspace=output_colorspace,
+                frame=int(fnum),
+            )
     return output_pattern, written

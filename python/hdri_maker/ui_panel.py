@@ -23,6 +23,7 @@ from .hdri_generator import (
     export_hdri_sequence,
     extract_and_inpaint_hotspot,
     extract_and_inpaint_multiple_hotspots,
+    generate_diffuse_irradiance_hdri,
     generate_latlong_hdri,
     render_preview_srgb,
 )
@@ -36,7 +37,9 @@ from .lighting_analyzer import (
     compute_overlap_difference_map,
     compute_plate_outline_uv,
     equirect_rect_to_plate_rect,
+    estimate_horizon_roll_deg,
     estimate_horizon_shift_deg,
+    estimate_radial_vignette,
     hit_test_plate_uv,
     merge_lighting_profiles,
     rgb_to_cct_kelvin,
@@ -53,8 +56,12 @@ from .qt_compat import Qt, QtCore, QtGui, QtWidgets, Signal
 from .solaris_stage import (
     HAS_HOU,
     create_or_update_area_light_from_hotspot,
+    create_or_update_distant_sun_from_hotspot,
     create_or_update_domelight,
     create_or_update_lookdev_and_ground,
+    export_solaris_rig_usd,
+    list_scene_cameras,
+    read_scene_camera_params,
 )
 
 try:
@@ -264,6 +271,17 @@ class PreviewLabel(QtWidgets.QLabel):
         self._panning: bool = False
         self._pan_start_pos: Optional[QtCore.QPoint] = None
         self._pan_start_uv: Tuple[float, float] = (0.5, 0.5)
+        # A/B Split Wipe state
+        self._ab_split_enabled: bool = False
+        self._ab_split_x: float = 0.5
+        self._ab_compare_pixmap: Optional[QtGui.QPixmap] = None
+        self._ab_dragging: bool = False
+
+    def set_ab_split(self, enabled: bool, compare_pix: Optional[QtGui.QPixmap] = None) -> None:
+        self._ab_split_enabled = bool(enabled)
+        if compare_pix is not None:
+            self._ab_compare_pixmap = compare_pix
+        self.update()
 
     def set_source_pixmap(self, pix: Optional[QtGui.QPixmap]) -> None:
         self._source_pixmap = pix
@@ -458,6 +476,13 @@ class PreviewLabel(QtWidgets.QLabel):
             self.update()
             return
         if self._pick_mode is None and event.button() == Qt.LeftButton:
+            if self._ab_split_enabled and self._ab_compare_pixmap is not None:
+                prect = self._pixmap_rect()
+                split_px = prect.x() + int(self._ab_split_x * prect.width())
+                if abs(pos.x() - split_px) <= 12:
+                    self._ab_dragging = True
+                    self.setCursor(Qt.SplitHCursor)
+                    return
             uv = self._pos_to_uv(pos)
             if self._plate_edit_mode and uv is not None and self._plate_views:
                 handle_mode = self._hit_test_plate_handles(uv[0], uv[1])
@@ -518,6 +543,13 @@ class PreviewLabel(QtWidgets.QLabel):
                 float(np.clip(self._pan_start_uv[1] - dy / zh, 0.0, 1.0)),
             ]
             self.update()
+            return
+
+        if self._ab_dragging:
+            prect = self._pixmap_rect()
+            if prect.width() > 2:
+                self._ab_split_x = float(np.clip((pos.x() - prect.x()) / float(prect.width()), 0.02, 0.98))
+                self.update()
             return
 
         uv = self._pos_to_uv(pos)
@@ -595,6 +627,10 @@ class PreviewLabel(QtWidgets.QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._ab_dragging:
+            self._ab_dragging = False
+            self.setCursor(Qt.ArrowCursor)
+            return
         if self._panning:
             self._panning = False
             self._pan_start_pos = None
@@ -640,6 +676,19 @@ class PreviewLabel(QtWidgets.QLabel):
             painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._zoom <= 4.0)
             target = self._pixmap_rect()
             painter.drawPixmap(target, self._source_pixmap, self._source_pixmap.rect())
+            if self._ab_split_enabled and self._ab_compare_pixmap is not None and not self._ab_compare_pixmap.isNull():
+                split_w = int(round(self._ab_split_x * target.width()))
+                if split_w > 1:
+                    src_w = int(round(self._ab_split_x * self._ab_compare_pixmap.width()))
+                    left_target = QtCore.QRect(target.x(), target.y(), split_w, target.height())
+                    left_src = QtCore.QRect(0, 0, src_w, self._ab_compare_pixmap.height())
+                    painter.drawPixmap(left_target, self._ab_compare_pixmap, left_src)
+                sx = target.x() + split_w
+                painter.setPen(QtGui.QPen(QtGui.QColor(0, 225, 255), 2, Qt.SolidLine))
+                painter.drawLine(sx, target.y(), sx, target.y() + target.height())
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1))
+                painter.drawText(target.x() + 8, target.y() + 18, "A: RAW PLATE")
+                painter.drawText(min(target.right() - 95, sx + 8), target.y() + 18, "B: SYNTH HDRI")
             if self._plate_edit_mode and self._plate_views:
                 for idx, view in enumerate(self._plate_views):
                     is_sel = idx == self._selected_plate_idx
@@ -1245,6 +1294,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         cam_row.addWidget(self.cam_az_spin)
         cam_row.addWidget(QtWidgets.QLabel("El°:"))
         cam_row.addWidget(self.cam_el_spin)
+        self.link_cam_btn = QtWidgets.QPushButton("Link Scene Cam...")
+        self.link_cam_btn.setToolTip("Read FOV, Azimuth, Elevation, and Roll from a Houdini /stage USD Camera or /obj Camera")
+        self.link_cam_btn.clicked.connect(self._on_link_scene_camera)
+        cam_row.addWidget(self.link_cam_btn)
         form.addRow("Camera Map:", cam_row)
 
         hs_row = QtWidgets.QHBoxLayout()
@@ -1399,9 +1452,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.hdri_blur_slider.setToolTip("360-deg wrap-safe Gaussian-approximate blur for the output HDRI")
         self.sky_fill_slider = SliderResetControl(0.0, 1.0, 0.0, 0.02)
         self.sky_fill_slider.setToolTip("Synthesize a physical Rayleigh/Mie sky gradient & HDR sun disc in uncovered upper-hemisphere gaps")
+        self.highlight_recovery_slider = SliderResetControl(0.0, 10.0, 0.0, 0.25)
+        self.highlight_recovery_slider.setToolTip("Reconstruct smooth physical HDR peak energy inside clipped LDR highlight cores (sun/softboxes)")
+        self.nadir_cleanup_slider = SliderResetControl(0.0, 1.0, 0.0, 0.02)
+        self.nadir_cleanup_slider.setToolTip("Seam-aware radial clone & pole smoothing to clean up tripods or shadows at the nadir")
+        self.temporal_stab_slider = SliderResetControl(0.0, 1.0, 0.0, 0.05)
+        self.temporal_stab_slider.setToolTip("Temporal EV & white-balance smoothing across exported sequence ($F4) frames")
 
         self.inpaint_chk = QtWidgets.QCheckBox("Inpaint Sky/Ground")
         self.inpaint_chk.setChecked(True)
+        self.neutralize_env_chk = QtWidgets.QCheckBox("Neutralize Environment (Turntable WB)")
+        self.neutralize_env_chk.setToolTip("Strip heavy ambient color cast while preserving contrast and key/fill ratios for asset lookdev")
+        self.neutralize_env_chk.setChecked(False)
 
         vshift_row = QtWidgets.QHBoxLayout()
         vshift_row.setContentsMargins(0, 0, 0, 0)
@@ -1430,7 +1492,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         form.addRow("Ground Blur:", self.gnd_blur_slider)
         form.addRow("HDRI Blur:", self.hdri_blur_slider)
         form.addRow("Physical Sky Fill:", self.sky_fill_slider)
+        form.addRow("Highlight Recovery:", self.highlight_recovery_slider)
+        form.addRow("Nadir Cleanup:", self.nadir_cleanup_slider)
+        form.addRow("Temporal Smooth:", self.temporal_stab_slider)
         form.addRow("", self.inpaint_chk)
+        form.addRow("", self.neutralize_env_chk)
 
         regen_btn = QtWidgets.QPushButton("Update Preview")
         regen_btn.clicked.connect(self._regenerate_preview)
@@ -1440,6 +1506,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.res_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.out_cs_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.inpaint_chk.toggled.connect(self._schedule_preview_update)
+        self.neutralize_env_chk.toggled.connect(self._schedule_preview_update)
         for ctrl in (
             self.ev_spin,
             self.hs_boost_spin,
@@ -1460,6 +1527,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.gnd_blur_slider,
             self.hdri_blur_slider,
             self.sky_fill_slider,
+            self.highlight_recovery_slider,
+            self.nadir_cleanup_slider,
         ):
             ctrl.valueChanged.connect(self._schedule_preview_update)
         self.vshift_spin.valueChanged.connect(self._on_vshift_changed)
@@ -1617,6 +1686,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_ev_val = QtWidgets.QLabel("0.0 EV")
         ev_row.addWidget(self.preview_ev_val)
 
+        ev_row.addWidget(QtWidgets.QLabel("Rough:"))
+        self.preview_roughness_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.preview_roughness_slider.setRange(0, 100)
+        self.preview_roughness_slider.setValue(0)
+        self.preview_roughness_slider.setMaximumWidth(80)
+        self.preview_roughness_slider.setToolTip("Simulate glossy-to-diffuse reflection roughness (0.0 .. 1.0) in the 2:1 preview")
+        self.preview_roughness_slider.valueChanged.connect(self._update_preview_pixmap)
+        ev_row.addWidget(self.preview_roughness_slider)
+
+        self.ab_split_btn = QtWidgets.QPushButton("A/B Split")
+        self.ab_split_btn.setCheckable(True)
+        self.ab_split_btn.setToolTip("Compare Raw Plate Projection (left) vs Synthesized HDRI (right) with a draggable divider")
+        self.ab_split_btn.toggled.connect(self._on_toggle_ab_split)
+        ev_row.addWidget(self.ab_split_btn)
+
         self.show_markers_chk = QtWidgets.QCheckBox("Hotspot Markers")
         self.show_markers_chk.setChecked(False)
         self.show_markers_chk.toggled.connect(self._update_preview_pixmap)
@@ -1735,8 +1819,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.pt_ev_spin = _mk_spin(-4.0, 4.0, 0.0, 0.05, 2)
         self.pt_vig_spin = _mk_spin(-0.5, 1.5, 0.0, 0.05, 2)
         self.pt_lens_combo = QtWidgets.QComboBox()
-        self.pt_lens_combo.addItems(["rectilinear", "fisheye_equidistant", "fisheye_equisolid"])
+        self.pt_lens_combo.addItems(["rectilinear", "fisheye_equidistant", "fisheye_equisolid", "chrome_ball"])
         self.pt_lens_combo.currentIndexChanged.connect(self._on_plate_spin_changed)
+        self.pt_auto_vig_btn = QtWidgets.QPushButton("Auto Vig")
+        self.pt_auto_vig_btn.setToolTip("Estimate radial corner vignetting for the selected plate")
+        self.pt_auto_vig_btn.clicked.connect(self._on_auto_vignette_plate)
         self.pt_mask_btn = QtWidgets.QPushButton("Mask Area")
         self.pt_mask_btn.setCheckable(True)
         self.pt_mask_btn.setToolTip("Drag a box on the selected plate in the viewer to exclude tripod/moving objects")
@@ -1762,6 +1849,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             pt_layout.addWidget(QtWidgets.QLabel(lbl))
             pt_layout.addWidget(w)
         pt_layout.addWidget(self.pt_lens_combo)
+        pt_layout.addWidget(self.pt_auto_vig_btn)
         pt_layout.addWidget(self.pt_mask_btn)
         pt_layout.addWidget(self.pt_clear_mask_btn)
         pt_layout.addWidget(self.pt_reset_btn)
@@ -1849,6 +1937,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         lookdev_form.addRow("Ground Emission:", self.ground_emission_slider)
         lookdev_form.addRow("Render Engine:", self.render_engine_combo)
         lookdev_form.addRow("Ground Shader:", self.ground_shader_combo)
+        self.diffuse_split_chk = QtWidgets.QCheckBox("Export Companion Diffuse EXR (_diffuse.exr)")
+        self.diffuse_split_chk.setToolTip("Write a firefly-free clamped & smoothed diffuse/irradiance EXR alongside the full-range specular EXR")
+        self.diffuse_split_chk.setChecked(False)
+        lookdev_form.addRow("", self.diffuse_split_chk)
         layout.addLayout(lookdev_form)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -1864,6 +1956,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.rig_btn.setMinimumHeight(34)
         self.rig_btn.clicked.connect(self._on_create_hotspot_rig)
 
+        self.sun_btn = QtWidgets.QPushButton("Create / Update Sun Light (/stage)")
+        self.sun_btn.setMinimumHeight(34)
+        self.sun_btn.setToolTip("Extract Hotspot #1 as a Solaris Distant Light (Sun) aimed toward origin")
+        self.sun_btn.clicked.connect(self._on_create_sun_light)
+
         self.update_lookdev_btn = QtWidgets.QPushButton("Update Lookdev / Ground (/stage)")
         self.update_lookdev_btn.setMinimumHeight(34)
         self.update_lookdev_btn.clicked.connect(self._on_update_lookdev_clicked)
@@ -1873,11 +1970,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.export_seq_btn.setToolTip("Export per-frame 32-bit float Lat/Long EXRs for an analyzed sequence and set $F4 path")
         self.export_seq_btn.clicked.connect(self._on_export_sequence_exr)
 
+        self.export_usd_btn = QtWidgets.QPushButton("Export USD Rig (.usda)")
+        self.export_usd_btn.setMinimumHeight(34)
+        self.export_usd_btn.setToolTip("Export the active /stage HDRI Maker dome, lights, and lookdev rig to a standalone .usda/.usd sublayer")
+        self.export_usd_btn.clicked.connect(self._on_export_usd_rig)
+
         btn_row.addWidget(self.export_btn)
         btn_row.addWidget(self.export_seq_btn)
         btn_row.addWidget(self.dome_btn)
         btn_row.addWidget(self.rig_btn)
+        btn_row.addWidget(self.sun_btn)
         btn_row.addWidget(self.update_lookdev_btn)
+        btn_row.addWidget(self.export_usd_btn)
         layout.addLayout(btn_row)
 
         return grp
@@ -2262,6 +2366,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             light_rect=self._light_regions[0]["rect"] if self._light_regions else None,
             remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
             physical_sky_fill=self.sky_fill_slider.value(),
+            highlight_recovery=self.highlight_recovery_slider.value(),
+            nadir_cleanup=self.nadir_cleanup_slider.value(),
+            neutralize_environment=self.neutralize_env_chk.isChecked(),
+            temporal_stabilize=self.temporal_stab_slider.value(),
         )
 
     def _current_light_shape(self) -> str:
@@ -2688,7 +2796,72 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         est_shift = estimate_horizon_shift_deg(s_map, s_cov)
         self.vshift_spin.setValue(est_shift)
-        self.status_label.setText(f"Auto-leveled Horizon Shift to {est_shift:+.1f} deg.")
+        roll_msg = ""
+        idx = self._selected_plate_idx
+        if 0 <= idx < len(self._views):
+            est_roll = estimate_horizon_roll_deg(self._views[idx].pixels)
+            if abs(est_roll) > 0.25:
+                self._views[idx].cam_roll_deg = est_roll
+                self._sync_view_to_table_and_bar(idx)
+                roll_msg = f" | Plate #{idx + 1} Roll: {est_roll:+.1f} deg"
+        self.status_label.setText(f"Auto-leveled Horizon Shift to {est_shift:+.1f} deg{roll_msg}.")
+
+    def _on_link_scene_camera(self) -> None:
+        if not HAS_HOU:
+            self.status_label.setText("Scene camera linking is only available inside Houdini.")
+            return
+        cams = list_scene_cameras()
+        if not cams:
+            self.status_label.setText("No /stage USD cameras or /obj cameras found in the scene.")
+            return
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Link Scene Camera",
+            "Select a Solaris (/stage) or /obj Camera:",
+            cams,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+        try:
+            cam_p = read_scene_camera_params(choice)
+            self.fov_spin.setValue(cam_p["fov_h_deg"])
+            self.cam_az_spin.setValue(cam_p["azimuth_deg"])
+            self.cam_el_spin.setValue(cam_p["elevation_deg"])
+            idx = self._selected_plate_idx
+            if 0 <= idx < len(self._views):
+                v = self._views[idx]
+                v.fov_h_deg = cam_p["fov_h_deg"]
+                v.cam_azimuth_deg = cam_p["azimuth_deg"]
+                v.cam_elevation_deg = cam_p["elevation_deg"]
+                v.cam_roll_deg = cam_p["roll_deg"]
+                self._sync_view_to_table_and_bar(idx)
+                self._regenerate_preview()
+            self.status_label.setText(
+                f"Linked {choice}: FOV={cam_p['fov_h_deg']:.1f}°, Az={cam_p['azimuth_deg']:+.1f}°, "
+                f"El={cam_p['elevation_deg']:+.1f}°, Roll={cam_p['roll_deg']:+.1f}°."
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Camera link error: {exc}")
+
+    def _on_auto_vignette_plate(self) -> None:
+        idx = self._selected_plate_idx
+        if not (0 <= idx < len(self._views)):
+            self.status_label.setText("Select a plate first to estimate radial vignetting.")
+            return
+        v1 = estimate_radial_vignette(self._views[idx].pixels)
+        self._views[idx].vignette_v1 = v1
+        self._sync_view_to_table_and_bar(idx)
+        self._regenerate_preview()
+        self.status_label.setText(f"Estimated Plate #{idx + 1} Vignette lift = {v1:.2f}.")
+
+    def _on_toggle_ab_split(self, checked: bool) -> None:
+        if checked and self._profile is not None:
+            self._regenerate_preview()
+        else:
+            self.preview_label.set_ab_split(False)
+            self._update_preview_pixmap()
 
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -2929,6 +3102,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             elif not self._light_regions:
                 self._extracted_lights = []
             self._hdri_pixels = hdri
+            if hasattr(self, "ab_split_btn") and self.ab_split_btn.isChecked() and not fast:
+                raw_p = HDRISynthesisParams(
+                    width=p.width,
+                    height=p.height,
+                    azimuth_offset_deg=p.azimuth_offset_deg,
+                    vertical_shift_deg=p.vertical_shift_deg,
+                    plate_projection_blend=1.0,
+                    stitch_blend=p.stitch_blend,
+                    enable_inpaint=False,
+                    ldr_highlight_boost=1.0,
+                )
+                self._raw_hdri_pixels = generate_latlong_hdri(
+                    self._profile,
+                    raw_p,
+                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                )
+            elif not hasattr(self, "ab_split_btn") or not self.ab_split_btn.isChecked():
+                self._raw_hdri_pixels = None
             if not fast:
                 self._log_debug("Updating preview pixmap...")
             self._update_preview_pixmap()
@@ -2954,7 +3145,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             )
             srgb = np.clip(diff_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
         else:
-            srgb = render_preview_srgb(self._hdri_pixels, preview_ev=ev, tonemap=tm_mode)
+            rough = (self.preview_roughness_slider.value() / 100.0) if hasattr(self, "preview_roughness_slider") else 0.0
+            srgb = render_preview_srgb(
+                self._hdri_pixels,
+                preview_ev=ev,
+                tonemap=tm_mode,
+                roughness_preview=rough,
+            )
+            if (
+                hasattr(self, "ab_split_btn")
+                and self.ab_split_btn.isChecked()
+                and getattr(self, "_raw_hdri_pixels", None) is not None
+            ):
+                raw_srgb = render_preview_srgb(
+                    self._raw_hdri_pixels,
+                    preview_ev=ev,
+                    tonemap=tm_mode,
+                    roughness_preview=rough,
+                )
+                rh, rw, _ = raw_srgb.shape
+                rqimg = QtGui.QImage(raw_srgb.data, rw, rh, 3 * rw, QtGui.QImage.Format_RGB888)
+                self.preview_label.set_ab_split(True, QtGui.QPixmap.fromImage(rqimg.copy()))
+            else:
+                self.preview_label.set_ab_split(False)
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         self.preview_label.set_plate_overlay(
             self._views if len(self._views) <= 12 else self._views[:1],
@@ -3028,6 +3241,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 light_regions=self._light_regions,
                 inpaint_lights=self.remove_hotspot_chk.isChecked(),
                 light_blur=self.light_blur_slider.value(),
+                temporal_stabilize=p.temporal_stabilize,
+                export_diffuse_split=self.diffuse_split_chk.isChecked(),
             )
             self.out_path_edit.setText(pattern)
             self.status_label.setText(f"Exported {len(written)} 32-bit float EXR frame(s): {pattern}")
@@ -3154,6 +3369,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     output_colorspace=out_cs,
                     metadata=meta,
                 )
+                if self.diffuse_split_chk.isChecked():
+                    stem_d, ext_d = os.path.splitext(p_written)
+                    diff_out = f"{stem_d}_diffuse{ext_d or '.exr'}"
+                    diff_hdri = generate_diffuse_irradiance_hdri(hdri)
+                    write_exr_32f(diff_out, diff_hdri, output_colorspace=out_cs, metadata=meta)
+                    light_msg += " + Diffuse EXR"
                 self._last_exr_path = p_written
                 self._last_hdri_full = self._downsample_for_lookdev(hdri)
                 lookdev_msg = ""
@@ -3314,6 +3535,49 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         except Exception as exc:
             self.status_label.setText(f"Solaris Area Light error: {exc}")
 
+    def _on_create_sun_light(self) -> None:
+        if not HAS_HOU:
+            self.status_label.setText("Solaris /stage wiring is only available inside Houdini.")
+            return
+        if self._profile is None or not self._profile.hotspots:
+            self.status_label.setText("Analyze a plate with at least 1 detected hotspot before creating a Sun Light.")
+            return
+        try:
+            hs = self._profile.hotspots[0]
+            parent = self._last_dome_node
+            if parent is None and self._last_exr_path:
+                parent = create_or_update_domelight(
+                    hdri_exr_path=self._last_exr_path,
+                    profile=self._profile,
+                    set_display_flag=False,
+                )
+                self._last_dome_node = parent
+            sun = create_or_update_distant_sun_from_hotspot(hs, parent_node=parent)
+            self.status_label.setText(
+                f"Solaris Distant Sun ready at {sun.path()} (Az={hs.azimuth_deg:+.1f}°, El={hs.elevation_deg:+.1f}°)."
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Solaris Sun Light error: {exc}")
+
+    def _on_export_usd_rig(self) -> None:
+        if not HAS_HOU:
+            self.status_label.setText("USD Rig export requires Houdini /stage.")
+            return
+        default_dir = os.path.dirname(self.out_path_edit.text().strip()) or os.path.expanduser("~")
+        usd_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Solaris HDRI & Lookdev Rig (.usda / .usd)",
+            os.path.join(default_dir, "hdri_maker_rig.usda"),
+            "USD ASCII (*.usda);;USD Binary (*.usd);;USD Crate (*.usdc)",
+        )
+        if not usd_path:
+            return
+        try:
+            written = export_solaris_rig_usd(usd_path)
+            self.status_label.setText(f"Exported standalone Solaris USD rig: {written}")
+        except Exception as exc:
+            self.status_label.setText(f"USD export error: {exc}")
+
     @staticmethod
     def _downsample_for_lookdev(hdri: Optional[np.ndarray], max_width: int = 2048) -> Optional[np.ndarray]:
         """Cap cached full-export HDRI to max_width (e.g. 2K instead of 8K 384MB) for ground baking."""
@@ -3437,6 +3701,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "ground_blur": self.gnd_blur_slider.value(),
             "hdri_blur": self.hdri_blur_slider.value(),
             "physical_sky_fill": self.sky_fill_slider.value(),
+            "highlight_recovery": self.highlight_recovery_slider.value(),
+            "nadir_cleanup": self.nadir_cleanup_slider.value(),
+            "temporal_stabilize": self.temporal_stab_slider.value(),
+            "neutralize_environment": self.neutralize_env_chk.isChecked(),
+            "diffuse_split": self.diffuse_split_chk.isChecked(),
+            "preview_roughness": self.preview_roughness_slider.value(),
+            "ab_split": self.ab_split_btn.isChecked(),
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -3543,6 +3814,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.gnd_blur_slider.setValue(float(data.get("ground_blur", 0.0)))
         self.hdri_blur_slider.setValue(float(data.get("hdri_blur", 0.0)))
         self.sky_fill_slider.setValue(float(data.get("physical_sky_fill", 0.0)))
+        self.highlight_recovery_slider.setValue(float(data.get("highlight_recovery", 0.0)))
+        self.nadir_cleanup_slider.setValue(float(data.get("nadir_cleanup", 0.0)))
+        self.temporal_stab_slider.setValue(float(data.get("temporal_stabilize", 0.0)))
+        self.neutralize_env_chk.setChecked(bool(data.get("neutralize_environment", False)))
+        self.diffuse_split_chk.setChecked(bool(data.get("diffuse_split", False)))
+        self.preview_roughness_slider.setValue(int(data.get("preview_roughness", 0)))
+        self.ab_split_btn.setChecked(bool(data.get("ab_split", False)))
 
         sr = data.get("sky_rect")
         self._sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None

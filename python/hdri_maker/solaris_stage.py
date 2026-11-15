@@ -1061,3 +1061,200 @@ if is_shadow_catcher:
         except Exception:
             pass
     return mat_lib
+
+
+def list_scene_cameras() -> List[str]:
+    """
+    Discover available cameras on `/stage` (USD `UsdGeom.Camera` prims) and `/obj` (`cam` nodes).
+    Returns formatted descriptors like `/stage:/cameras/cam1` or `/obj/cam1`.
+    """
+    if hou is None:
+        return []
+    cameras: List[str] = []
+    try:
+        stage_net = hou.node("/stage")
+        if stage_net is not None:
+            disp = stage_net.displayNode()
+            if disp is not None:
+                usd_stage = disp.stage()
+                if usd_stage is not None:
+                    from pxr import UsdGeom
+                    for prim in usd_stage.Traverse():
+                        if prim.IsA(UsdGeom.Camera):
+                            cameras.append(f"/stage:{prim.GetPath()}")
+    except Exception:
+        pass
+    try:
+        obj_net = hou.node("/obj")
+        if obj_net is not None:
+            for node in obj_net.allSubChildren():
+                if node.type().name() in ("cam", "vrcam", "stereocamrig"):
+                    cameras.append(node.path())
+    except Exception:
+        pass
+    return cameras
+
+
+def read_scene_camera_params(camera_ref: str, frame: Optional[float] = None) -> Dict[str, float]:
+    """
+    Read FOV (horizontal degrees), Azimuth, Elevation, and Roll (degrees) from a
+    `/stage:/path/to/usd_cam` or `/obj/cam` Houdini camera, matching `_camera_basis`.
+    """
+    if hou is None:
+        raise RuntimeError("Houdini `hou` module is not available.")
+
+    if camera_ref.startswith("/stage:"):
+        prim_path = camera_ref.split(":", 1)[1]
+        stage_net = hou.node("/stage")
+        disp = stage_net.displayNode() if stage_net is not None else None
+        usd_stage = disp.stage() if disp is not None else None
+        if usd_stage is None:
+            raise RuntimeError("No active USD stage found on /stage.")
+        from pxr import Gf, Usd, UsdGeom
+        prim = usd_stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"USD camera prim not found: {prim_path}")
+        cam = UsdGeom.Camera(prim)
+        tc = Usd.TimeCode(frame if frame is not None else hou.frame())
+        focal = float(cam.GetFocalLengthAttr().Get(tc) or 50.0)
+        hap = float(cam.GetHorizontalApertureAttr().Get(tc) or 36.0)
+        fov_h = 2.0 * math.degrees(math.atan(max(hap, 1e-3) / (2.0 * max(focal, 1e-3))))
+        xform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(tc)
+        # Camera looks along -Z, right is +X, up is +Y (row-vector convention in pxr)
+        fwd = (-xform.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))).GetNormalized()
+        right = xform.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0)).GetNormalized()
+        up = xform.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0)).GetNormalized()
+    else:
+        node = hou.node(camera_ref)
+        if node is None:
+            raise RuntimeError(f"Camera node not found: {camera_ref}")
+        focal = float(node.parm("focal").eval() if node.parm("focal") else 50.0)
+        hap = float(node.parm("aperture").eval() if node.parm("aperture") else 36.0)
+        fov_h = 2.0 * math.degrees(math.atan(max(hap, 1e-3) / (2.0 * max(focal, 1e-3))))
+        wt = node.worldTransform()
+        fwd_v = (hou.Vector3(0.0, 0.0, -1.0) * wt.extractRotationMatrix3()).normalized()
+        right_v = (hou.Vector3(1.0, 0.0, 0.0) * wt.extractRotationMatrix3()).normalized()
+        up_v = (hou.Vector3(0.0, 1.0, 0.0) * wt.extractRotationMatrix3()).normalized()
+        from pxr import Gf
+        fwd = Gf.Vec3d(fwd_v[0], fwd_v[1], fwd_v[2])
+        right = Gf.Vec3d(right_v[0], right_v[1], right_v[2])
+        up = Gf.Vec3d(up_v[0], up_v[1], up_v[2])
+
+    el_deg = math.degrees(math.asin(max(-1.0, min(1.0, float(fwd[1])))))
+    az_deg = math.degrees(math.atan2(float(fwd[0]), float(fwd[2])))
+    # Roll relative to world-up horizon basis
+    world_up = (0.0, 1.0, 0.0)
+    # right0 = normalize(fwd x world_up) -> wait: in _camera_basis, right0 = (cos(az), 0, -sin(az))
+    az_r = math.radians(az_deg)
+    r0_x, r0_y, r0_z = math.cos(az_r), 0.0, -math.sin(az_r)
+    u0_x = float(fwd[1]) * r0_z - float(fwd[2]) * r0_y
+    u0_y = float(fwd[2]) * r0_x - float(fwd[0]) * r0_z
+    u0_z = float(fwd[0]) * r0_y - float(fwd[1]) * r0_x
+    cos_roll = float(right[0]) * r0_x + float(right[1]) * r0_y + float(right[2]) * r0_z
+    sin_roll = float(right[0]) * u0_x + float(right[1]) * u0_y + float(right[2]) * u0_z
+    roll_deg = math.degrees(math.atan2(sin_roll, cos_roll))
+
+    return {
+        "fov_h_deg": float(max(5.0, min(165.0, fov_h))),
+        "azimuth_deg": float(az_deg),
+        "elevation_deg": float(max(-89.0, min(89.0, el_deg))),
+        "roll_deg": float(roll_deg),
+    }
+
+
+def create_or_update_distant_sun_from_hotspot(
+    hotspot: HotspotLight,
+    parent_node=None,
+    node_name: str = "hdri_maker_sun",
+    prim_path: str = "/lights/hdri_maker_sun",
+    intensity: float = 1.0,
+    exposure: float = 0.0,
+    angle_deg: Optional[float] = None,
+    set_display_flag: bool = True,
+):
+    """
+    Create or update a Solaris Distant Light (Sun) LOP aimed from the hotspot's
+    (azimuth, elevation) toward the origin, with matched angular diameter and color.
+    """
+    stage = _ensure_stage_context()
+    sun = _create_lop(stage, ("distantlight::2.0", "light::2.0", "distantlight"), node_name)
+    _set_first_parm(sun, ("primpath",), prim_path)
+    _set_first_parm(sun, ("lighttype",), "UsdLuxDistantLight")
+
+    _set_first_parm(sun, ("rx",), float(-hotspot.elevation_deg))
+    _set_first_parm(sun, ("ry",), float(hotspot.azimuth_deg))
+    _set_first_parm(sun, ("rz",), 0.0)
+
+    eff_angle = float(angle_deg) if angle_deg is not None else float(max(0.53, min(15.0, hotspot.radius_deg * 0.5)))
+    _set_parm_control(sun, ("xn__inputsangle_control_e4a", "xn__inputsangle_control_f6a"))
+    _set_first_parm(sun, ("xn__inputsangle_e4a", "xn__inputsangle_f6a", "inputs:angle", "angle"), eff_angle)
+
+    _set_parm_control(sun, ("xn__inputsintensity_control_jeb", "xn__inputsintensity_control_i5a"))
+    _set_first_parm(
+        sun,
+        ("xn__inputsintensity_i0a", "xn__inputsintensity_i5a", "inputs:intensity", "intensity"),
+        float(max(0.01, hotspot.mean_intensity * intensity)),
+    )
+
+    _set_parm_control(sun, ("xn__inputsexposure_control_wcb", "xn__inputsexposure_control_e5a"))
+    _set_first_parm(
+        sun,
+        ("xn__inputsexposure_vya", "xn__inputsexposure_e5a", "inputs:exposure", "exposure"),
+        float(exposure),
+    )
+
+    _set_parm_control(sun, ("xn__inputscolor_control_06a", "xn__inputscolor_control_i4a"))
+    _set_first_parm_tuple(sun, ("xn__inputscolor_zta", "xn__inputscolor_i4a", "inputs:color", "color"), hotspot.color_rgb)
+
+    valid_parent = _resolve_valid_parent_lop(stage, parent_node)
+    if valid_parent is not None and valid_parent != sun:
+        try:
+            sun.setInput(0, valid_parent)
+        except Exception:
+            pass
+
+    sun.moveToGoodPosition()
+    if not _rewire_lookdev_to_tail(stage, sun, set_display_flag=set_display_flag):
+        if set_display_flag:
+            try:
+                sun.setDisplayFlag(True)
+            except Exception:
+                pass
+    return sun
+
+
+def export_solaris_rig_usd(
+    output_usd_path: str,
+    tail_node_name: Optional[str] = None,
+) -> str:
+    """
+    Export the active HDRI Maker Solaris `/stage` stream (dome light, area/sun lights,
+    and lookdev rig) to a standalone `.usda` or `.usd` file for sublayering into shots.
+    """
+    import os
+
+    stage = _ensure_stage_context()
+    target = stage.node(tail_node_name) if tail_node_name else None
+    if target is None:
+        target = stage.node("hdri_maker_materials") or stage.node("hdri_maker_lookdev") or _find_tail_light_lop(stage)
+    if target is None:
+        target = stage.displayNode()
+    if target is None:
+        raise RuntimeError("No HDRI Maker LOP nodes found on /stage to export.")
+
+    out_dir = os.path.dirname(os.path.abspath(output_usd_path))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    usd_rop = _create_lop(stage, ("usd_rop::2.0", "usd_rop", "usdexport"), "hdri_maker_usd_export")
+    _set_first_parm(usd_rop, ("lopoutput", "outputfile", "file"), output_usd_path)
+    usd_rop.setInput(0, target)
+    usd_rop.moveToGoodPosition()
+    try:
+        usd_rop.parm("execute").pressButton()
+    except Exception:
+        usd_stage = target.stage()
+        if usd_stage is None:
+            raise RuntimeError("Could not cook USD stage for export.")
+        usd_stage.Flatten().Export(output_usd_path)
+    return output_usd_path
