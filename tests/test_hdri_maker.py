@@ -671,8 +671,8 @@ class TestHDRIMaker(unittest.TestCase):
             stem, ext = os.path.splitext(sp)
             self.assertTrue(os.path.isfile(f"{stem}_diffuse{ext}"))
 
-        # 4b. 32-bit Float Canvas Brush Tools (clone across seam, heal, burn, dodge, blur, desat)
-        from hdri_maker.hdri_generator import apply_brush_dab, apply_brush_strokes
+        # 4b. 32-bit Float Canvas Brush Tools & Fast Baked Post-Adjustments
+        from hdri_maker.hdri_generator import apply_brush_dab, apply_brush_strokes, apply_post_adjustments_to_hdri
 
         canvas = np.full((64, 128, 3), 0.25, dtype=np.float32)
         canvas[:, 10:25, :] = [4.0, 0.2, 0.2]  # bright red region to clone/heal/burn
@@ -697,6 +697,14 @@ class TestHDRIMaker(unittest.TestCase):
         )
         self.assertEqual(replayed.shape, canvas.shape)
         self.assertTrue(np.all(np.isfinite(replayed)))
+
+        baked_adj = apply_post_adjustments_to_hdri(
+            replayed,
+            HDRISynthesisParams(width=128, height=64, exposure_ev=1.0, saturation=0.8, azimuth_offset_deg=45.0),
+            prof,
+        )
+        self.assertEqual(baked_adj.shape, (64, 128, 3))
+        self.assertTrue(np.all(np.isfinite(baked_adj)))
 
         # 5. Solaris distant sun & USD rig export (if hou available)
         try:

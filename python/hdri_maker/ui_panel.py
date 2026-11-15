@@ -20,6 +20,7 @@ from .hdri_generator import (
     HDRISynthesisParams,
     apply_brush_dab,
     apply_brush_strokes,
+    apply_post_adjustments_to_hdri,
     bake_planar_ground_texture,
     compute_neutral_wb_gains,
     export_hdri_sequence,
@@ -1223,6 +1224,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._brush_strokes: List[Dict[str, Any]] = []
         self._brush_undo_stack: List[np.ndarray] = []
         self._pre_brush_hdri: Optional[np.ndarray] = None
+        self._baked_canvas_hdri: Optional[np.ndarray] = None
         self._active_brush_stroke: Optional[Dict[str, Any]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
@@ -1973,23 +1975,37 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.brush_size_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_size_slider.setRange(5, 120)
         self.brush_size_slider.setValue(25)
-        self.brush_size_slider.setMaximumWidth(80)
+        self.brush_size_slider.setMaximumWidth(60)
         self.brush_size_slider.valueChanged.connect(self._on_brush_config_changed)
         self.brush_strength_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_strength_slider.setRange(10, 100)
         self.brush_strength_slider.setValue(85)
-        self.brush_strength_slider.setMaximumWidth(75)
+        self.brush_strength_slider.setMaximumWidth(58)
         self.brush_strength_slider.valueChanged.connect(self._on_brush_config_changed)
         self.brush_soft_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_soft_slider.setRange(10, 100)
         self.brush_soft_slider.setValue(65)
-        self.brush_soft_slider.setMaximumWidth(75)
+        self.brush_soft_slider.setMaximumWidth(58)
         self.brush_soft_slider.valueChanged.connect(self._on_brush_config_changed)
-        undo_brush_btn = QtWidgets.QPushButton("Undo Brush (Ctrl+Z)")
+        undo_brush_btn = QtWidgets.QPushButton("Undo (Ctrl+Z)")
         undo_brush_btn.setToolTip("Undo last brush stroke (Ctrl+Z)")
         undo_brush_btn.clicked.connect(self._on_undo_brush)
         clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
         clear_brush_btn.clicked.connect(self._on_clear_brush)
+        self.bake_edits_btn = QtWidgets.QPushButton("Apply / Collapse")
+        self.bake_edits_btn.setStyleSheet(
+            "QPushButton { background-color: #0e7490; color: #ffffff; font-weight: bold; padding: 3px 8px; }"
+            "QPushButton:hover { background-color: #0891b2; }"
+        )
+        self.bake_edits_btn.setToolTip(
+            "Apply & collapse plate stitching, sky/ground/light inpainting, and brush strokes into a fast 32-bit canvas\n"
+            "so tweaking Exposure, CCT, Saturation, Blur, etc. becomes instant."
+        )
+        self.bake_edits_btn.clicked.connect(self._on_bake_edits_to_canvas)
+        self.unbake_edits_btn = QtWidgets.QPushButton("Unbake")
+        self.unbake_edits_btn.setEnabled(False)
+        self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
+        self.unbake_edits_btn.clicked.connect(self._on_unbake_edits)
 
         brush_row.addWidget(self.brush_btn)
         brush_row.addWidget(self.brush_mode_combo)
@@ -2001,6 +2017,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         brush_row.addWidget(self.brush_soft_slider)
         brush_row.addWidget(undo_brush_btn)
         brush_row.addWidget(clear_brush_btn)
+        brush_row.addWidget(self.bake_edits_btn)
+        brush_row.addWidget(self.unbake_edits_btn)
         brush_row.addStretch(1)
         layout.addLayout(brush_row)
 
@@ -2399,6 +2417,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _sync_after_multiview_list_change(self, removed_indices: Optional[List[int]] = None) -> None:
         """Update cached views, lighting profile, and preview canvas after removing/clearing plates."""
         n_rows = self.multiview_table.rowCount()
+        self._baked_canvas_hdri = None
+        if hasattr(self, "unbake_edits_btn"):
+            self.unbake_edits_btn.setEnabled(False)
+            self.bake_edits_btn.setText("Apply / Collapse")
         if n_rows == 0:
             self._views = []
             self._profile = None
@@ -3329,6 +3351,80 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._regenerate_preview()
         self.status_label.setText("Cleared all brush strokes.")
 
+    def _on_bake_edits_to_canvas(self) -> None:
+        if self._profile is None:
+            self.status_label.setText("Analyze a plate first before baking edits.")
+            return
+        try:
+            p = self._current_synthesis_params()
+            # Bake geometry, stitching, sky/ground/light inpainting, and brush strokes at up to 4K
+            # while leaving global post-adjustments (EV, CCT, Saturation, Blur, etc.) live.
+            bake_p = HDRISynthesisParams(
+                width=min(p.width, 4096),
+                height=min(p.height, 2048),
+                hotspot_boost=p.hotspot_boost,
+                hotspot_softness=p.hotspot_softness,
+                ambient_wrap=p.ambient_wrap,
+                plate_projection_blend=p.plate_projection_blend,
+                vertical_shift_deg=p.vertical_shift_deg,
+                stitch_blend=p.stitch_blend,
+                ldr_highlight_boost=p.ldr_highlight_boost,
+                enable_inpaint=p.enable_inpaint,
+                sky_blend=p.sky_blend,
+                ground_blend=p.ground_blend,
+                sky_blur=p.sky_blur,
+                ground_blur=p.ground_blur,
+                sky_rect=self._sky_rect,
+                ground_rect=self._ground_rect,
+                light_rect=p.light_rect,
+                remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
+                physical_sky_fill=p.physical_sky_fill,
+            )
+            if self._baked_canvas_hdri is not None:
+                baked = self._baked_canvas_hdri.copy()
+            else:
+                baked = generate_latlong_hdri(
+                    self._profile,
+                    bake_p,
+                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                )
+            if self._light_regions:
+                baked, extracted = extract_and_inpaint_multiple_hotspots(
+                    baked,
+                    self._light_regions,
+                    inpaint_hdri=self.remove_hotspot_chk.isChecked(),
+                    region_blur=self.light_blur_slider.value(),
+                )
+                self._extracted_lights = extracted
+            if self._brush_strokes:
+                baked = apply_brush_strokes(baked, self._brush_strokes)
+
+            self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
+            self._sky_rect = None
+            self._ground_rect = None
+            self._light_regions.clear()
+            self._brush_strokes.clear()
+            self._brush_undo_stack.clear()
+            self._pre_brush_hdri = None
+            self.unbake_edits_btn.setEnabled(True)
+            self.bake_edits_btn.setText("Re-Apply / Collapse")
+            self._regenerate_preview()
+            self.status_label.setText(
+                f"Applied & collapsed all edits into fast {baked.shape[1]}x{baked.shape[0]} 32-bit canvas. "
+                "Parameter tweaks are now instant!"
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Bake error: {exc}")
+
+    def _on_unbake_edits(self) -> None:
+        if self._baked_canvas_hdri is None:
+            return
+        self._baked_canvas_hdri = None
+        self.unbake_edits_btn.setEnabled(False)
+        self.bake_edits_btn.setText("Apply / Collapse")
+        self._regenerate_preview()
+        self.status_label.setText("Unbaked: returned to live multi-plate synthesis pipeline.")
+
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
@@ -3550,11 +3646,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 p.height = min(p.height, 1024)
             if not fast:
                 self._log_debug(f"Regenerating preview ({p.width}x{p.height}), views={len(self._views)}")
-            hdri = generate_latlong_hdri(
-                self._profile,
-                p,
-                views=self._views if len(self._views) <= 12 else self._views[:1],
-            )
+            if self._baked_canvas_hdri is not None:
+                hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, p, self._profile)
+            else:
+                hdri = generate_latlong_hdri(
+                    self._profile,
+                    p,
+                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                )
             if not fast:
                 self._log_debug(f"generate_latlong_hdri finished: shape={hdri.shape}")
             if (not fast) and self._light_regions:
@@ -3819,11 +3918,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 )
                 return out_path
             else:
-                hdri = generate_latlong_hdri(
-                    self._profile,
-                    params,
-                    views=self._views if self._views else None,
-                )
+                if self._baked_canvas_hdri is not None:
+                    hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, params, self._profile)
+                else:
+                    hdri = generate_latlong_hdri(
+                        self._profile,
+                        params,
+                        views=self._views if self._views else None,
+                    )
                 light_msg = ""
                 self._last_light_exr_paths = []
                 if self._light_regions:

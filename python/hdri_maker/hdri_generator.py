@@ -1365,3 +1365,99 @@ def apply_brush_strokes(
                     inplace=True,
                 )
     return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def apply_post_adjustments_to_hdri(
+    base_hdri: np.ndarray,
+    params: HDRISynthesisParams | None = None,
+    profile: Optional[LightingProfile] = None,
+) -> np.ndarray:
+    """
+    Fast path for a baked/collapsed 32-bit float Lat/Long canvas: resizes if needed
+    and applies global post-adjustments (Yaw, Sky/Ground Gain, CCT/WB, Highlight
+    Recovery, Nadir Cleanup, Neutralize, Saturation, Exposure EV, HDRI Blur)
+    without re-running plate projection, stitching, or inpainting.
+    """
+    p = params or HDRISynthesisParams()
+    h = max(64, int(p.height))
+    w = max(128, int(p.width))
+    src = np.asarray(base_hdri, dtype=np.float32)
+    sh, sw = src.shape[:2]
+    if (sh, sw) != (h, w):
+        ys = np.linspace(0.0, sh - 1.0, h, dtype=np.float32)
+        xs = np.linspace(0.0, sw - 1.0, w, dtype=np.float32)
+        y0 = np.floor(ys).astype(np.int32)
+        x0 = np.floor(xs).astype(np.int32)
+        y1 = np.minimum(y0 + 1, sh - 1)
+        x1 = (x0 + 1) % sw
+        fy = (ys - y0)[:, None, None]
+        fx = (xs - x0)[None, :, None]
+        hdri = (
+            (src[np.ix_(y0, x0)] * (1.0 - fx) + src[np.ix_(y0, x1)] * fx) * (1.0 - fy)
+            + (src[np.ix_(y1, x0)] * (1.0 - fx) + src[np.ix_(y1, x1)] * fx) * fy
+        ).astype(np.float32)
+    else:
+        hdri = src.copy()
+
+    if abs(p.azimuth_offset_deg) > 1e-4:
+        shift_px = int(round((p.azimuth_offset_deg / 360.0) * w)) % w
+        if shift_px != 0:
+            hdri = np.roll(hdri, shift_px, axis=1)
+
+    if abs(p.sky_gain - 1.0) > 1e-4 or abs(p.ground_gain - 1.0) > 1e-4:
+        v = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+        elev = (0.5 - v) * math.pi
+        if abs(p.sky_gain - 1.0) > 1e-4:
+            sky_mask = _smoothstep(0.0, 0.25, elev)[:, None, None]
+            hdri = hdri * (1.0 + (float(p.sky_gain) - 1.0) * sky_mask)
+        if abs(p.ground_gain - 1.0) > 1e-4:
+            gnd_mask = _smoothstep(0.0, 0.25, -elev)[:, None, None]
+            hdri = hdri * (1.0 + (float(p.ground_gain) - 1.0) * gnd_mask)
+
+    if p.temperature_kelvin > 0.0 and p.temperature_blend > 0.0:
+        src_cct = profile.overall_cct_kelvin if profile is not None else 6500.0
+        target_rgb = np.array(cct_to_rgb(p.temperature_kelvin), dtype=np.float32)
+        src_rgb = np.array(cct_to_rgb(src_cct), dtype=np.float32)
+        ratio = target_rgb / np.maximum(src_rgb, 1e-4)
+        ratio_lum = float(0.2126 * ratio[0] + 0.7152 * ratio[1] + 0.0722 * ratio[2])
+        if ratio_lum > 1e-5:
+            ratio /= ratio_lum
+        blend = float(np.clip(p.temperature_blend, 0.0, 1.0))
+        hdri *= ((1.0 - blend) + blend * ratio)[None, None, :]
+
+    if p.wb_gains is not None and len(p.wb_gains) == 3:
+        wb = np.array(p.wb_gains, dtype=np.float32)
+        if float(np.max(np.abs(wb - 1.0))) > 1e-4:
+            hdri *= wb[None, None, :]
+
+    if p.highlight_recovery > 1e-4:
+        hdri = recover_clipped_highlights(hdri, strength=p.highlight_recovery)
+
+    if p.nadir_cleanup > 1e-4:
+        hdri = _apply_nadir_cleanup(hdri, strength=p.nadir_cleanup)
+
+    if p.neutralize_environment:
+        mean_rgb = np.mean(hdri, axis=(0, 1))
+        mr, mg, mb = max(float(mean_rgb[0]), 1e-5), max(float(mean_rgb[1]), 1e-5), max(float(mean_rgb[2]), 1e-5)
+        mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
+        neut_gains = np.array(
+            [
+                float(np.clip(mlum / mr, 0.25, 4.0)),
+                float(np.clip(mlum / mg, 0.25, 4.0)),
+                float(np.clip(mlum / mb, 0.25, 4.0)),
+            ],
+            dtype=np.float32,
+        )
+        hdri *= neut_gains[None, None, :]
+
+    if abs(p.saturation - 1.0) > 1e-4:
+        lum = compute_luminance(hdri)[..., None]
+        hdri = np.maximum(lum + (hdri - lum) * float(p.saturation), 0.0)
+
+    if abs(p.exposure_ev) > 1e-5:
+        hdri *= float(2.0 ** p.exposure_ev)
+
+    if p.hdri_blur > 1e-4:
+        hdri = blur_latlong_hdri(hdri, p.hdri_blur)
+
+    return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
