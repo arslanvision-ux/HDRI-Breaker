@@ -4667,16 +4667,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if hasattr(self, "preview_tonemap_combo"):
                 self.preview_tonemap_combo.setCurrentIndex(0)
 
-            for btn in (
-                self.pick_sky_btn,
-                self.pick_gnd_btn,
-                self.pick_light_btn,
-                self.pick_wb_btn,
-                self.brush_btn,
-                self.plate_edit_btn,
-                self.ab_split_btn,
+            for btn_name in (
+                "pick_sky_btn",
+                "pick_gnd_btn",
+                "pick_light_btn",
+                "pick_wb_btn",
+                "brush_btn",
+                "edit_plates_btn",
+                "ab_split_btn",
             ):
-                btn.setChecked(False)
+                btn = getattr(self, btn_name, None)
+                if btn is not None:
+                    btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
             self.preview_label.set_plate_edit_mode(False)
             self.preview_label.set_ab_split(False)
