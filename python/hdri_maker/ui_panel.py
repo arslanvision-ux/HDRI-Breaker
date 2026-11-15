@@ -1489,7 +1489,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         eq_ev_btn = QtWidgets.QPushButton("Equalize EV")
         eq_ev_btn.setToolTip("Automatically match exposure across overlapping plates to eliminate brightness seams")
         eq_ev_btn.clicked.connect(self._on_equalize_plate_exposures)
-        mv_btn_grid.addWidget(eq_ev_btn, 2, 0, 1, 3)
+        unify_fov_btn = QtWidgets.QPushButton("Unify FOV")
+        unify_fov_btn.setToolTip("Match all listed plates to the selected plate's (or first plate's) FOV° and reset Scale X/Y to 1.0")
+        unify_fov_btn.clicked.connect(self._on_unify_plate_fovs)
+        mv_btn_grid.addWidget(eq_ev_btn, 2, 0, 1, 2)
+        mv_btn_grid.addWidget(unify_fov_btn, 2, 2)
         form.addRow("Multi-Position:", mv_btn_grid)
 
         self.multiview_table = QtWidgets.QTableWidget(0, 6)
@@ -2500,13 +2504,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         fov = self.fov_spin.value()
         el = self.cam_el_spin.value()
         cs = self.colorspace_combo.currentText()
-        for i, p in enumerate(paths):
+        metas = [read_plate_metadata(p) for p in paths]
+        valid_fovs = [float(m["fov_h_deg"]) for m in metas if m.get("fov_h_deg") is not None]
+        batch_fallback_fov = float(np.median(valid_fovs)) if valid_fovs else fov
+        for i, (p, meta) in enumerate(zip(paths, metas)):
             # Suggest evenly spaced azimuths if adding a batch
             az = ((start_idx + i) * (360.0 / max(total, 1)))
             if az > 180.0:
                 az -= 360.0
-            meta = read_plate_metadata(p)
-            plate_fov = meta["fov_h_deg"] if meta.get("fov_h_deg") is not None else fov
+            plate_fov = float(meta["fov_h_deg"]) if meta.get("fov_h_deg") is not None else batch_fallback_fov
             plate_roll = float(meta.get("roll_deg", 0.0))
             self._add_multiview_row(p, az, el, plate_fov, cs, roll=plate_roll)
         self._maybe_update_default_output_path(paths[0])
@@ -2607,6 +2613,31 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         except Exception as exc:
             self._log_debug(f"Equalize EV error: {exc}\n{traceback.format_exc()}")
             self.status_label.setText(f"Equalize EV error: {exc}")
+
+    def _on_unify_plate_fovs(self) -> None:
+        n_rows = self.multiview_table.rowCount()
+        if n_rows == 0:
+            self.status_label.setText("Add plates first before unifying FOV.")
+            return
+        ref_idx = self._selected_plate_idx if (0 <= self._selected_plate_idx < n_rows) else 0
+        ref_item = self.multiview_table.item(ref_idx, 3)
+        try:
+            target_fov = float(ref_item.text()) if ref_item is not None else self.fov_spin.value()
+        except ValueError:
+            target_fov = self.fov_spin.value()
+        target_fov = float(np.clip(target_fov, 10.0, 165.0))
+        for r in range(n_rows):
+            fov_item = self.multiview_table.item(r, 3)
+            if fov_item is not None:
+                fov_item.setText(f"{target_fov:.1f}")
+            if r < len(self._views):
+                self._views[r].fov_h_deg = target_fov
+                self._views[r].scale_x = 1.0
+                self._views[r].scale_y = 1.0
+                self._sync_view_to_table_and_bar(r)
+        if self._views:
+            self._regenerate_preview()
+        self.status_label.setText(f"Unified all {n_rows} plate(s) to FOV {target_fov:.1f}° (Scale X/Y = 1.0).")
 
     def _on_browse_output(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(

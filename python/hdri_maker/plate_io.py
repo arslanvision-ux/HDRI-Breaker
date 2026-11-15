@@ -582,7 +582,8 @@ def read_plate_metadata(path: str) -> Dict[str, Any]:
     elif orient == 3:
         result["roll_deg"] = 180.0
 
-    used_focal = focal_35 if focal_35 is not None else focal_mm
+    # Only trust FocalLengthIn35mmFilm, or raw focal_mm >= 14mm (avoid phone 4mm lens / 36mm sensor mismatch)
+    used_focal = focal_35 if focal_35 is not None else (focal_mm if (focal_mm is not None and focal_mm >= 14.0) else None)
     if used_focal is not None and used_focal > 1.0:
         # 36mm full-frame sensor width baseline; adjust if portrait aspect
         sensor_w = 36.0 if width >= height or height == 0 else 24.0
