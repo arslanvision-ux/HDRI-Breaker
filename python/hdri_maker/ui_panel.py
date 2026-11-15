@@ -3938,6 +3938,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.hotspot_table.setItem(row, col, item)
 
+    def _render_from_baked_canvas(self, p: HDRISynthesisParams, apply_regions: bool = True) -> np.ndarray:
+        """Render from `_baked_canvas_hdri` while keeping live Sky/Ground selections & post-adjustments responsive."""
+        from dataclasses import replace as _dc_replace
+
+        delta_yaw = float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg)
+        if apply_regions and (self._sky_rect is not None or self._ground_rect is not None):
+            # Resize & apply delta yaw first so live Sky/Ground UV rects match the current canvas
+            pre_p = HDRISynthesisParams(width=p.width, height=p.height, azimuth_offset_deg=delta_yaw)
+            base = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, pre_p, self._profile)
+            base = apply_sky_ground_inpaint_to_hdri(
+                base,
+                sky_rect=self._sky_rect,
+                ground_rect=self._ground_rect,
+                sky_blend=p.sky_blend,
+                ground_blend=p.ground_blend,
+                sky_blur=p.sky_blur,
+                ground_blur=p.ground_blur,
+            )
+            post_p = _dc_replace(p, azimuth_offset_deg=0.0)
+            return apply_post_adjustments_to_hdri(base, post_p, self._profile)
+        post_p = _dc_replace(p, azimuth_offset_deg=delta_yaw)
+        return apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_p, self._profile)
+
     def _regenerate_preview(self, fast: bool = False) -> None:
         if self._profile is None:
             return
@@ -3954,13 +3977,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if not fast:
                 self._log_debug(f"Regenerating preview ({p.width}x{p.height}), views={len(self._views)}")
             if self._baked_canvas_hdri is not None:
-                from dataclasses import replace as _dc_replace
-
-                post_p = _dc_replace(
-                    p,
-                    azimuth_offset_deg=float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg),
-                )
-                hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_p, self._profile)
+                hdri = self._render_from_baked_canvas(p, apply_regions=not fast)
             else:
                 enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                 hdri = generate_latlong_hdri(
@@ -4235,13 +4252,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 return out_path
             else:
                 if self._baked_canvas_hdri is not None:
-                    from dataclasses import replace as _dc_replace
-
-                    post_params = _dc_replace(
-                        params,
-                        azimuth_offset_deg=float(params.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg),
-                    )
-                    hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_params, self._profile)
+                    hdri = self._render_from_baked_canvas(params, apply_regions=True)
                 else:
                     enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                     hdri = generate_latlong_hdri(
