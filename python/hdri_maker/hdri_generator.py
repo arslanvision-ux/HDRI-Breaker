@@ -176,10 +176,12 @@ def blur_latlong_hdri(hdri_pixels: np.ndarray, blur_amount: float) -> np.ndarray
     return _separable_box_blur(hdri_pixels, rx, ry, wrap_x=True)
 
 
-def _build_seamless_tile(patch: np.ndarray) -> np.ndarray:
-    """Create a 2x2 ping-pong mirrored seamless tile from an (H, W, 3) patch."""
+def _build_seamless_tile(patch: np.ndarray, mirror_vertical: bool = False) -> np.ndarray:
+    """Create a horizontally seamless (optionally 2x2 ping-pong) tile from an (H, W, 3) patch."""
     h_mir = np.concatenate([patch, patch[:, ::-1, :]], axis=1)
-    return np.concatenate([h_mir, h_mir[::-1, :, :]], axis=0)
+    if mirror_vertical:
+        return np.concatenate([h_mir, h_mir[::-1, :, :]], axis=0)
+    return h_mir
 
 
 def _tile_fill_region(
@@ -347,13 +349,14 @@ def _mirror_extend_rows(
         cap_h = blend_top_end + 1
         sky_cap = np.empty((cap_h, w, 3), dtype=np.float32)
         if enable_inpaint:
+            auto_strip = max(4, min(16, band_h // 16))
             sky_patch = _extract_patch(
                 sky_rect,
                 y_top_in,
-                min(y_bot, y_top_in + max(12, band_h // 5)),
+                min(y_bot, y_top_in + auto_strip),
             )
-            sky_tile = _build_seamless_tile(sky_patch)
-            sky_fill = _tile_fill_region(sky_tile, cap_h, w, flip_vertical=True)
+            sky_tile = _build_seamless_tile(sky_patch, mirror_vertical=False)
+            sky_fill = _tile_fill_region(sky_tile, cap_h, w, flip_vertical=False)
             top_edge_smooth = _smooth_horizontal_wrap(filled[y_top_in], max(8, w // 20))
             for y in range(cap_h):
                 pole_t = (y / float(max(blend_top_end, 1))) ** 0.8
@@ -383,12 +386,13 @@ def _mirror_extend_rows(
         nadir_h = h - blend_bot_start
         gnd_cap = np.empty((nadir_h, w, 3), dtype=np.float32)
         if enable_inpaint:
+            auto_strip = max(4, min(16, band_h // 16))
             gnd_patch = _extract_patch(
                 ground_rect,
-                max(y_top, y_bot_in - max(12, band_h // 5)),
+                max(y_top, y_bot_in - auto_strip),
                 y_bot_in,
             )
-            gnd_tile = _build_seamless_tile(gnd_patch)
+            gnd_tile = _build_seamless_tile(gnd_patch, mirror_vertical=False)
             gnd_fill = _tile_fill_region(gnd_tile, nadir_h, w, flip_vertical=False)
             bot_edge_smooth = _smooth_horizontal_wrap(filled[y_bot_in], max(8, w // 20))
             for idx, y in enumerate(range(blend_bot_start, h)):

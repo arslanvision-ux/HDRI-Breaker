@@ -270,10 +270,36 @@ def read_plate(
                 detected_cs = oiio_cs
             if spec.format in (oiio.HALF, oiio.FLOAT, oiio.DOUBLE):
                 is_hdr = True
+
+            # Respect EXIF Orientation (1..8) for LDR photos so upside-down/rotated shots load upright
+            if not is_hdr:
+                orient = int(spec.get_int_attribute("Orientation", 1) or 1)
+                if orient == 2:
+                    pixels = pixels[:, ::-1, :]
+                elif orient == 3:
+                    pixels = pixels[::-1, ::-1, :]
+                elif orient == 4:
+                    pixels = pixels[::-1, :, :]
+                elif orient == 5:
+                    pixels = np.transpose(pixels, (1, 0, 2))
+                elif orient == 6:
+                    pixels = np.rot90(pixels, k=3)
+                elif orient == 7:
+                    pixels = np.rot90(pixels, k=3)[:, ::-1, :]
+                elif orient == 8:
+                    pixels = np.rot90(pixels, k=1)
+                if orient != 1:
+                    pixels = np.ascontiguousarray(pixels, dtype=np.float32)
         finally:
             inp.close()
     elif HAS_PIL:
         with Image.open(resolved) as img:
+            try:
+                from PIL import ImageOps
+
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
             rgb_img = img.convert("RGB")
             pixels = np.asarray(rgb_img, dtype=np.float32) / 255.0
     else:
