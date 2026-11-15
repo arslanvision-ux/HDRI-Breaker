@@ -117,6 +117,7 @@ class PlateViewInput:
     exposure_ev: float = 0.0
     vignette_v1: float = 0.0
     exclude_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    enabled: bool = True
 
 
 def compute_luminance(rgb: np.ndarray) -> np.ndarray:
@@ -674,6 +675,8 @@ def hit_test_plate_uv(
 
     for idx in range(len(views) - 1, -1, -1):
         view = views[idx]
+        if not getattr(view, "enabled", True):
+            continue
         fwd, right, up, thx, thy, _ = _camera_basis(view, vertical_shift_deg=vertical_shift_deg)
         cam_z = dx * fwd[0] + dy * fwd[1] + dz * fwd[2]
         if cam_z <= 1e-4:
@@ -726,6 +729,8 @@ def project_multiview_plates_to_latlong(
     max_cov = np.zeros((out_height, out_width), dtype=np.float32)
 
     for view in views:
+        if not getattr(view, "enabled", True):
+            continue
         img = np.asarray(view.pixels, dtype=np.float32)
         ih, iw = img.shape[:2]
         fwd, right, up, tan_half_fov_x, tan_half_fov_y, el_deg = _camera_basis(
@@ -916,7 +921,8 @@ def compute_overlap_difference_map(
     Visualize alignment & exposure discrepancies in overlapping plate regions.
     Returns (H, W, 3) float32 sRGB-ready difference map (bright red/orange = seam mismatch).
     """
-    if not views:
+    views = [v for v in views if getattr(v, "enabled", True)]
+    if len(views) < 2:
         return np.zeros((out_height, out_width, 3), dtype=np.float32)
     min_lum = np.full((out_height, out_width), 1e9, dtype=np.float32)
     max_lum = np.full((out_height, out_width), -1e9, dtype=np.float32)
@@ -1103,6 +1109,7 @@ def analyze_multiview_plates(
     Analyze multiple plate images taken from different camera positions/angles
     and fuse them into a unified 360-degree LightingProfile.
     """
+    views = [v for v in views if getattr(v, "enabled", True)]
     if not views:
         raise ValueError("At least one PlateViewInput is required.")
     if len(views) == 1:

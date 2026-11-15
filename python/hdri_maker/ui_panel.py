@@ -793,6 +793,8 @@ class PreviewLabel(QtWidgets.QLabel):
                 painter.drawText(min(target.right() - 95, sx + 8), target.y() + 18, "B: SYNTH HDRI")
             if self._plate_edit_mode and self._plate_views:
                 for idx, view in enumerate(self._plate_views):
+                    if not getattr(view, "enabled", True):
+                        continue
                     is_sel = idx == self._selected_plate_idx
                     info = compute_plate_outline_uv(
                         view,
@@ -1506,6 +1508,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.multiview_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.multiview_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.multiview_table.customContextMenuRequested.connect(self._on_multiview_context_menu)
+        self.multiview_table.itemChanged.connect(self._on_multiview_item_changed)
         mv_hdr = self.multiview_table.horizontalHeader()
         mv_hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         for col in (1, 2, 3, 4, 5):
@@ -2347,47 +2350,54 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         exposure_ev: float = 0.0,
         vignette_v1: float = 0.0,
         exclude_rects: Optional[List[Tuple[float, float, float, float]]] = None,
+        enabled: bool = True,
     ) -> None:
-        row = self.multiview_table.rowCount()
-        self.multiview_table.insertRow(row)
+        was_blocked = self.multiview_table.blockSignals(True)
+        try:
+            row = self.multiview_table.rowCount()
+            self.multiview_table.insertRow(row)
 
-        file_item = QtWidgets.QTableWidgetItem(os.path.basename(path))
-        file_item.setData(Qt.UserRole, path)
-        file_item.setData(
-            Qt.UserRole + 1,
-            {
-                "roll": float(roll),
-                "scale_x": float(scale_x),
-                "scale_y": float(scale_y),
-                "warp_k1": float(warp_k1),
-                "lens_type": str(lens_type or "rectilinear"),
-                "exposure_ev": float(exposure_ev),
-                "vignette_v1": float(vignette_v1),
-                "exclude_rects": [list(r) for r in (exclude_rects or [])],
-            },
-        )
-        file_item.setToolTip(path)
-        file_item.setFlags(file_item.flags() & ~Qt.ItemIsEditable)
-        thumb_icon = self._make_plate_thumbnail(path, cs)
-        if not thumb_icon.isNull():
-            file_item.setIcon(thumb_icon)
-        self.multiview_table.setItem(row, 0, file_item)
+            file_item = QtWidgets.QTableWidgetItem(os.path.basename(path))
+            file_item.setData(Qt.UserRole, path)
+            file_item.setData(
+                Qt.UserRole + 1,
+                {
+                    "roll": float(roll),
+                    "scale_x": float(scale_x),
+                    "scale_y": float(scale_y),
+                    "warp_k1": float(warp_k1),
+                    "lens_type": str(lens_type or "rectilinear"),
+                    "exposure_ev": float(exposure_ev),
+                    "vignette_v1": float(vignette_v1),
+                    "exclude_rects": [list(r) for r in (exclude_rects or [])],
+                },
+            )
+            file_item.setToolTip(path)
+            file_item.setFlags((file_item.flags() & ~Qt.ItemIsEditable) | Qt.ItemIsUserCheckable)
+            file_item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
+            thumb_icon = self._make_plate_thumbnail(path, cs)
+            if not thumb_icon.isNull():
+                file_item.setIcon(thumb_icon)
+            self.multiview_table.setItem(row, 0, file_item)
 
-        for col, val in ((1, f"{az:.1f}"), (2, f"{el:.1f}"), (3, f"{fov:.1f}")):
-            item = QtWidgets.QTableWidgetItem(val)
-            item.setTextAlignment(Qt.AlignCenter)
-            self.multiview_table.setItem(row, col, item)
+            for col, val in ((1, f"{az:.1f}"), (2, f"{el:.1f}"), (3, f"{fov:.1f}")):
+                item = QtWidgets.QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.multiview_table.setItem(row, col, item)
 
-        cs_item = QtWidgets.QTableWidgetItem(cs)
-        cs_item.setTextAlignment(Qt.AlignCenter)
-        self.multiview_table.setItem(row, 4, cs_item)
+            cs_item = QtWidgets.QTableWidgetItem(cs)
+            cs_item.setTextAlignment(Qt.AlignCenter)
+            self.multiview_table.setItem(row, 4, cs_item)
 
-        rm_btn = QtWidgets.QToolButton()
-        rm_btn.setText("×")
-        rm_btn.setToolTip("Remove this plate from the list")
-        rm_btn.setAutoRaise(True)
-        rm_btn.clicked.connect(lambda _checked=False, b=rm_btn: self._remove_multiview_row_by_button(b))
-        self.multiview_table.setCellWidget(row, 5, rm_btn)
+            rm_btn = QtWidgets.QToolButton()
+            rm_btn.setText("×")
+            rm_btn.setToolTip("Remove this plate from the list")
+            rm_btn.setAutoRaise(True)
+            rm_btn.clicked.connect(lambda _checked=False, b=rm_btn: self._remove_multiview_row_by_button(b))
+            self.multiview_table.setCellWidget(row, 5, rm_btn)
+            self._apply_multiview_row_visual_state(row, bool(enabled))
+        finally:
+            self.multiview_table.blockSignals(was_blocked)
 
     def _remove_multiview_row_by_button(self, btn: QtWidgets.QToolButton) -> None:
         for r in range(self.multiview_table.rowCount()):
@@ -2448,28 +2458,85 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     self._views.pop(r)
 
         if len(self._views) == n_rows and self._views:
-            self._selected_plate_idx = min(max(0, self._selected_plate_idx), len(self._views) - 1)
-            self._refresh_plate_transform_bar()
-            self._profile = analyze_multiview_plates(
-                self._views,
-                max_hotspots=self.max_hotspots_spin.value(),
-                ldr_highlight_boost=self.ldr_boost_spin.value(),
-            )
-            self._populate_analysis_ui(self._profile, len(self._views))
-            self._raw_hdri_pixels = None
-            self._regenerate_preview()
+            self._sync_after_multiview_enable_change(update_status=False)
         elif self._profile is not None or self._hdri_pixels is not None:
             self._on_analyze_clicked()
+
+    def _apply_multiview_row_visual_state(self, row: int, enabled: bool) -> None:
+        """Dim table row text when a plate is disabled without removing it."""
+        dim_brush = QtGui.QBrush(QtGui.QColor(135, 135, 135))
+        clear_brush = QtGui.QBrush()
+        for col in range(5):
+            it = self.multiview_table.item(row, col)
+            if it is not None:
+                it.setForeground(clear_brush if enabled else dim_brush)
+
+    def _on_multiview_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if item is None or item.column() != 0:
+            return
+        row = item.row()
+        enabled = item.checkState() == Qt.Checked
+        self._apply_multiview_row_visual_state(row, enabled)
+        if 0 <= row < len(self._views):
+            self._views[row].enabled = enabled
+            self._sync_after_multiview_enable_change(update_status=True)
+        elif self._profile is not None or self._hdri_pixels is not None:
+            self._on_analyze_clicked()
+
+    def _sync_after_multiview_enable_change(self, update_status: bool = True) -> None:
+        """Re-analyze and redraw canvas using only currently enabled plates."""
+        n_rows = self.multiview_table.rowCount()
+        self._baked_canvas_hdri = None
+        if hasattr(self, "unbake_edits_btn"):
+            self.unbake_edits_btn.setEnabled(False)
+            self.bake_edits_btn.setText("Apply / Collapse")
+        if len(self._views) != n_rows or not self._views:
+            return
+
+        enabled_indices = [i for i, v in enumerate(self._views) if getattr(v, "enabled", True)]
+        if not enabled_indices:
+            self._profile = None
+            self._hdri_pixels = None
+            self._raw_hdri_pixels = None
+            self._rough_cache = None
+            self._raw_rough_cache = None
+            self._selected_plate_idx = -1
+            self._refresh_plate_transform_bar()
+            self.hotspot_table.setRowCount(0)
+            self.preview_label.set_plate_overlay([], -1, self.yaw_spin.value(), self.vshift_spin.value())
+            self.preview_label.set_source_pixmap(None)
+            self.preview_label.setText("All plates disabled. Check a plate in the list to show it on the canvas.")
+            if update_status:
+                self.status_label.setText("All plates disabled (hidden from canvas).")
+            return
+
+        if self._selected_plate_idx not in enabled_indices:
+            self._selected_plate_idx = enabled_indices[0]
+        self._refresh_plate_transform_bar()
+        self._profile = analyze_multiview_plates(
+            self._views,
+            max_hotspots=self.max_hotspots_spin.value(),
+            ldr_highlight_boost=self.ldr_boost_spin.value(),
+        )
+        self._populate_analysis_ui(self._profile, len(enabled_indices))
+        self._raw_hdri_pixels = None
+        self._regenerate_preview()
+        if update_status:
+            self.status_label.setText(
+                f"Canvas updated: {len(enabled_indices)}/{len(self._views)} plate(s) enabled."
+            )
 
     def _on_multiview_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self.multiview_table)
         act_add = menu.addAction("Add Plates...")
+        act_toggle = menu.addAction("Enable / Disable Selected Plate(s)")
         act_rm = menu.addAction("Remove Selected Plate(s)")
         act_use = menu.addAction("Set as Single Plate Path")
         menu.addSeparator()
         act_clear = menu.addAction("Clear All")
 
         has_sel = len(self.multiview_table.selectedIndexes()) > 0 or self.multiview_table.currentRow() >= 0
+        act_toggle.setEnabled(has_sel)
         act_rm.setEnabled(has_sel)
         act_use.setEnabled(has_sel)
         act_clear.setEnabled(self.multiview_table.rowCount() > 0)
@@ -2479,6 +2546,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         if chosen == act_add:
             self._on_add_multiview_plates()
+        elif chosen == act_toggle:
+            rows = sorted({idx.row() for idx in self.multiview_table.selectedIndexes()})
+            if not rows and self.multiview_table.currentRow() >= 0:
+                rows = [self.multiview_table.currentRow()]
+            if not rows:
+                return
+            any_enabled = any(
+                (self.multiview_table.item(r, 0) is not None and self.multiview_table.item(r, 0).checkState() == Qt.Checked)
+                for r in rows
+            )
+            target_enabled = not any_enabled
+            was_blocked = self.multiview_table.blockSignals(True)
+            try:
+                for r in rows:
+                    it = self.multiview_table.item(r, 0)
+                    if it is not None:
+                        it.setCheckState(Qt.Checked if target_enabled else Qt.Unchecked)
+                    self._apply_multiview_row_visual_state(r, target_enabled)
+                    if 0 <= r < len(self._views):
+                        self._views[r].enabled = target_enabled
+            finally:
+                self.multiview_table.blockSignals(was_blocked)
+            self._sync_after_multiview_enable_change(update_status=True)
         elif chosen == act_rm:
             self._on_remove_selected_multiview_plates()
         elif chosen == act_use:
@@ -3499,6 +3589,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     self._log_debug(f"Reading multiview plate #{row + 1}: {fpath} (az={az}, el={el}, fov={fov}, cs={cs})")
                     plate = read_plate(fpath, colorspace=cs, max_dim=4096)
                     self._log_debug(f"Loaded plate #{row + 1}: shape={plate.pixels.shape}, is_hdr={plate.is_hdr}")
+                    enabled = (item0.checkState() == Qt.Checked) if item0 is not None else True
                     views.append(
                         PlateViewInput(
                             pixels=plate.pixels,
@@ -3515,10 +3606,22 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                             exposure_ev=float(extra.get("exposure_ev", 0.0)),
                             vignette_v1=float(extra.get("vignette_v1", 0.0)),
                             exclude_rects=[tuple(r) for r in (extra.get("exclude_rects") or [])],
+                            enabled=enabled,
                         )
                     )
                 self._views = views
-                self._selected_plate_idx = min(max(0, self._selected_plate_idx), len(views) - 1) if views else -1
+                enabled_indices = [i for i, v in enumerate(views) if getattr(v, "enabled", True)]
+                if not enabled_indices:
+                    self._profile = None
+                    self._hdri_pixels = None
+                    self._selected_plate_idx = -1
+                    self._refresh_plate_transform_bar()
+                    self.preview_label.set_plate_overlay([], -1, self.yaw_spin.value(), self.vshift_spin.value())
+                    self.preview_label.set_source_pixmap(None)
+                    self.preview_label.setText("All plates disabled. Check a plate in the list to show it on the canvas.")
+                    self.status_label.setText("All plates are disabled. Enable at least one plate to analyze.")
+                    return
+                self._selected_plate_idx = enabled_indices[0] if self._selected_plate_idx not in enabled_indices else self._selected_plate_idx
                 self._refresh_plate_transform_bar()
                 self._frame_profiles = []
                 self._log_debug("Running analyze_multiview_plates...")
@@ -3528,10 +3631,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     ldr_highlight_boost=self.ldr_boost_spin.value(),
                 )
                 self._log_debug(f"Analysis done: CCT={self._profile.overall_cct_kelvin:.0f}K, hotspots={len(self._profile.hotspots)}")
-                self._populate_analysis_ui(self._profile, len(views))
+                self._populate_analysis_ui(self._profile, len(enabled_indices))
                 self._regenerate_preview()
                 self.status_label.setText(
-                    f"Analyzed {len(views)} multi-position plate(s). "
+                    f"Analyzed {len(enabled_indices)}/{len(views)} multi-position plate(s). "
                     f"Overall CCT: {self._profile.overall_cct_kelvin:.0f} K, "
                     f"Hotspots: {len(self._profile.hotspots)}."
                 )
@@ -3680,10 +3783,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if self._baked_canvas_hdri is not None:
                 hdri = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, p, self._profile)
             else:
+                enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
                 hdri = generate_latlong_hdri(
                     self._profile,
                     p,
-                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                    views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 )
             if not fast:
                 self._log_debug(f"generate_latlong_hdri finished: shape={hdri.shape}")
@@ -4289,6 +4393,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "exposure_ev": float(extra.get("exposure_ev", 0.0)),
                     "vignette_v1": float(extra.get("vignette_v1", 0.0)),
                     "exclude_rects": [list(r) for r in (extra.get("exclude_rects") or [])],
+                    "enabled": (item0.checkState() == Qt.Checked) if item0 is not None else True,
                 }
             )
         return {
@@ -4412,6 +4517,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     exposure_ev=float(row_d.get("exposure_ev", 0.0)),
                     vignette_v1=float(row_d.get("vignette_v1", 0.0)),
                     exclude_rects=[tuple(r) for r in (row_d.get("exclude_rects") or [])],
+                    enabled=bool(row_d.get("enabled", True)),
                 )
 
         if "resolution" in data:

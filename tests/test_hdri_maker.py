@@ -706,6 +706,24 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertEqual(baked_adj.shape, (64, 128, 3))
         self.assertTrue(np.all(np.isfinite(baked_adj)))
 
+        # 4c. Disabled PlateViewInput is skipped by projection, hit-test, and multiview analysis
+        from hdri_maker.lighting_analyzer import (
+            PlateViewInput,
+            analyze_multiview_plates,
+            hit_test_plate_uv,
+            project_multiview_plates_to_latlong,
+        )
+
+        v_on = PlateViewInput(pixels=np.full((32, 32, 3), 0.5, dtype=np.float32), fov_h_deg=60.0, cam_azimuth_deg=0.0, enabled=True)
+        v_off = PlateViewInput(pixels=np.full((32, 32, 3), 2.0, dtype=np.float32), fov_h_deg=60.0, cam_azimuth_deg=180.0, enabled=False)
+        proj_map, proj_cov = project_multiview_plates_to_latlong([v_on, v_off], out_width=128, out_height=64)
+        self.assertEqual(float(proj_cov[32, 0]), 0.0)
+        self.assertGreater(float(proj_cov[32, 64]), 0.0)
+        self.assertIsNone(hit_test_plate_uv([v_on, v_off], 0.0, 0.5))
+        self.assertEqual(hit_test_plate_uv([v_on, v_off], 0.5, 0.5), 0)
+        mv_prof = analyze_multiview_plates([v_on, v_off])
+        self.assertIsNotNone(mv_prof)
+
         # 5. Solaris distant sun & USD rig export (if hou available)
         try:
             import hou  # noqa: F401
