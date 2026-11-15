@@ -1262,6 +1262,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._last_vshift: float = 0.0
         self._last_yaw: float = 0.0
         self._wb_gains: tuple = (1.0, 1.0, 1.0)
+        self._wb_undo_stack: List[tuple] = []
+        self._action_undo_stack: List[str] = []
         self._macbeth_path: str = ""
         self._macbeth_colorspace: str = "Auto"
         self._thumb_cache: Dict[tuple, QtGui.QIcon] = {}
@@ -1290,7 +1292,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if QShortcutCls is not None:
             self._undo_shortcut = QShortcutCls(QtGui.QKeySequence.Undo, self)
             self._undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-            self._undo_shortcut.activated.connect(self._on_undo_brush)
+            self._undo_shortcut.activated.connect(self._on_global_undo)
         self._apply_ui_scale(self.ui_scale_slider.value())
         if restore_session:
             self._auto_load_session()
@@ -3219,6 +3221,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         mean_rgb = tuple(float(v) for v in np.mean(patch, axis=(0, 1)))
         gains, patch_cct, duv, lum = compute_neutral_wb_gains(mean_rgb)
         ev_delta = float(np.clip(np.log2(0.18 / max(lum, 1e-4)), -6.0, 6.0))
+        self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
+        self._action_undo_stack.append("wb")
         self._wb_gains = (
             float(np.clip(self._wb_gains[0] * gains[0], 0.1, 10.0)),
             float(np.clip(self._wb_gains[1] * gains[1], 0.1, 10.0)),
@@ -3259,6 +3263,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         source_label: str = "Macbeth",
     ) -> None:
         """Apply sampled 3-channel White Balance gains (and optional EV delta) to HDRI synthesis."""
+        self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
+        self._action_undo_stack.append("wb")
         self._wb_gains = (
             float(np.clip(gains[0], 0.1, 10.0)),
             float(np.clip(gains[1], 0.1, 10.0)),
@@ -3277,9 +3283,44 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         )
 
     def _on_reset_wb(self) -> None:
+        if self._wb_gains != (1.0, 1.0, 1.0):
+            self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
+            self._action_undo_stack.append("wb")
         self._wb_gains = (1.0, 1.0, 1.0)
         self._regenerate_preview()
         self.status_label.setText("Reset White Balance gains to (1.000, 1.000, 1.000).")
+
+    def _on_undo_wb(self) -> bool:
+        if not self._wb_undo_stack:
+            return False
+        prev_gains, prev_ev = self._wb_undo_stack.pop()
+        self._wb_gains = tuple(prev_gains)
+        self._suppress_auto_preview = True
+        try:
+            self.ev_spin.setValue(float(prev_ev))
+        finally:
+            self._suppress_auto_preview = False
+        self._regenerate_preview()
+        self.status_label.setText(
+            f"Undid White Balance -> Gains ({self._wb_gains[0]:.3f}, {self._wb_gains[1]:.3f}, {self._wb_gains[2]:.3f})."
+        )
+        return True
+
+    def _on_global_undo(self) -> None:
+        while self._action_undo_stack:
+            kind = self._action_undo_stack.pop()
+            if kind == "wb" and self._wb_undo_stack:
+                self._on_undo_wb()
+                return
+            if kind == "brush" and self._brush_strokes:
+                self._on_undo_brush()
+                return
+        if self._brush_strokes:
+            self._on_undo_brush()
+        elif self._wb_undo_stack:
+            self._on_undo_wb()
+        else:
+            self.status_label.setText("Nothing to undo.")
 
     def _on_auto_level_horizon(self) -> None:
         if self._profile is None:
@@ -3530,6 +3571,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _on_brush_stroke_finished(self) -> None:
         if self._active_brush_stroke is not None:
             self._brush_strokes.append(self._active_brush_stroke)
+            self._action_undo_stack.append("brush")
             self._active_brush_stroke = None
             self._brush_clone_offset_uv = None
             self.status_label.setText(f"Applied brush stroke ({len(self._brush_strokes)} total).")
