@@ -1221,6 +1221,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._light_regions: List[Dict[str, Any]] = []
         self._extracted_lights: List[tuple] = []
         self._brush_strokes: List[Dict[str, Any]] = []
+        self._brush_undo_stack: List[np.ndarray] = []
+        self._pre_brush_hdri: Optional[np.ndarray] = None
         self._active_brush_stroke: Optional[Dict[str, Any]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
@@ -1251,6 +1253,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._raw_rough_cache: Optional[tuple] = None
 
         self._build_ui()
+        QShortcutCls = getattr(QtGui, "QShortcut", None) or getattr(QtWidgets, "QShortcut", None)
+        if QShortcutCls is not None:
+            self._undo_shortcut = QShortcutCls(QtGui.QKeySequence.Undo, self)
+            self._undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            self._undo_shortcut.activated.connect(self._on_undo_brush)
         self._apply_ui_scale(self.ui_scale_slider.value())
         if restore_session:
             self._auto_load_session()
@@ -1978,7 +1985,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.brush_soft_slider.setValue(65)
         self.brush_soft_slider.setMaximumWidth(75)
         self.brush_soft_slider.valueChanged.connect(self._on_brush_config_changed)
-        undo_brush_btn = QtWidgets.QPushButton("Undo Brush")
+        undo_brush_btn = QtWidgets.QPushButton("Undo Brush (Ctrl+Z)")
+        undo_brush_btn.setToolTip("Undo last brush stroke (Ctrl+Z)")
         undo_brush_btn.clicked.connect(self._on_undo_brush)
         clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
         clear_brush_btn.clicked.connect(self._on_clear_brush)
@@ -3234,6 +3242,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         radius_u = self.brush_size_slider.value() / 1000.0
         softness = self.brush_soft_slider.value() / 100.0
         strength = self.brush_strength_slider.value() / 100.0
+        if self._pre_brush_hdri is None:
+            self._pre_brush_hdri = self._hdri_pixels.copy()
+        self._brush_undo_stack.append(self._hdri_pixels.copy())
+        if len(self._brush_undo_stack) > 15:
+            self._brush_undo_stack.pop(0)
         self._active_brush_stroke = {
             "mode": mode,
             "radius_u": radius_u,
@@ -3291,14 +3304,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("No brush strokes to undo.")
             return
         self._brush_strokes.pop()
-        self._regenerate_preview()
+        if self._brush_undo_stack:
+            self._hdri_pixels = self._brush_undo_stack.pop()
+            self._rough_cache = None
+            self._update_preview_pixmap()
+        elif self._pre_brush_hdri is not None:
+            self._hdri_pixels = apply_brush_strokes(self._pre_brush_hdri, self._brush_strokes)
+            self._rough_cache = None
+            self._update_preview_pixmap()
+        else:
+            self._regenerate_preview()
         self.status_label.setText(f"Undid last brush stroke ({len(self._brush_strokes)} remaining).")
 
     def _on_clear_brush(self) -> None:
         if not self._brush_strokes:
             return
         self._brush_strokes.clear()
-        self._regenerate_preview()
+        self._brush_undo_stack.clear()
+        if self._pre_brush_hdri is not None:
+            self._hdri_pixels = self._pre_brush_hdri.copy()
+            self._rough_cache = None
+            self._update_preview_pixmap()
+        else:
+            self._regenerate_preview()
         self.status_label.setText("Cleared all brush strokes.")
 
     def _on_merge_brackets_clicked(self) -> None:
@@ -3539,8 +3567,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._extracted_lights = extracted
             elif not self._light_regions:
                 self._extracted_lights = []
-            if (not fast) and self._brush_strokes:
-                hdri = apply_brush_strokes(hdri, self._brush_strokes)
+            if not fast:
+                self._pre_brush_hdri = hdri.copy()
+                self._brush_undo_stack.clear()
+                if self._brush_strokes:
+                    hdri = apply_brush_strokes(hdri, self._brush_strokes)
             self._hdri_pixels = hdri
             if hasattr(self, "ab_split_btn") and self.ab_split_btn.isChecked() and not fast:
                 raw_p = HDRISynthesisParams(
