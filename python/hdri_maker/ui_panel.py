@@ -2306,6 +2306,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         for r in range(self.multiview_table.rowCount()):
             if self.multiview_table.cellWidget(r, 5) is btn:
                 self.multiview_table.removeRow(r)
+                self._sync_after_multiview_list_change(removed_indices=[r])
                 self.status_label.setText(
                     f"Removed plate ({self.multiview_table.rowCount()} remaining)."
                 )
@@ -2325,9 +2326,49 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         for r in rows:
             self.multiview_table.removeRow(r)
+        self._sync_after_multiview_list_change(removed_indices=rows)
         self.status_label.setText(
             f"Removed {len(rows)} plate(s) ({self.multiview_table.rowCount()} remaining)."
         )
+
+    def _sync_after_multiview_list_change(self, removed_indices: Optional[List[int]] = None) -> None:
+        """Update cached views, lighting profile, and preview canvas after removing/clearing plates."""
+        n_rows = self.multiview_table.rowCount()
+        if n_rows == 0:
+            self._views = []
+            self._profile = None
+            self._frame_profiles = []
+            self._hdri_pixels = None
+            self._raw_hdri_pixels = None
+            self._rough_cache = None
+            self._raw_rough_cache = None
+            self._selected_plate_idx = -1
+            self._refresh_plate_transform_bar()
+            self.hotspot_table.setRowCount(0)
+            self.preview_label.set_ab_split(False)
+            self.preview_label.set_plate_overlay([], -1, self.yaw_spin.value(), self.vshift_spin.value())
+            self.preview_label.set_source_pixmap(None)
+            self.preview_label.setText("Analyze a plate or multi-view set to preview the 2:1 Lat/Long HDRI.")
+            return
+
+        if removed_indices and self._views:
+            for r in sorted(set(removed_indices), reverse=True):
+                if 0 <= r < len(self._views):
+                    self._views.pop(r)
+
+        if len(self._views) == n_rows and self._views:
+            self._selected_plate_idx = min(max(0, self._selected_plate_idx), len(self._views) - 1)
+            self._refresh_plate_transform_bar()
+            self._profile = analyze_multiview_plates(
+                self._views,
+                max_hotspots=self.max_hotspots_spin.value(),
+                ldr_highlight_boost=self.ldr_boost_spin.value(),
+            )
+            self._populate_analysis_ui(self._profile, len(self._views))
+            self._raw_hdri_pixels = None
+            self._regenerate_preview()
+        elif self._profile is not None or self._hdri_pixels is not None:
+            self._on_analyze_clicked()
 
     def _on_multiview_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self.multiview_table)
@@ -2414,6 +2455,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _on_clear_multiview_plates(self) -> None:
         self.multiview_table.setRowCount(0)
+        self._sync_after_multiview_list_change()
+        self.status_label.setText("Cleared all multi-position plates.")
 
     def _on_auto_align_plates(self) -> None:
         n_mv = self.multiview_table.rowCount()
