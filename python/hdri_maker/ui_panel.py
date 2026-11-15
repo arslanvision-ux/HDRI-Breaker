@@ -2520,10 +2520,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if self._selected_plate_idx not in enabled_indices:
             self._selected_plate_idx = enabled_indices[0]
         self._refresh_plate_transform_bar()
+        from dataclasses import replace as _dc_replace
+
+        stat_views = []
+        for idx in enabled_indices:
+            v = self._views[idx]
+            px = v.pixels
+            step = max(1, max(px.shape[:2]) // 512)
+            stat_views.append(_dc_replace(v, pixels=px[::step, ::step]) if step > 1 else v)
         self._profile = analyze_multiview_plates(
-            self._views,
+            stat_views,
             max_hotspots=self.max_hotspots_spin.value(),
             ldr_highlight_boost=self.ldr_boost_spin.value(),
+            include_spherical_map=False,
         )
         self._populate_analysis_ui(self._profile, len(enabled_indices))
         self._raw_hdri_pixels = None
@@ -2654,26 +2663,65 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("Add at least 2 overlapping plates to auto-align.")
             return
         try:
+            use_cached = bool(self._views and len(self._views) == n_mv)
+            align_rows: List[int] = []
             views: List[PlateViewInput] = []
             for row in range(n_mv):
-                fpath = self.multiview_table.item(row, 0).data(Qt.UserRole)
+                item0 = self.multiview_table.item(row, 0)
+                if item0 is not None and item0.checkState() != Qt.Checked:
+                    continue
                 az = float(self.multiview_table.item(row, 1).text())
                 el = float(self.multiview_table.item(row, 2).text())
                 fov = float(self.multiview_table.item(row, 3).text())
-                cs = self.multiview_table.item(row, 4).text() or "Auto"
-                plate = read_plate(fpath, colorspace=cs, max_dim=512)
-                views.append(
-                    PlateViewInput(
-                        pixels=plate.pixels,
-                        is_hdr=plate.is_hdr,
-                        source_path=fpath,
-                        fov_h_deg=fov,
-                        cam_azimuth_deg=az,
-                        cam_elevation_deg=el,
+                extra = dict(item0.data(Qt.UserRole + 1) or {}) if item0 is not None else {}
+                if use_cached:
+                    cached = self._views[row]
+                    px = cached.pixels
+                    step = max(1, max(px.shape[:2]) // 256)
+                    views.append(
+                        PlateViewInput(
+                            pixels=np.ascontiguousarray(px[::step, ::step]),
+                            is_hdr=cached.is_hdr,
+                            source_path=cached.source_path,
+                            fov_h_deg=fov,
+                            cam_azimuth_deg=az,
+                            cam_elevation_deg=el,
+                            cam_roll_deg=float(extra.get("roll", 0.0)),
+                            warp_k1=float(extra.get("warp_k1", 0.0)),
+                            lens_type=str(extra.get("lens_type", "rectilinear")),
+                        )
                     )
-                )
-            aligned = auto_align_adjacent_plates(views)
-            for row, v in enumerate(aligned):
+                else:
+                    fpath = item0.data(Qt.UserRole)
+                    cs = self.multiview_table.item(row, 4).text() or "Auto"
+                    self.status_label.setText(f"Loading plate {row + 1}/{n_mv} for alignment...")
+                    QtWidgets.QApplication.processEvents()
+                    plate = read_plate(fpath, colorspace=cs, max_dim=256)
+                    views.append(
+                        PlateViewInput(
+                            pixels=plate.pixels,
+                            is_hdr=plate.is_hdr,
+                            source_path=fpath,
+                            fov_h_deg=fov,
+                            cam_azimuth_deg=az,
+                            cam_elevation_deg=el,
+                            cam_roll_deg=float(extra.get("roll", 0.0)),
+                            warp_k1=float(extra.get("warp_k1", 0.0)),
+                            lens_type=str(extra.get("lens_type", "rectilinear")),
+                        )
+                    )
+                align_rows.append(row)
+
+            if len(views) < 2:
+                self.status_label.setText("Enable at least 2 overlapping plates to auto-align.")
+                return
+
+            def _on_align_progress(idx: int, total: int) -> None:
+                self.status_label.setText(f"Auto-aligning plate {idx}/{total}...")
+                QtWidgets.QApplication.processEvents()
+
+            aligned = auto_align_adjacent_plates(views, progress_cb=_on_align_progress)
+            for row, v in zip(align_rows, aligned):
                 self.multiview_table.item(row, 1).setText(f"{v.cam_azimuth_deg:.1f}")
                 self.multiview_table.item(row, 2).setText(f"{v.cam_elevation_deg:.1f}")
                 self.multiview_table.item(row, 3).setText(f"{v.fov_h_deg:.1f}")
@@ -2683,13 +2731,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     extra["roll"] = float(v.cam_roll_deg)
                     extra["warp_k1"] = float(v.warp_k1)
                     item0.setData(Qt.UserRole + 1, extra)
-            if self._views and len(self._views) == len(aligned):
-                for idx, v in enumerate(aligned):
-                    self._views[idx].cam_azimuth_deg = v.cam_azimuth_deg
-                    self._views[idx].cam_elevation_deg = v.cam_elevation_deg
-                    self._views[idx].cam_roll_deg = v.cam_roll_deg
-                    self._views[idx].fov_h_deg = v.fov_h_deg
-                    self._views[idx].warp_k1 = v.warp_k1
+                if use_cached:
+                    self._views[row].cam_azimuth_deg = v.cam_azimuth_deg
+                    self._views[row].cam_elevation_deg = v.cam_elevation_deg
+                    self._views[row].cam_roll_deg = v.cam_roll_deg
+                    self._views[row].fov_h_deg = v.fov_h_deg
+                    self._views[row].warp_k1 = v.warp_k1
+            if use_cached:
                 self._refresh_plate_transform_bar()
                 self._regenerate_preview()
             self.status_label.setText(f"Auto-aligned {len(aligned)} overlapping plates (Az, El, Roll, FOV, Warp).")
@@ -3673,6 +3721,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     views,
                     max_hotspots=self.max_hotspots_spin.value(),
                     ldr_highlight_boost=self.ldr_boost_spin.value(),
+                    include_spherical_map=False,
                 )
                 self._log_debug(f"Analysis done: CCT={self._profile.overall_cct_kelvin:.0f}K, hotspots={len(self._profile.hotspots)}")
                 self._populate_analysis_ui(self._profile, len(enabled_indices))

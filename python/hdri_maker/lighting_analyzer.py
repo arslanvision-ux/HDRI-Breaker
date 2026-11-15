@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -982,7 +982,10 @@ def auto_equalize_plate_exposures(views: List[PlateViewInput]) -> List[PlateView
     return eq
 
 
-def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInput]:
+def auto_align_adjacent_plates(
+    views: List[PlateViewInput],
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> List[PlateViewInput]:
     """
     Coarse-to-fine spherical overlap refinement for consecutive plates.
 
@@ -992,10 +995,29 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
     if len(views) < 2:
         return views
 
-    def _ncc_score(prev_lum: np.ndarray, prev_cov: np.ndarray, cand: PlateViewInput) -> float:
-        c_map, c_cov = project_multiview_plates_to_latlong([cand], 256, 128, ldr_highlight_boost=1.0)
+    def _downsample_for_align(view: PlateViewInput, max_dim: int = 256) -> PlateViewInput:
+        px = np.asarray(view.pixels, dtype=np.float32)
+        h, w = px.shape[:2]
+        m = max(h, w)
+        if m <= max_dim:
+            return view
+        step = max(1, m // max_dim)
+        return replace(view, pixels=np.ascontiguousarray(px[::step, ::step]))
+
+    small_views = [_downsample_for_align(v) for v in views]
+
+    def _ncc_score(
+        prev_lum: np.ndarray,
+        prev_cov: np.ndarray,
+        cand: PlateViewInput,
+        out_w: int = 256,
+        out_h: int = 128,
+    ) -> float:
+        c_map, c_cov = project_multiview_plates_to_latlong(
+            [cand], out_w, out_h, ldr_highlight_boost=1.0
+        )
         overlap = (prev_cov > 0.25) & (c_cov > 0.25)
-        if np.sum(overlap) < 40:
+        if np.sum(overlap) < 30:
             return -1e9
         a = prev_lum[overlap]
         b = compute_luminance(c_map)[overlap]
@@ -1005,9 +1027,14 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
         return float(np.sum(a * b) / denom) if denom > 1e-6 else -1e9
 
     aligned = [views[0]]
+    aligned_small = [small_views[0]]
+    total_pairs = len(views) - 1
     for i in range(1, len(views)):
-        prev = aligned[-1]
-        curr = views[i]
+        if progress_cb is not None:
+            progress_cb(i, total_pairs)
+        prev_s = aligned_small[-1]
+        orig_curr = views[i]
+        curr = small_views[i]
         best_az = curr.cam_azimuth_deg
         best_el = curr.cam_elevation_deg
         best_roll = curr.cam_roll_deg
@@ -1015,10 +1042,12 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
         best_k1 = curr.warp_k1
         best_score = -1e9
 
-        prev_map, prev_cov = project_multiview_plates_to_latlong([prev], 256, 128, ldr_highlight_boost=1.0)
-        prev_lum = compute_luminance(prev_map)
+        prev_map_c, prev_cov_c = project_multiview_plates_to_latlong(
+            [prev_s], 192, 96, ldr_highlight_boost=1.0
+        )
+        prev_lum_c = compute_luminance(prev_map_c)
 
-        # Stage 1: Coarse search (+-18 deg az, +-8 deg el)
+        # Stage 1: Coarse search (+-18 deg az, +-8 deg el) at 192x96
         for d_az in (-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0):
             for d_el in (-8.0, -4.0, 0.0, 4.0, 8.0):
                 cand = replace(
@@ -1026,13 +1055,19 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
                     cam_azimuth_deg=curr.cam_azimuth_deg + d_az,
                     cam_elevation_deg=float(np.clip(curr.cam_elevation_deg + d_el, -85.0, 85.0)),
                 )
-                score = _ncc_score(prev_lum, prev_cov, cand)
+                score = _ncc_score(prev_lum_c, prev_cov_c, cand, out_w=192, out_h=96)
                 if score > best_score:
                     best_score = score
                     best_az = cand.cam_azimuth_deg
                     best_el = cand.cam_elevation_deg
 
-        # Stage 2: Fine search (+-3 deg az, +-2 deg el in 1 deg steps)
+        prev_map, prev_cov = project_multiview_plates_to_latlong(
+            [prev_s], 256, 128, ldr_highlight_boost=1.0
+        )
+        prev_lum = compute_luminance(prev_map)
+        best_score = -1e9
+
+        # Stage 2: Fine search (+-3 deg az, +-2 deg el in 1 deg steps) at 256x128
         coarse_az, coarse_el = best_az, best_el
         for d_az in (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0):
             for d_el in (-2.0, -1.0, 0.0, 1.0, 2.0):
@@ -1089,6 +1124,16 @@ def auto_align_adjacent_plates(views: List[PlateViewInput]) -> List[PlateViewInp
 
         aligned.append(
             replace(
+                orig_curr,
+                cam_azimuth_deg=best_az,
+                cam_elevation_deg=best_el,
+                cam_roll_deg=best_roll,
+                fov_h_deg=best_fov,
+                warp_k1=best_k1,
+            )
+        )
+        aligned_small.append(
+            replace(
                 curr,
                 cam_azimuth_deg=best_az,
                 cam_elevation_deg=best_el,
@@ -1104,6 +1149,7 @@ def analyze_multiview_plates(
     views: List[PlateViewInput],
     max_hotspots: int = 8,
     ldr_highlight_boost: float = 8.0,
+    include_spherical_map: bool = True,
 ) -> LightingProfile:
     """
     Analyze multiple plate images taken from different camera positions/angles
@@ -1124,9 +1170,10 @@ def analyze_multiview_plates(
             max_hotspots=max_hotspots,
             ldr_highlight_boost=ldr_highlight_boost,
         )
-        s_map, s_cov = project_multiview_plates_to_latlong(views)
-        prof.spherical_plate_map = s_map
-        prof.spherical_coverage_mask = s_cov
+        if include_spherical_map:
+            s_map, s_cov = project_multiview_plates_to_latlong(views)
+            prof.spherical_plate_map = s_map
+            prof.spherical_coverage_mask = s_cov
         return prof
 
     per_view_profiles: List[LightingProfile] = []
@@ -1178,9 +1225,10 @@ def analyze_multiview_plates(
     merged.source_path = f"{len(views)} multi-view plates"
     merged.hotspots = merged_hotspots
 
-    s_map, s_cov = project_multiview_plates_to_latlong(views)
-    merged.spherical_plate_map = s_map
-    merged.spherical_coverage_mask = s_cov
+    if include_spherical_map:
+        s_map, s_cov = project_multiview_plates_to_latlong(views)
+        merged.spherical_plate_map = s_map
+        merged.spherical_coverage_mask = s_cov
     return merged
 
 
