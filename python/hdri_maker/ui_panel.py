@@ -1362,6 +1362,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         reload_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         reload_btn.clicked.connect(self._on_reload_code)
 
+        reset_all_btn = QtWidgets.QPushButton("Reset All")
+        reset_all_btn.setToolTip("Clear all plates, edits, apply/collapse history, and reset all parameters to start fresh")
+        reset_all_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        reset_all_btn.clicked.connect(self._on_reset_all_setup)
+
         debug_btn = QtWidgets.QPushButton("Debug Log")
         debug_btn.setToolTip(f"Open live Debug Log window (also written to {DEBUG_LOG_PATH})")
         debug_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
@@ -1386,6 +1391,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         status_row.addWidget(self.ui_scale_slider)
         status_row.addWidget(save_btn)
         status_row.addWidget(load_btn)
+        status_row.addWidget(reset_all_btn)
         status_row.addWidget(debug_btn)
         status_row.addWidget(reload_btn)
         right_layout.addLayout(status_row)
@@ -4609,6 +4615,84 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._auto_save_session()
         import hdri_maker
         hdri_maker.reload_all(relaunch=True)
+
+    def _on_reset_all_setup(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Reset All & Start Fresh",
+            "Clear all loaded plates, canvas edits, Apply/Collapse history, and reset all parameters to defaults?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._preview_fast_timer.stop()
+        self._preview_timer.stop()
+        self._display_timer.stop()
+        self._suppress_auto_preview = True
+        try:
+            self.multiview_table.setRowCount(0)
+            self._views = []
+            self._profile = None
+            self._frame_profiles = []
+            self._hdri_pixels = None
+            self._raw_hdri_pixels = None
+            self._baked_canvas_hdri = None
+            self._baked_azimuth_offset_deg = 0.0
+            self._pre_bake_snapshot = None
+            self._bake_history.clear()
+            self._sky_rect = None
+            self._ground_rect = None
+            self._light_regions.clear()
+            self._extracted_lights.clear()
+            self._last_light_exr_paths.clear()
+            self._brush_strokes.clear()
+            self._brush_undo_stack.clear()
+            self._pre_brush_hdri = None
+            self._wb_gains = (1.0, 1.0, 1.0)
+            self._wb_undo_stack.clear()
+            self._action_undo_stack.clear()
+            self._rough_cache = None
+            self._raw_rough_cache = None
+            self._selected_plate_idx = -1
+
+            self.apply_state_dict({})
+            self.res_combo.setCurrentIndex(0)
+            self.out_cs_combo.setCurrentIndex(0)
+            self.colorspace_combo.setCurrentIndex(0)
+            self.seq_mode_combo.setCurrentIndex(0)
+            self.preview_ev_slider.setValue(0)
+            if hasattr(self, "preview_roughness_slider"):
+                self.preview_roughness_slider.setValue(0)
+            if hasattr(self, "preview_tonemap_combo"):
+                self.preview_tonemap_combo.setCurrentIndex(0)
+
+            for btn in (
+                self.pick_sky_btn,
+                self.pick_gnd_btn,
+                self.pick_light_btn,
+                self.pick_wb_btn,
+                self.brush_btn,
+                self.plate_edit_btn,
+                self.ab_split_btn,
+            ):
+                btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+            self.preview_label.set_plate_edit_mode(False)
+            self.preview_label.set_ab_split(False)
+            self.preview_label.set_regions(None, None, [])
+            self.preview_label.set_plate_overlay([], -1, 0.0, 0.0)
+            self.preview_label.set_source_pixmap(None)
+            self.preview_label.setText("Analyze a plate or multi-view set to preview the 2:1 Lat/Long HDRI.")
+            self.unbake_edits_btn.setEnabled(False)
+            self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
+            self.hotspot_table.setRowCount(0)
+            self.metrics_label.setText("Analyze a plate to see extracted lighting metrics.")
+            self._refresh_plate_transform_bar()
+        finally:
+            self._suppress_auto_preview = False
+        self._auto_save_session()
+        self.status_label.setText("Fresh setup ready: cleared all plates, edits, bake history, and parameters.")
 
     # ------------------------------------------------------------------
     # State Save / Load & Session Persistence
