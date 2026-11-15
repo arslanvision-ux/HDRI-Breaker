@@ -3803,8 +3803,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                         region_blur=self.light_blur_slider.value(),
                     )
-                if self._brush_strokes:
-                    hdri = apply_brush_strokes(hdri, self._brush_strokes)
                     self._extracted_lights = extracted
                     stem, _ = os.path.splitext(out_path)
                     for idx, (light_tex, light_info) in enumerate(extracted, start=1):
@@ -3823,6 +3821,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         )
                         self._last_light_exr_paths.append(written_l)
                     light_msg = f" + {len(self._last_light_exr_paths)} Light EXR(s)"
+                if self._brush_strokes:
+                    hdri = apply_brush_strokes(hdri, self._brush_strokes)
 
                 meta = {
                     "hdri_maker:cct_kelvin": f"{self._profile.overall_cct_kelvin:.1f}",
