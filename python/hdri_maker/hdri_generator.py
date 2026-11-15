@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1239,3 +1239,129 @@ def export_hdri_sequence(
                 frame=int(fnum),
             )
     return output_pattern, written
+
+
+def apply_brush_dab(
+    hdri: np.ndarray,
+    u: float,
+    v: float,
+    mode: str = "heal",
+    radius_u: float = 0.025,
+    softness: float = 0.65,
+    strength: float = 0.85,
+    src_offset_uv: Optional[Tuple[float, float]] = None,
+    inplace: bool = False,
+) -> np.ndarray:
+    """
+    Apply a single 32-bit float wrap-aware brush dab onto a 2:1 Lat/Long HDRI.
+
+    Supported modes:
+        - "clone": Clone from `(u + du, v + dv)` with 360-deg horizontal wrap
+        - "heal": Smoothly inpaint from the surrounding clean ring
+        - "blur": Local 32-bit float smoothing
+        - "burn": Attenuate hot speculars/fireflies (`* 2^(-strength * w)`)
+        - "dodge": Boost HDR energy (`* 2^(+strength * w)`)
+        - "desat": Neutralize local chroma cast toward luminance
+    """
+    out = hdri if inplace else hdri.astype(np.float32, copy=True)
+    h, w = out.shape[:2]
+    ru_px = max(2, int(round(float(np.clip(radius_u, 0.002, 0.25)) * w)))
+    rv_px = ru_px  # 2:1 aspect ratio -> equal pixel radius in x and y
+    cx = int(round((u % 1.0) * (w - 1)))
+    cy = int(round(float(np.clip(v, 0.0, 1.0)) * (h - 1)))
+
+    # Local patch bounds with 4px padding for blur/heal context
+    pad = max(4, ru_px // 2) if mode in ("heal", "blur") else 0
+    rad = ru_px + pad
+    y0 = max(0, cy - rad)
+    y1 = min(h, cy + rad + 1)
+    if y1 <= y0:
+        return out
+
+    xs = (np.arange(cx - rad, cx + rad + 1, dtype=np.int32)) % w
+    ys = np.arange(y0, y1, dtype=np.int32)
+    patch = out[np.ix_(ys, xs)].copy()
+
+    # Radial distance in brush-radius units inside the patch
+    gx = np.arange(cx - rad, cx + rad + 1, dtype=np.float32)[None, :] - float(cx)
+    gy = ys.astype(np.float32)[:, None] - float(cy)
+    r_norm = np.hypot(gx, gy) / float(max(1, ru_px))
+
+    soft = float(np.clip(softness, 0.05, 1.0))
+    inner = max(0.0, 1.0 - soft)
+    # Smooth falloff: 1 at center, 0 at r_norm >= 1.0
+    falloff = 1.0 - _smoothstep(inner, 1.0, r_norm)
+    w_mask = (falloff * float(np.clip(strength, 0.02, 1.0)))[..., None]
+
+    m = str(mode or "heal").strip().lower()
+    if m == "clone" and src_offset_uv is not None:
+        du_px = int(round(float(src_offset_uv[0]) * w))
+        dv_px = int(round(float(src_offset_uv[1]) * h))
+        src_xs = (xs + du_px) % w
+        src_ys = np.clip(ys + dv_px, 0, h - 1)
+        src_patch = out[np.ix_(src_ys, src_xs)]
+        blended = patch * (1.0 - w_mask) + src_patch * w_mask
+    elif m == "heal":
+        # Compute mean color of the outer clean ring (1.05 <= r_norm <= 1.55)
+        ring_mask = (r_norm >= 1.02) & (r_norm <= 1.55)
+        if np.any(ring_mask):
+            ring_rgb = np.median(patch[ring_mask], axis=0, keepdims=True)[None, :, :]
+        else:
+            ring_rgb = np.mean(patch, axis=(0, 1), keepdims=True)
+        # Smooth the patch + blend toward ring_rgb for natural textureless fill
+        rx_b = max(2, ru_px // 2)
+        blurred = _separable_box_blur(patch, rx_b, rx_b, wrap_x=False)
+        fill = blurred * 0.45 + ring_rgb * 0.55
+        blended = patch * (1.0 - w_mask) + fill * w_mask
+    elif m == "blur":
+        rx_b = max(2, ru_px // 3)
+        blurred = _separable_box_blur(patch, rx_b, rx_b, wrap_x=False)
+        blended = patch * (1.0 - w_mask) + blurred * w_mask
+    elif m == "burn":
+        mult = np.power(2.0, -w_mask * 1.5)
+        blended = patch * mult
+    elif m == "dodge":
+        mult = np.power(2.0, w_mask * 1.5)
+        blended = patch * mult
+    elif m == "desat":
+        lum = compute_luminance(patch)[..., None]
+        blended = patch * (1.0 - w_mask) + lum * w_mask
+    else:
+        return out
+
+    out[np.ix_(ys, xs)] = np.maximum(blended, 0.0)
+    return out
+
+
+def apply_brush_strokes(
+    hdri: np.ndarray,
+    strokes: List[Dict[str, Any]],
+) -> np.ndarray:
+    """
+    Replay a list of resolution-independent 32-bit float brush strokes onto an HDRI.
+    """
+    if not strokes:
+        return hdri
+    out = hdri.astype(np.float32, copy=True)
+    for st in strokes:
+        mode = str(st.get("mode", "heal"))
+        radius_u = float(st.get("radius_u", 0.025))
+        softness = float(st.get("softness", 0.65))
+        strength = float(st.get("strength", 0.85))
+        src_off = st.get("src_offset")
+        src_offset_uv = (float(src_off[0]), float(src_off[1])) if src_off is not None else None
+        pts = st.get("points") or []
+        for pt in pts:
+            if len(pt) >= 2:
+                apply_brush_dab(
+                    out,
+                    float(pt[0]),
+                    float(pt[1]),
+                    mode=mode,
+                    radius_u=radius_u,
+                    softness=softness,
+                    strength=strength,
+                    src_offset_uv=src_offset_uv,
+                    inplace=True,
+                )
+    return np.ascontiguousarray(out, dtype=np.float32)

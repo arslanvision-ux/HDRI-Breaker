@@ -671,6 +671,33 @@ class TestHDRIMaker(unittest.TestCase):
             stem, ext = os.path.splitext(sp)
             self.assertTrue(os.path.isfile(f"{stem}_diffuse{ext}"))
 
+        # 4b. 32-bit Float Canvas Brush Tools (clone across seam, heal, burn, dodge, blur, desat)
+        from hdri_maker.hdri_generator import apply_brush_dab, apply_brush_strokes
+
+        canvas = np.full((64, 128, 3), 0.25, dtype=np.float32)
+        canvas[:, 10:25, :] = [4.0, 0.2, 0.2]  # bright red region to clone/heal/burn
+        # Clone from (0.12, 0.5) onto wrap seam (0.99, 0.5)
+        cloned = apply_brush_dab(
+            canvas, u=0.99, v=0.5, mode="clone", radius_u=0.05, strength=1.0, src_offset_uv=(0.12 - 0.99, 0.0)
+        )
+        self.assertGreater(float(cloned[32, 126, 0]), 1.5)
+        # Burn dims hot region, Dodge boosts it
+        burned = apply_brush_dab(canvas, u=0.14, v=0.5, mode="burn", radius_u=0.05, strength=1.0)
+        self.assertLess(float(burned[32, 18, 0]), 3.5)
+        dodged = apply_brush_dab(canvas, u=0.14, v=0.5, mode="dodge", radius_u=0.05, strength=1.0)
+        self.assertGreater(float(dodged[32, 18, 0]), 4.5)
+        # Replay resolution-independent strokes (heal, blur, desat)
+        replayed = apply_brush_strokes(
+            canvas,
+            [
+                {"mode": "heal", "radius_u": 0.04, "softness": 0.6, "strength": 0.9, "points": [[0.5, 0.5]]},
+                {"mode": "blur", "radius_u": 0.04, "softness": 0.6, "strength": 0.8, "points": [[0.5, 0.5]]},
+                {"mode": "desat", "radius_u": 0.04, "softness": 0.6, "strength": 1.0, "points": [[0.14, 0.5]]},
+            ],
+        )
+        self.assertEqual(replayed.shape, canvas.shape)
+        self.assertTrue(np.all(np.isfinite(replayed)))
+
         # 5. Solaris distant sun & USD rig export (if hou available)
         try:
             import hou  # noqa: F401

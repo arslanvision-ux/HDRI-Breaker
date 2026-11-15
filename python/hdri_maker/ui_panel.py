@@ -18,6 +18,8 @@ import numpy as np
 from .hdri_generator import (
     ExtractedAreaLightInfo,
     HDRISynthesisParams,
+    apply_brush_dab,
+    apply_brush_strokes,
     bake_planar_ground_texture,
     compute_neutral_wb_gains,
     export_hdri_sequence,
@@ -238,6 +240,10 @@ class PreviewLabel(QtWidgets.QLabel):
     plateDragMoved = Signal(int, float, float, str)
     plateDragFinished = Signal(int)
     plateWheelScaled = Signal(int, float)
+    brushStrokeStarted = Signal(float, float)
+    brushStrokeMoved = Signal(float, float)
+    brushStrokeFinished = Signal()
+    brushCloneSourcePicked = Signal(float, float)
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
@@ -276,6 +282,30 @@ class PreviewLabel(QtWidgets.QLabel):
         self._ab_split_x: float = 0.5
         self._ab_compare_pixmap: Optional[QtGui.QPixmap] = None
         self._ab_dragging: bool = False
+        # Interactive Canvas Brush state
+        self._brush_enabled: bool = False
+        self._brush_mode: str = "heal"
+        self._brush_radius_u: float = 0.025
+        self._brush_hover_uv: Optional[Tuple[float, float]] = None
+        self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
+        self._brush_painting: bool = False
+
+    def set_brush_state(
+        self,
+        enabled: bool,
+        mode: str = "heal",
+        radius_u: float = 0.025,
+        clone_src_uv: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        self._brush_enabled = bool(enabled)
+        self._brush_mode = str(mode)
+        self._brush_radius_u = float(radius_u)
+        self._brush_clone_src_uv = clone_src_uv
+        if self._brush_enabled:
+            self.setCursor(Qt.CrossCursor)
+        elif self._pick_mode is None:
+            self.setCursor(Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor)
+        self.update()
 
     def set_ab_split(self, enabled: bool, compare_pix: Optional[QtGui.QPixmap] = None) -> None:
         self._ab_split_enabled = bool(enabled)
@@ -476,6 +506,17 @@ class PreviewLabel(QtWidgets.QLabel):
             self.update()
             return
         if self._pick_mode is None and event.button() == Qt.LeftButton:
+            if self._brush_enabled:
+                uv_b = self._pos_to_uv(pos)
+                if uv_b is not None and 0.0 <= uv_b[0] <= 1.0 and 0.0 <= uv_b[1] <= 1.0:
+                    if bool(event.modifiers() & Qt.ControlModifier) and self._brush_mode == "clone":
+                        self._brush_clone_src_uv = (float(uv_b[0]), float(uv_b[1]))
+                        self.brushCloneSourcePicked.emit(float(uv_b[0]), float(uv_b[1]))
+                        self.update()
+                        return
+                    self._brush_painting = True
+                    self.brushStrokeStarted.emit(float(uv_b[0]), float(uv_b[1]))
+                    return
             if self._ab_split_enabled and self._ab_compare_pixmap is not None:
                 prect = self._pixmap_rect()
                 split_px = prect.x() + int(self._ab_split_x * prect.width())
@@ -555,6 +596,13 @@ class PreviewLabel(QtWidgets.QLabel):
         uv = self._pos_to_uv(pos)
         if uv is not None and 0.0 <= uv[0] <= 1.0 and 0.0 <= uv[1] <= 1.0:
             self.pixelHovered.emit(float(uv[0]), float(uv[1]))
+            if self._brush_enabled:
+                self._brush_hover_uv = (float(uv[0]), float(uv[1]))
+                if self._brush_painting:
+                    self.brushStrokeMoved.emit(float(uv[0]), float(uv[1]))
+                self.update()
+                if self._brush_painting:
+                    return
 
         if self._pick_mode and self._drag_start is not None:
             self._drag_end = pos
@@ -627,6 +675,10 @@ class PreviewLabel(QtWidgets.QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._brush_painting:
+            self._brush_painting = False
+            self.brushStrokeFinished.emit()
+            return
         if self._ab_dragging:
             self._ab_dragging = False
             self.setCursor(Qt.ArrowCursor)
@@ -751,6 +803,26 @@ class PreviewLabel(QtWidgets.QLabel):
                     painter.drawEllipse(rect)
                 else:
                     painter.drawRect(rect)
+            if self._brush_enabled:
+                if self._brush_mode == "clone" and self._brush_clone_src_uv is not None:
+                    su, sv = self._brush_clone_src_uv
+                    sx = target.x() + su * target.width()
+                    sy = target.y() + sv * target.height()
+                    painter.setPen(QtGui.QPen(QtGui.QColor(80, 255, 160), 2, Qt.SolidLine))
+                    painter.drawLine(int(sx - 8), int(sy), int(sx + 8), int(sy))
+                    painter.drawLine(int(sx), int(sy - 8), int(sx), int(sy + 8))
+                    painter.drawEllipse(QtCore.QPointF(sx, sy), 5, 5)
+                if self._brush_hover_uv is not None:
+                    bu, bv = self._brush_hover_uv
+                    bx = target.x() + bu * target.width()
+                    by = target.y() + bv * target.height()
+                    rx = max(2.0, self._brush_radius_u * target.width())
+                    ry = max(2.0, self._brush_radius_u * 2.0 * target.height())
+                    b_col = QtGui.QColor(255, 160, 40) if self._brush_mode == "dodge" else (
+                        QtGui.QColor(80, 200, 255) if self._brush_mode == "burn" else QtGui.QColor(255, 255, 255)
+                    )
+                    painter.setPen(QtGui.QPen(b_col, 1.5, Qt.SolidLine))
+                    painter.drawEllipse(QtCore.QPointF(bx, by), rx, ry)
             painter.end()
             return
         super().paintEvent(event)
@@ -1092,6 +1164,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._ground_rect: Optional[tuple] = None
         self._light_regions: List[Dict[str, Any]] = []
         self._extracted_lights: List[tuple] = []
+        self._brush_strokes: List[Dict[str, Any]] = []
+        self._active_brush_stroke: Optional[Dict[str, Any]] = None
+        self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
+        self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
         self._last_exr_path: str = ""
         self._last_hdri_full: Optional[np.ndarray] = None
         self._last_light_exr_paths: List[str] = []
@@ -1806,6 +1882,68 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(undo_light_btn)
         ctrl_row.addWidget(clear_area_btn)
         layout.addLayout(ctrl_row)
+
+        # Interactive 32-bit Float Canvas Brush Toolbar
+        brush_row = QtWidgets.QHBoxLayout()
+        self.brush_btn = QtWidgets.QPushButton("Brush Paint")
+        self.brush_btn.setCheckable(True)
+        self.brush_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #b45309; color: #ffffff; font-weight: bold; }"
+        )
+        self.brush_btn.setToolTip(
+            "Paint directly on the 32-bit float 2:1 HDRI canvas:\n"
+            "• Heal / Inpaint: Clean spots/tripods from surrounding ring\n"
+            "• Clone Stamp: Ctrl+Click to pick source, then paint (360° wrap-aware)\n"
+            "• Blur / Burn / Dodge / Desaturate: Smooth seams, dim fireflies, or boost highlights"
+        )
+        self.brush_btn.toggled.connect(self._on_toggle_brush_mode)
+        self.brush_mode_combo = QtWidgets.QComboBox()
+        self.brush_mode_combo.addItems([
+            "Heal / Inpaint",
+            "Clone Stamp",
+            "Blur / Smooth",
+            "Burn (Dim HDR)",
+            "Dodge (Boost HDR)",
+            "Desaturate",
+        ])
+        self.brush_mode_combo.currentIndexChanged.connect(self._on_brush_config_changed)
+        self.brush_size_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.brush_size_slider.setRange(5, 120)
+        self.brush_size_slider.setValue(25)
+        self.brush_size_slider.setMaximumWidth(80)
+        self.brush_size_slider.valueChanged.connect(self._on_brush_config_changed)
+        self.brush_strength_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.brush_strength_slider.setRange(10, 100)
+        self.brush_strength_slider.setValue(85)
+        self.brush_strength_slider.setMaximumWidth(75)
+        self.brush_strength_slider.valueChanged.connect(self._on_brush_config_changed)
+        self.brush_soft_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.brush_soft_slider.setRange(10, 100)
+        self.brush_soft_slider.setValue(65)
+        self.brush_soft_slider.setMaximumWidth(75)
+        self.brush_soft_slider.valueChanged.connect(self._on_brush_config_changed)
+        undo_brush_btn = QtWidgets.QPushButton("Undo Brush")
+        undo_brush_btn.clicked.connect(self._on_undo_brush)
+        clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
+        clear_brush_btn.clicked.connect(self._on_clear_brush)
+
+        brush_row.addWidget(self.brush_btn)
+        brush_row.addWidget(self.brush_mode_combo)
+        brush_row.addWidget(QtWidgets.QLabel("Size:"))
+        brush_row.addWidget(self.brush_size_slider)
+        brush_row.addWidget(QtWidgets.QLabel("Strength:"))
+        brush_row.addWidget(self.brush_strength_slider)
+        brush_row.addWidget(QtWidgets.QLabel("Soft:"))
+        brush_row.addWidget(self.brush_soft_slider)
+        brush_row.addWidget(undo_brush_btn)
+        brush_row.addWidget(clear_brush_btn)
+        brush_row.addStretch(1)
+        layout.addLayout(brush_row)
+
+        self.preview_label.brushCloneSourcePicked.connect(self._on_brush_clone_src_picked)
+        self.preview_label.brushStrokeStarted.connect(self._on_brush_stroke_started)
+        self.preview_label.brushStrokeMoved.connect(self._on_brush_stroke_moved)
+        self.preview_label.brushStrokeFinished.connect(self._on_brush_stroke_finished)
 
         self.plate_transform_bar = QtWidgets.QWidget()
         pt_layout = QtWidgets.QHBoxLayout(self.plate_transform_bar)
@@ -2907,6 +3045,134 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         self._display_timer.start()
 
+    def _current_brush_mode(self) -> str:
+        txt = self.brush_mode_combo.currentText().lower()
+        if "clone" in txt:
+            return "clone"
+        if "blur" in txt:
+            return "blur"
+        if "burn" in txt:
+            return "burn"
+        if "dodge" in txt:
+            return "dodge"
+        if "desat" in txt:
+            return "desat"
+        return "heal"
+
+    def _on_toggle_brush_mode(self, checked: bool) -> None:
+        if checked:
+            for btn in (self.pick_sky_btn, self.pick_gnd_btn, self.pick_light_btn):
+                btn.setChecked(False)
+            if hasattr(self, "pick_wb_btn"):
+                self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "edit_plates_btn") and self.edit_plates_btn.isChecked():
+                self.edit_plates_btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+            m = self._current_brush_mode()
+            if m == "clone":
+                self.status_label.setText("Brush (Clone Stamp): Ctrl+Click to set Clone Source, then drag to paint.")
+            else:
+                self.status_label.setText(f"Brush ({self.brush_mode_combo.currentText()}): Drag on canvas to paint in 32-bit float.")
+        self._on_brush_config_changed()
+
+    def _on_brush_config_changed(self, *_args) -> None:
+        if not hasattr(self, "preview_label"):
+            return
+        self.preview_label.set_brush_state(
+            enabled=self.brush_btn.isChecked(),
+            mode=self._current_brush_mode(),
+            radius_u=self.brush_size_slider.value() / 1000.0,
+            clone_src_uv=self._brush_clone_src_uv,
+        )
+
+    def _on_brush_clone_src_picked(self, u: float, v: float) -> None:
+        self._brush_clone_src_uv = (float(u), float(v))
+        self.status_label.setText(f"Clone Source set at ({u:.3f}, {v:.3f}). Drag anywhere to clone-stamp.")
+
+    def _on_brush_stroke_started(self, u: float, v: float) -> None:
+        if self._hdri_pixels is None:
+            return
+        mode = self._current_brush_mode()
+        src_off = None
+        if mode == "clone":
+            if self._brush_clone_src_uv is None:
+                self.status_label.setText("Ctrl+Click on the canvas first to set a Clone Source.")
+                return
+            src_off = (self._brush_clone_src_uv[0] - u, self._brush_clone_src_uv[1] - v)
+            self._brush_clone_offset_uv = src_off
+        else:
+            self._brush_clone_offset_uv = None
+
+        radius_u = self.brush_size_slider.value() / 1000.0
+        softness = self.brush_soft_slider.value() / 100.0
+        strength = self.brush_strength_slider.value() / 100.0
+        self._active_brush_stroke = {
+            "mode": mode,
+            "radius_u": radius_u,
+            "softness": softness,
+            "strength": strength,
+            "src_offset": list(src_off) if src_off is not None else None,
+            "points": [[float(u), float(v)]],
+        }
+        apply_brush_dab(
+            self._hdri_pixels,
+            u,
+            v,
+            mode=mode,
+            radius_u=radius_u,
+            softness=softness,
+            strength=strength,
+            src_offset_uv=src_off,
+            inplace=True,
+        )
+        self._rough_cache = None
+        self._update_preview_pixmap()
+
+    def _on_brush_stroke_moved(self, u: float, v: float) -> None:
+        if self._hdri_pixels is None or self._active_brush_stroke is None:
+            return
+        pts = self._active_brush_stroke["points"]
+        last_u, last_v = pts[-1]
+        if ((u - last_u) ** 2 + (v - last_v) ** 2) < (self._active_brush_stroke["radius_u"] * 0.25) ** 2:
+            return
+        pts.append([float(u), float(v)])
+        src_off = self._brush_clone_offset_uv
+        apply_brush_dab(
+            self._hdri_pixels,
+            u,
+            v,
+            mode=self._active_brush_stroke["mode"],
+            radius_u=self._active_brush_stroke["radius_u"],
+            softness=self._active_brush_stroke["softness"],
+            strength=self._active_brush_stroke["strength"],
+            src_offset_uv=src_off,
+            inplace=True,
+        )
+        self._rough_cache = None
+        self._update_preview_pixmap()
+
+    def _on_brush_stroke_finished(self) -> None:
+        if self._active_brush_stroke is not None:
+            self._brush_strokes.append(self._active_brush_stroke)
+            self._active_brush_stroke = None
+            self._brush_clone_offset_uv = None
+            self.status_label.setText(f"Applied brush stroke ({len(self._brush_strokes)} total).")
+
+    def _on_undo_brush(self) -> None:
+        if not self._brush_strokes:
+            self.status_label.setText("No brush strokes to undo.")
+            return
+        self._brush_strokes.pop()
+        self._regenerate_preview()
+        self.status_label.setText(f"Undid last brush stroke ({len(self._brush_strokes)} remaining).")
+
+    def _on_clear_brush(self) -> None:
+        if not self._brush_strokes:
+            return
+        self._brush_strokes.clear()
+        self._regenerate_preview()
+        self.status_label.setText("Cleared all brush strokes.")
+
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
@@ -3145,6 +3411,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._extracted_lights = extracted
             elif not self._light_regions:
                 self._extracted_lights = []
+            if (not fast) and self._brush_strokes:
+                hdri = apply_brush_strokes(hdri, self._brush_strokes)
             self._hdri_pixels = hdri
             if hasattr(self, "ab_split_btn") and self.ab_split_btn.isChecked() and not fast:
                 raw_p = HDRISynthesisParams(
@@ -3407,6 +3675,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                         region_blur=self.light_blur_slider.value(),
                     )
+                if self._brush_strokes:
+                    hdri = apply_brush_strokes(hdri, self._brush_strokes)
                     self._extracted_lights = extracted
                     stem, _ = os.path.splitext(out_path)
                     for idx, (light_tex, light_info) in enumerate(extracted, start=1):
@@ -3776,6 +4046,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "diffuse_split": self.diffuse_split_chk.isChecked(),
             "preview_roughness": self.preview_roughness_slider.value(),
             "ab_split": self.ab_split_btn.isChecked(),
+            "brush_strokes": self._brush_strokes,
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -3889,6 +4160,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.diffuse_split_chk.setChecked(bool(data.get("diffuse_split", False)))
         self.preview_roughness_slider.setValue(int(data.get("preview_roughness", 0)))
         self.ab_split_btn.setChecked(bool(data.get("ab_split", False)))
+        self._brush_strokes = list(data.get("brush_strokes") or [])
 
         sr = data.get("sky_rect")
         self._sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
