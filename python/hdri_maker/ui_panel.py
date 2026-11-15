@@ -21,6 +21,7 @@ from .hdri_generator import (
     apply_brush_dab,
     apply_brush_strokes,
     apply_post_adjustments_to_hdri,
+    apply_sky_ground_inpaint_to_hdri,
     bake_planar_ground_texture,
     compute_neutral_wb_gains,
     export_hdri_sequence,
@@ -1250,6 +1251,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_canvas_hdri: Optional[np.ndarray] = None
         self._baked_azimuth_offset_deg: float = 0.0
         self._pre_bake_snapshot: Optional[Dict[str, Any]] = None
+        self._bake_history: List[Dict[str, Any]] = []
         self._active_brush_stroke: Optional[Dict[str, Any]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
@@ -2471,6 +2473,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_canvas_hdri = None
         self._baked_azimuth_offset_deg = 0.0
         self._pre_bake_snapshot = None
+        self._bake_history.clear()
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
         if n_rows == 0:
@@ -2527,6 +2530,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_canvas_hdri = None
         self._baked_azimuth_offset_deg = 0.0
         self._pre_bake_snapshot = None
+        self._bake_history.clear()
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
         if len(self._views) != n_rows or not self._views:
@@ -3604,8 +3608,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
                 physical_sky_fill=p.physical_sky_fill,
             )
-            has_new_regions = (self._sky_rect is not None) or (self._ground_rect is not None)
-            if self._baked_canvas_hdri is not None and not has_new_regions:
+            if self._baked_canvas_hdri is not None:
                 baked = self._baked_canvas_hdri.copy()
                 delta_yaw = float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg)
                 if abs(delta_yaw) > 1e-4:
@@ -3613,6 +3616,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     if shift_px != 0:
                         baked = np.roll(baked, shift_px, axis=1)
                 self._baked_azimuth_offset_deg = float(p.azimuth_offset_deg)
+                if self._sky_rect is not None or self._ground_rect is not None:
+                    baked = apply_sky_ground_inpaint_to_hdri(
+                        baked,
+                        sky_rect=self._sky_rect,
+                        ground_rect=self._ground_rect,
+                        sky_blend=p.sky_blend,
+                        ground_blend=p.ground_blend,
+                        sky_blur=p.sky_blur,
+                        ground_blur=p.ground_blur,
+                    )
             else:
                 baked = generate_latlong_hdri(
                     self._profile,
@@ -3631,13 +3644,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if self._brush_strokes:
                 baked = apply_brush_strokes(baked, self._brush_strokes)
 
-            if self._pre_bake_snapshot is None:
-                self._pre_bake_snapshot = {
+            # Push previous state onto history stack without keeping live layers in canvas memory
+            self._bake_history.append(
+                {
+                    "baked_hdri": self._baked_canvas_hdri,
+                    "baked_az": float(self._baked_azimuth_offset_deg),
                     "sky_rect": self._sky_rect,
                     "ground_rect": self._ground_rect,
                     "light_regions": [dict(r) for r in self._light_regions],
                     "brush_strokes": [dict(s) for s in self._brush_strokes],
                 }
+            )
+            if len(self._bake_history) > 5:
+                self._bake_history.pop(0)
 
             self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
             self._sky_rect = None
@@ -3647,29 +3666,43 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
             self.unbake_edits_btn.setEnabled(True)
+            self.unbake_edits_btn.setToolTip(
+                f"Step back to previous state ({len(self._bake_history)} saved in history)"
+            )
             self.bake_edits_btn.clearFocus()
             self._regenerate_preview()
             self.status_label.setText(
-                f"Applied & collapsed all edits into fast {baked.shape[1]}x{baked.shape[0]} 32-bit canvas. "
-                "Parameter tweaks are now instant!"
+                f"Applied & collapsed edits into fast {baked.shape[1]}x{baked.shape[0]} 32-bit canvas "
+                f"(history: {len(self._bake_history)}). Parameter tweaks are instant!"
             )
         except Exception as exc:
             self.status_label.setText(f"Bake error: {exc}")
 
     def _on_unbake_edits(self) -> None:
-        if self._baked_canvas_hdri is None:
+        if not self._bake_history and self._baked_canvas_hdri is None:
             return
-        self._baked_canvas_hdri = None
-        self._baked_azimuth_offset_deg = 0.0
-        if self._pre_bake_snapshot is not None:
-            self._sky_rect = self._pre_bake_snapshot.get("sky_rect")
-            self._ground_rect = self._pre_bake_snapshot.get("ground_rect")
-            self._light_regions = [dict(r) for r in self._pre_bake_snapshot.get("light_regions", [])]
-            self._brush_strokes = [dict(s) for s in self._pre_bake_snapshot.get("brush_strokes", [])]
-            self._pre_bake_snapshot = None
-        self.unbake_edits_btn.setEnabled(False)
+        if self._bake_history:
+            prev = self._bake_history.pop()
+            self._baked_canvas_hdri = prev.get("baked_hdri")
+            self._baked_azimuth_offset_deg = float(prev.get("baked_az", 0.0))
+            self._sky_rect = prev.get("sky_rect")
+            self._ground_rect = prev.get("ground_rect")
+            self._light_regions = [dict(r) for r in prev.get("light_regions", [])]
+            self._brush_strokes = [dict(s) for s in prev.get("brush_strokes", [])]
+        else:
+            self._baked_canvas_hdri = None
+            self._baked_azimuth_offset_deg = 0.0
+        has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
+        self.unbake_edits_btn.setEnabled(has_more)
+        self.unbake_edits_btn.setToolTip(
+            f"Step back to previous state ({len(self._bake_history)} saved in history)"
+            if has_more
+            else "Return to live multi-plate synthesis pipeline"
+        )
         self._regenerate_preview()
-        self.status_label.setText("Unbaked: restored live layers & multi-plate synthesis pipeline.")
+        self.status_label.setText(
+            f"Restored previous state ({len(self._bake_history)} remaining in history)."
+        )
 
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(

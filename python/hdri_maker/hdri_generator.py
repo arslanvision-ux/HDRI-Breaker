@@ -423,6 +423,62 @@ def _mirror_extend_rows(
     return filled
 
 
+def apply_sky_ground_inpaint_to_hdri(
+    hdri: np.ndarray,
+    sky_rect: Optional[Tuple[float, float, float, float]] = None,
+    ground_rect: Optional[Tuple[float, float, float, float]] = None,
+    sky_blend: float = 0.35,
+    ground_blend: float = 0.35,
+    sky_blur: float = 0.0,
+    ground_blur: float = 0.0,
+) -> np.ndarray:
+    """
+    Apply newly selected Sky and/or Ground region inpainting directly onto an
+    existing baked 32-bit float Lat/Long HDRI without discarding prior baked edits.
+    """
+    if sky_rect is None and ground_rect is None:
+        return hdri
+    out = np.asarray(hdri, dtype=np.float32).copy()
+    h, w, _ = out.shape
+
+    def _extract_patch(rect: Tuple[float, float, float, float]) -> np.ndarray:
+        u0, v0, u1, v1 = rect
+        x0 = int(np.clip(min(u0, u1) * w, 0, w - 2))
+        x1 = int(np.clip(max(u0, u1) * w, x0 + 2, w))
+        py0 = int(np.clip(min(v0, v1) * h, 0, h - 2))
+        py1 = int(np.clip(max(v0, v1) * h, py0 + 2, h))
+        return out[py0:py1, x0:x1]
+
+    if sky_rect is not None:
+        sky_b = float(np.clip(sky_blend, 0.0, 1.0))
+        cap_h = max(8, int(round(h * (0.18 + 0.27 * sky_b))))
+        cap_h = min(h // 2, cap_h)
+        sky_patch = _extract_patch(sky_rect)
+        sky_tile = _build_seamless_tile(sky_patch, mirror_vertical=False)
+        sky_fill = _tile_fill_region(sky_tile, cap_h, w, flip_vertical=False)
+        sky_cap = _smooth_pole_cap(sky_fill, is_zenith=True, blur_amount=sky_blur)
+        ys = np.arange(cap_h, dtype=np.float32)
+        blend_start = max(0, int(round(cap_h * 0.45)))
+        alpha = (1.0 - _smoothstep(float(blend_start), float(max(blend_start + 1, cap_h - 1)), ys))[:, None, None]
+        out[:cap_h] = out[:cap_h] * (1.0 - alpha) + sky_cap * alpha
+
+    if ground_rect is not None:
+        gnd_b = float(np.clip(ground_blend, 0.0, 1.0))
+        nadir_h = max(8, int(round(h * (0.18 + 0.27 * gnd_b))))
+        nadir_h = min(h // 2, nadir_h)
+        start_y = h - nadir_h
+        gnd_patch = _extract_patch(ground_rect)
+        gnd_tile = _build_seamless_tile(gnd_patch, mirror_vertical=False)
+        gnd_fill = _tile_fill_region(gnd_tile, nadir_h, w, flip_vertical=False)
+        gnd_cap = _smooth_pole_cap(gnd_fill, is_zenith=False, blur_amount=ground_blur)
+        ys = np.arange(nadir_h, dtype=np.float32)
+        blend_end = min(nadir_h - 1, int(round(nadir_h * 0.55)))
+        alpha = _smoothstep(0.0, float(max(1, blend_end)), ys)[:, None, None]
+        out[start_y:] = out[start_y:] * (1.0 - alpha) + gnd_cap * alpha
+
+    return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)
+
+
 _PROJ_CACHE: Optional[Tuple[tuple, np.ndarray, np.ndarray]] = None
 
 
