@@ -819,6 +819,11 @@ def render_preview_srgb(
     src = hdri_pixels.astype(np.float32)
     r_prev = float(np.clip(roughness_preview, 0.0, 1.0))
     if r_prev > 1e-3:
+        sh, sw = src.shape[:2]
+        if sw > 320:
+            step_x = max(1, sw // 320)
+            step_y = max(1, sh // 160)
+            src = src[::step_y, ::step_x]
         src = blur_latlong_hdri(src, blur_amount=min(1.0, (r_prev ** 1.45) * 0.85))
     img = src * float(2.0 ** preview_ev)
     tm = str(tonemap or "aces").strip().lower()

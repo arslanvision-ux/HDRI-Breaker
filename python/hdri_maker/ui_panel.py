@@ -1111,6 +1111,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(120)
         self._preview_timer.timeout.connect(self._regenerate_preview)
+        self._display_timer = QtCore.QTimer(self)
+        self._display_timer.setSingleShot(True)
+        self._display_timer.setInterval(30)
+        self._display_timer.timeout.connect(self._update_preview_pixmap)
+        self._rough_cache: Optional[tuple] = None
+        self._raw_rough_cache: Optional[tuple] = None
 
         self._build_ui()
         self._apply_ui_scale(self.ui_scale_slider.value())
@@ -1680,11 +1686,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_ev_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.preview_ev_slider.setRange(-60, 60)
         self.preview_ev_slider.setValue(0)
-        self.preview_ev_slider.valueChanged.connect(self._update_preview_pixmap)
+        self.preview_ev_slider.valueChanged.connect(self._schedule_display_update)
         ev_row.addWidget(self.preview_ev_slider)
 
         self.preview_ev_val = QtWidgets.QLabel("0.0 EV")
         ev_row.addWidget(self.preview_ev_val)
+        self.preview_ev_reset_btn = QtWidgets.QPushButton("R")
+        self.preview_ev_reset_btn.setMaximumWidth(24)
+        self.preview_ev_reset_btn.setToolTip("Reset Preview EV to 0.0 EV")
+        self.preview_ev_reset_btn.clicked.connect(lambda: self.preview_ev_slider.setValue(0))
+        ev_row.addWidget(self.preview_ev_reset_btn)
 
         ev_row.addWidget(QtWidgets.QLabel("Rough:"))
         self.preview_roughness_slider = QtWidgets.QSlider(Qt.Horizontal)
@@ -1692,8 +1703,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_roughness_slider.setValue(0)
         self.preview_roughness_slider.setMaximumWidth(80)
         self.preview_roughness_slider.setToolTip("Simulate glossy-to-diffuse reflection roughness (0.0 .. 1.0) in the 2:1 preview")
-        self.preview_roughness_slider.valueChanged.connect(self._update_preview_pixmap)
+        self.preview_roughness_slider.valueChanged.connect(self._schedule_display_update)
         ev_row.addWidget(self.preview_roughness_slider)
+        self.preview_roughness_val = QtWidgets.QLabel("0.00")
+        ev_row.addWidget(self.preview_roughness_val)
+        self.preview_roughness_reset_btn = QtWidgets.QPushButton("R")
+        self.preview_roughness_reset_btn.setMaximumWidth(24)
+        self.preview_roughness_reset_btn.setToolTip("Reset Roughness Preview to 0.00")
+        self.preview_roughness_reset_btn.clicked.connect(lambda: self.preview_roughness_slider.setValue(0))
+        ev_row.addWidget(self.preview_roughness_reset_btn)
 
         self.ab_split_btn = QtWidgets.QPushButton("A/B Split")
         self.ab_split_btn.setCheckable(True)
@@ -2858,10 +2876,36 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _on_toggle_ab_split(self, checked: bool) -> None:
         if checked and self._profile is not None:
-            self._regenerate_preview()
+            if getattr(self, "_raw_hdri_pixels", None) is None:
+                p = self._current_synthesis_params()
+                raw_p = HDRISynthesisParams(
+                    width=min(p.width, 1024),
+                    height=min(p.height, 512),
+                    azimuth_offset_deg=p.azimuth_offset_deg,
+                    vertical_shift_deg=p.vertical_shift_deg,
+                    plate_projection_blend=1.0,
+                    stitch_blend=p.stitch_blend,
+                    enable_inpaint=False,
+                    ldr_highlight_boost=1.0,
+                )
+                self._raw_hdri_pixels = generate_latlong_hdri(
+                    self._profile,
+                    raw_p,
+                    views=self._views if len(self._views) <= 12 else self._views[:1],
+                )
+            self._update_preview_pixmap()
         else:
             self.preview_label.set_ab_split(False)
             self._update_preview_pixmap()
+
+    def _schedule_display_update(self) -> None:
+        ev = self.preview_ev_slider.value() / 10.0
+        self.preview_ev_val.setText(f"{ev:+.1f} EV")
+        if hasattr(self, "preview_roughness_val"):
+            self.preview_roughness_val.setText(f"{self.preview_roughness_slider.value() / 100.0:.2f}")
+        if self._suppress_auto_preview:
+            return
+        self._display_timer.start()
 
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -3146,22 +3190,46 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             srgb = np.clip(diff_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
         else:
             rough = (self.preview_roughness_slider.value() / 100.0) if hasattr(self, "preview_roughness_slider") else 0.0
+            if hasattr(self, "preview_roughness_val"):
+                self.preview_roughness_val.setText(f"{rough:.2f}")
+
+            def _get_display_src(arr: np.ndarray, cache_attr: str, rough_val: float) -> np.ndarray:
+                cached = getattr(self, cache_attr, None)
+                arr_id = id(arr)
+                if cached is not None and cached[0] == arr_id and abs(cached[1] - rough_val) < 1e-4:
+                    return cached[2]
+                sh, sw = arr.shape[:2]
+                # Cap display buffer at 1024x512 (or 320x160 when roughness blur > 0) for instant EV/Rough dragging
+                max_w = 320 if rough_val > 1e-3 else 1024
+                if sw > max_w:
+                    step = max(1, sw // max_w)
+                    disp = arr[::step, ::step]
+                else:
+                    disp = arr
+                if rough_val > 1e-3:
+                    from .hdri_generator import blur_latlong_hdri
+                    disp = blur_latlong_hdri(disp, blur_amount=min(1.0, (rough_val ** 1.45) * 0.85))
+                setattr(self, cache_attr, (arr_id, rough_val, disp))
+                return disp
+
+            disp_src = _get_display_src(self._hdri_pixels, "_rough_cache", rough)
             srgb = render_preview_srgb(
-                self._hdri_pixels,
+                disp_src,
                 preview_ev=ev,
                 tonemap=tm_mode,
-                roughness_preview=rough,
+                roughness_preview=0.0,
             )
             if (
                 hasattr(self, "ab_split_btn")
                 and self.ab_split_btn.isChecked()
                 and getattr(self, "_raw_hdri_pixels", None) is not None
             ):
+                raw_disp_src = _get_display_src(self._raw_hdri_pixels, "_raw_rough_cache", rough)
                 raw_srgb = render_preview_srgb(
-                    self._raw_hdri_pixels,
+                    raw_disp_src,
                     preview_ev=ev,
                     tonemap=tm_mode,
-                    roughness_preview=rough,
+                    roughness_preview=0.0,
                 )
                 rh, rw, _ = raw_srgb.shape
                 rqimg = QtGui.QImage(raw_srgb.data, rw, rh, 3 * rw, QtGui.QImage.Format_RGB888)
