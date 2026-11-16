@@ -10,7 +10,7 @@ Welcome to the **HDRI Breaker** documentation. Click any highlighted section or 
 
 | Section | Focus | Direct Link |
 | :--- | :--- | :--- |
-| **Brackets & RAW Setup** | Shooting `-2 / 0 / +2 EV` brackets, **Merge Brackets...**, Phone/iPhone `.dng` / `.heic` & Camera RAWs | **[Open Brackets & RAW Guide →](tutorials/01_brackets_and_raw.md)** |
+| **Brackets & RAW Setup** | Shooting `-2 / 0 / +2 EV` brackets, **Batch Brackets...** (full 360° auto-group & merge), **Merge Brackets...**, Phone/iPhone `.dng` / `.heic` & Camera RAWs | **[Open Brackets & RAW Guide →](tutorials/01_brackets_and_raw.md)** |
 | **1. Plate / Sequence Input** | Loading plates, `$F4` sequences, **Auto 360°**, **Auto-Align**, **Equalize EV**, **Unify FOV**, `↑`/`↓`, checkboxes | **[Open Section 1 Guide →](tutorials/02_plate_input_and_alignment.md)** |
 | **2. Extracted Lighting Data** | Reading **DR**, **Key/Fill**, **EV100**, **CCT**, **Duv**, Tonal Swatches, and Hotspot Table | **[Open Section 2 Guide →](tutorials/03_lighting_analysis.md)** |
 | **3. 32-bit Synthesis Tuning** | **Exposure**, **Hotspot Boost**, **Sky/Ground Gain**, **Target CCT**, **Horizon Shift / Auto-Level**, **Physical Sky Fill** | **[Open Section 3 Guide →](tutorials/04_synthesis_tuning.md)** |

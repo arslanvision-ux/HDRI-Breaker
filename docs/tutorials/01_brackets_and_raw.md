@@ -35,13 +35,35 @@ HDRI Breaker supports:
 
 ---
 
-## 3. Merging Brackets with `Merge Brackets...`
+## 3. Merging Brackets (Single Angle vs. Full 360° Batch)
 
+Building a 360° HDRI from bracketed shots works in **2 stages**:
+1. **Brackets → 1 Tile per Direction**: Multiple exposures (`-2, 0, +2 EV`) of the same camera view merge into **one 32-bit `.exr` tile**.
+2. **All Direction Tiles → 1 360° Environment Map**: All merged tiles stitch around the sphere to build the final **2:1 Lat/Long HDRI**.
+
+### Method A: 1-Click Full 360° Shoot (`Batch Brackets...` — Recommended)
+Suppose you shot **8 angles × 3 brackets = 24 photos**:
+1. In **1. Plate / Sequence Input**, click **Batch Brackets...**.
+2. Select **all 24 photos** at once.
+3. Enter **`3`** *(brackets per angle)* — or leave **`0`** to auto-detect by EXIF timestamp gaps / EV cycle.
+4. HDRI Breaker automatically:
+   - Merges each group of 3 into a 32-bit `.exr` (`angle_01... [3 brackets]`, `angle_02... [3 brackets]`, ...).
+   - Places all 8 merged angle rows into the Multi-Position table (hover any row to see its source bracket filenames), spreads them across 360°, and builds the **2:1 Lat/Long environment map**.
+5. Finish the stitch:
+   - Click **Auto-Align (Spherical)** → **Equalize EV**.
+   - Fill missing zenith/nadir with **Pick Sky Area** / **Pick Ground Area** and clean seams/tripod with **Brush Paint (`B`)**.
+   - Click **Apply / Collapse (`Ctrl+Enter`)** → **Generate 32-bit Float EXR**.
+
+### Method B: Merging Raw Rows Already in the Multi-Position Table
+1. Hold `Ctrl`/`Shift` and select the rows belonging to **Angle 1** (e.g., 3 exposures of the same view).
+2. **Right-Click → `Merge Selected Rows as Brackets (3)`** — they collapse into a single `[3 brackets]` `.exr` row in place.
+3. Repeat for **Angle 2, Angle 3, ...** until each row represents one direction, then click **Auto 360°** → **Analyze Plate(s) & Generate Preview**.
+
+### Method C: Single Angle Only (`Merge Brackets...`)
 1. In **1. Plate / Sequence Input**, click **Merge Brackets...**.
 2. Select the **2+ bracketed files for ONE camera angle**.
-3. HDRI Breaker merges them using irradiance weighting into a single unclamped **32-bit float Linear Rec.709 `.exr`** saved next to your source files and places it in **Plate Path**.
-4. Keep **Input Mode → Color** on `Auto`.
-5. *(For multi-angle 360° shoots)* Repeat **Merge Brackets...** for each angle, then load all the resulting `*.exr` files in **[Section 1: Plate / Sequence Input](02_plate_input_and_alignment.md)**.
+3. HDRI Breaker merges them using EXIF `EV100` (or luminance-ratio) irradiance weighting into a single unclamped **32-bit float Linear Rec.709 `.exr`** saved next to your source files and places it in **Plate Path**.
+4. Keep **Input Mode → Color** on `Auto` and click **Analyze Plate(s) & Generate Preview**.
 
 ---
 
