@@ -52,6 +52,7 @@ from .lighting_analyzer import (
 )
 from .plate_io import (
     batch_merge_bracket_groups,
+    detect_circular_fisheye,
     group_bracket_sequences,
     linear_to_srgb,
     merge_ldr_brackets_to_hdr,
@@ -4698,17 +4699,28 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if paths:
                 self.status_label.setText("Select bracketed photos from 2+ angles (or use Merge Brackets... for 1 angle).")
             return
-        n_per, ok = QtWidgets.QInputDialog.getInt(
-            self,
-            "Batch Bracket Grouping",
-            "Brackets per camera angle (0 = Auto-detect by EXIF timestamp / EV cycle):",
-            0,
-            0,
-            15,
-            1,
-        )
-        if not ok:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Batch Bracket Grouping & Auto-Setup")
+        dlg_lay = QtWidgets.QVBoxLayout(dlg)
+        form_l = QtWidgets.QFormLayout()
+        n_spin = QtWidgets.QSpinBox()
+        n_spin.setRange(0, 15)
+        n_spin.setValue(0)
+        n_spin.setToolTip("0 = Auto-detect groups from EXIF timestamps / EV cycles; or enter exact brackets per angle (e.g. 3, 4, 5)")
+        form_l.addRow("Brackets per angle (0 = Auto):", n_spin)
+        auto_setup_chk = QtWidgets.QCheckBox("Auto-detect Lens (Fisheye/Rectilinear), 360° Layout, Auto-Align & Equalize EV")
+        auto_setup_chk.setChecked(True)
+        form_l.addRow("", auto_setup_chk)
+        dlg_lay.addLayout(form_l)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        dlg_lay.addWidget(btns)
+        exec_fn = getattr(dlg, "exec", None) or getattr(dlg, "exec_", None)
+        if exec_fn() != QtWidgets.QDialog.Accepted:
             return
+        n_per = int(n_spin.value())
+        do_auto_setup = bool(auto_setup_chk.isChecked())
         try:
             self._push_undo_snapshot("Batch Merge Brackets")
             groups = group_bracket_sequences(paths, frames_per_angle=(n_per if n_per >= 2 else None))
@@ -4717,7 +4729,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     self,
                     "Batch Bracket Grouping",
                     "Auto-detect found only 1 image per group (timestamps were >3.5s apart).\n"
-                    "Please re-run Batch Brackets and enter the exact number of brackets per angle (e.g. 3 or 5).",
+                    "Please re-run Batch Brackets and enter the exact number of brackets per angle (e.g. 3, 4, or 5).",
                 )
                 return
             self.status_label.setText(f"Merging {len(groups)} bracketed angle group(s) to 32-bit EXR...")
@@ -4730,22 +4742,37 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             total = len(exr_paths)
             fov = self.fov_spin.value()
             el = self.cam_el_spin.value()
+            fisheye_count = 0
             for i, p in enumerate(exr_paths):
                 az = i * (360.0 / float(max(total, 1)))
                 if az > 180.0:
                     az -= 360.0
                 grp_srcs = groups[i] if i < len(groups) else []
                 grp_fov = fov
+                grp_lens = "rectilinear"
                 if grp_srcs:
                     m0 = read_plate_metadata(grp_srcs[0])
                     if m0.get("fov_h_deg") is not None:
                         grp_fov = float(m0["fov_h_deg"])
-                self._add_multiview_row(p, az, el, grp_fov, "Auto", bracket_sources=grp_srcs)
+                if do_auto_setup:
+                    try:
+                        probe = read_plate(p, colorspace="Auto", max_dim=128)
+                        if detect_circular_fisheye(probe.pixels):
+                            grp_lens = "fisheye_equidistant"
+                            grp_fov = 180.0
+                            fisheye_count += 1
+                    except Exception:
+                        pass
+                self._add_multiview_row(p, az, el, grp_fov, "Auto", lens_type=grp_lens, bracket_sources=grp_srcs)
             self._maybe_update_default_output_path(exr_paths[0])
             self._on_analyze_clicked()
+            if do_auto_setup and len(exr_paths) >= 2:
+                self._on_auto_align_plates()
+                self._on_equalize_plate_exposures()
             self._commit_undo_baseline()
+            lens_note = f" (auto-detected {fisheye_count} circular fisheye)" if fisheye_count else ""
             self.status_label.setText(
-                f"Batch-merged {len(paths)} photos into {len(exr_paths)} 32-bit EXR angle(s) and analyzed."
+                f"Batch-merged {len(paths)} photos into {len(exr_paths)} 32-bit EXR angle(s){lens_note}."
             )
         except Exception as exc:
             self.status_label.setText(f"Batch bracket merge error: {exc}")

@@ -1084,6 +1084,23 @@ def group_bracket_sequences(
     return groups
 
 
+def detect_circular_fisheye(pixels: np.ndarray) -> bool:
+    """Return True if an image exhibits dark circular-fisheye corners with a lit center."""
+    if pixels is None or pixels.ndim < 3:
+        return False
+    ih, iw = pixels.shape[:2]
+    if ih < 16 or iw < 16:
+        return False
+    c_pts = np.array(
+        [pixels[2, 2], pixels[2, iw - 3], pixels[ih - 3, 2], pixels[ih - 3, iw - 3]],
+        dtype=np.float32,
+    )
+    c_lum = float(np.max(0.2126 * c_pts[:, 0] + 0.7152 * c_pts[:, 1] + 0.0722 * c_pts[:, 2]))
+    mid_p = pixels[ih // 2, iw // 2]
+    m_lum = float(0.2126 * mid_p[0] + 0.7152 * mid_p[1] + 0.0722 * mid_p[2])
+    return c_lum < 0.015 and m_lum > 0.02
+
+
 def batch_merge_bracket_groups(
     groups: List[List[str]],
     out_dir: Optional[str] = None,
