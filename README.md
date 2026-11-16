@@ -108,22 +108,22 @@ Double-click **`install_to_houdini.bat`** (or run `python scripts/install.py`).
 ## Complete UI & Parameter Reference
 
 <p align="center">
-  <img src="docs/hdri_breaker_ui_overview.jpg" alt="HDRI Breaker Full UI Overview" width="100%" />
+  <img src="docs/hdri_breaker_ui_updated.jpg" alt="HDRI Breaker Full UI Overview" width="100%" />
 </p>
 
-### 1. Plate / Sequence Input
+### 1. Plate / Sequence Input *(Collapsible)*
 
 | Control | Description |
 | :--- | :--- |
-| **Plate Path** + **Browse...** | Path to a single frame (`.exr`, `.hdr`, `.jpg`, `.png`, `.tif`, `.raw`) or sequence using `$F4` / `####`. |
+| **Plate Path** + **Browse...** | Path to a single frame (`.exr`, `.hdr`, `.jpg`, `.png`, `.tif`, `.dng`, `.heic`, `.cr2`, `.nef`, `.arw`) or sequence using `$F4` / `####`. |
 | **Merge Brackets...** | Merges multiple bracketed exposures (e.g., `-2 EV`, `0 EV`, `+2 EV`) into a single 32-bit linear `.exr`. |
 | **Input Mode: Color** | Input color space (`Auto`, `sRGB`, `Linear Rec.709`, `ACEScg`). |
 | **Input Mode: Mode** | `Single Frame`, `Sequence Master (Stabilized)`, or `Per-Frame Sequence`. |
 | **Frames (`Limit Range`, `Start`, `End`, `Step`)** | Restricts frame range and sampling step when analyzing image sequences. |
 | **Camera Map (`FOV°`, `Az°`, `El°`)** | Horizontal field of view, azimuth, and elevation angle for the active plate projection. |
 | **Detection (`Max Hotspots`, `LDR Boost`)** | Maximum number of automatic light hotspots to detect and dynamic-range boost factor for 8-bit/LDR inputs. |
-| **Multi-Position Grid** (`Add Plates...`, `Add Current`, `Remove`, `Auto 360°`, `Auto-Align (Spherical)`, `Clear`, `Equalize EV`) | Manage multi-angle plates: distribute angles evenly around 360°, auto-align overlapping spherical seams, clear the list, or normalize exposure differences across shots. |
-| **Multi-View Table** | Lists each loaded plate with thumbnail, filename, `Az°`, `El°`, `FOV°`, `Color` space, and quick remove (`×`). |
+| **Multi-Position Grid** (`Add Plates...`, `Add Current`, `Remove`, `Auto 360°`, `Auto-Align (Spherical)`, `Clear`, `Equalize EV`, `Unify FOV`, `↑`/`↓`) | Manage multi-angle plates: distribute angles around 360°, auto-align overlapping seams, equalize exposure, unify mismatched FOVs, or reorder blend priority. |
+| **Multi-View Table** | Lists each loaded plate with enable/disable checkbox, thumbnail, filename, `Az°`, `El°`, `FOV°`, `Color` space, and quick remove (`×`). |
 | **Analyze Plate(s) & Generate Preview** | Runs lighting extraction, spherical projection, and builds the live 2:1 Lat/Long preview. |
 
 ---
@@ -164,15 +164,16 @@ Double-click **`install_to_houdini.bat`** (or run `python scripts/install.py`).
 
 ### Lat/Long 2:1 HDRI Preview & Interactive Tools (Right Top)
 
-- **Preview Canvas & Inspector**: Displays the live 2:1 equirectangular HDRI. Hovering updates the bottom readout (`Az°`, `El°`, `UV`, `Linear RGB`, `Lum`, and `EV vs 18% Gray`).
-- **View / Preview EV / Zoom (`-`, `1.0x`, `+`)**: Switch tone-mapping (`ACES`, `False Color (EV)`, `Reinhard`, `Linear`, `Overlap Diff`), scrub viewport exposure without altering export values, and zoom/pan the preview.
+- **Preview Canvas, Mode HUD & Drag-and-Drop**: Displays the live 2:1 equirectangular HDRI with an on-canvas mode pill, shortcut hints, and direct file drop support. Hovering updates the inspector readout (`Az°`, `El°`, `RGB`, `Lum`, and `EV vs 18% Gray`).
+- **View / Preview EV / Roughness / Zoom (`-`, `1.0x`, `+`, `⤢`)**: Switch tone-mapping (`ACES`, `False Color (EV)`, `Reinhard`, `Linear`, `Overlap Diff`), scrub viewport exposure or reflection roughness, zoom/pan, or click **`⤢`** to expand/restore the viewport.
 - **Hotspot Markers**: Toggles overlays showing detected hotspots and custom `SKY`, `GROUND`, and `LIGHT #` regions.
-- **Move / Align Plates**: Enables interactive dragging on the canvas and opens the **Plate Transform Bar** (`Plate`, `Az°`, `El°`, `Roll°`, `FOV°`, `ScaleX`, `ScaleY`, `Warp`, `EV`, `Vignette`, `Lens` model, `Mask Area`, `Clear Masks`, `Reset`).
-- **Pick Sky Area / Pick Ground Area**: Draw a region on the preview to sample/guide sky or ground synthesis.
+- **Move / Align Plates (`E`)**: Drag plates on the canvas, adjust Roll/Scale/Warp, or **Right-Click** any plate for quick actions (**Hide**, **Solo**, **Show All**, **Move Up/Down**, **Auto Vignette**, **Reset Transform**, **Delete**).
+- **Pick Sky Area / Pick Ground Area**: Draw a region on the preview to sample/guide sky or ground synthesis (works both live and layered on top of an Apply/Collapse canvas).
 - **Pick Light Area** (`Rectangle` / `Circle`): Draw a region around a bright light source to extract it as a textured Solaris Area Light (or paint it out).
 - **Pick Neutral WB / Macbeth WB... / Reset WB**: Drag across a neutral surface (or match a Macbeth patch) to calibrate white balance and exposure; **Reset WB** restores defaults.
-- **Inpaint Light Out / Undo Light / Clear Areas**: When **Inpaint Light Out** is checked, picked light areas are smoothly painted out of the HDRI dome (ideal for avoiding double lighting with Solaris Area Lights, or simply cleaning up unwanted hotspots in a pure HDRI).
-- **Light Area Blur / Light Tex Res**: Edge softness and output resolution (`256 x 256` to `2048 x 2048`) for extracted area light textures.
+- **Brush Paint (`B`) & Contextual Brush Bar**: Opens 32-bit float painting tools (**Heal / Inpaint**, **Clone Stamp**, **Blur / Smooth**, **Burn**, **Dodge**, **Desaturate**) with per-stroke `Ctrl+Z` undo.
+- **Apply / Collapse (`Ctrl+Enter`) & Unbake (`N`)**: Collapses plate stitching, sky/ground/light fills, and brush strokes into a fast 32-bit canvas while saving up to 5 bake checkpoints for **Unbake**.
+- **Footer Controls**: Global **Undo: \<Action\> (`Ctrl+Z`)**, **Reset All**, **Tools ▾** (`Save State`, `Load State`, `Debug Log`, `Reload Code`), **Theme**, and **Scale**.
 
 ---
 
