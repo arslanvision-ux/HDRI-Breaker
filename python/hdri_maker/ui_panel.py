@@ -3075,6 +3075,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._sync_view_to_table_and_bar(r)
         if self._views:
             self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(f"Unified all {n_rows} plate(s) to FOV {target_fov:.1f}° (Scale X/Y = 1.0).")
 
     def _on_browse_output(self) -> None:
@@ -3390,6 +3392,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.set_pick_mode(None)
         self._commit_undo_baseline()
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText("Cleared custom Sky/Ground/Light areas.")
 
     def _on_preview_rect_selected(self, mode: str, rect: tuple) -> None:
@@ -3502,6 +3506,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         finally:
             self._suppress_auto_preview = False
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(
             f"Calibrated neutral patch ({patch_cct:.0f} K, Duv {duv:+.4f}, Lum {lum:.3f}) -> "
             f"WB Gains ({self._wb_gains[0]:.3f}, {self._wb_gains[1]:.3f}, {self._wb_gains[2]:.3f})."
@@ -3547,6 +3553,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             finally:
                 self._suppress_auto_preview = False
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(
             f"Applied {source_label} WB Gains: "
             f"(R={self._wb_gains[0]:.3f}, G={self._wb_gains[1]:.3f}, B={self._wb_gains[2]:.3f})."
@@ -3560,6 +3568,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._refresh_undo_ui()
         self._wb_gains = (1.0, 1.0, 1.0)
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText("Reset White Balance gains to (1.000, 1.000, 1.000).")
 
     def _on_undo_wb(self) -> bool:
@@ -3573,6 +3583,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         finally:
             self._suppress_auto_preview = False
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(
             f"Undid White Balance -> Gains ({self._wb_gains[0]:.3f}, {self._wb_gains[1]:.3f}, {self._wb_gains[2]:.3f})."
         )
@@ -3918,6 +3930,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._views[idx].vignette_v1 = v1
         self._sync_view_to_table_and_bar(idx)
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(f"Estimated Plate #{idx + 1} Vignette lift = {v1:.2f}.")
 
     def _on_toggle_ab_split(self, checked: bool) -> None:
@@ -4121,6 +4135,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._update_preview_pixmap()
         else:
             self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(f"Undid last brush stroke ({len(self._brush_strokes)} remaining).")
 
     def _on_clear_brush(self) -> None:
@@ -4134,6 +4150,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._update_preview_pixmap()
         else:
             self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText("Cleared all brush strokes.")
 
     def _on_bake_edits_to_canvas(self) -> None:
@@ -4242,7 +4260,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.unbake_edits_btn.setToolTip(
                 f"Step back to previous state ({len(self._bake_history)} saved in history)"
             )
-            self._undo_stack.append({"kind": "bake", "label": "Apply / Collapse"})
+            self._undo_stack.clear()
+            self._action_undo_stack.clear()
+            self._commit_undo_baseline()
             self._refresh_undo_ui()
             self.bake_edits_btn.clearFocus()
             self._regenerate_preview()
@@ -4278,6 +4298,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             else "Return to live multi-plate synthesis pipeline"
         )
         self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self.status_label.setText(
             f"Restored previous state ({len(self._bake_history)} remaining in history)."
         )
