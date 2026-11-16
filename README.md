@@ -21,6 +21,10 @@
 </p>
 
 <p align="center">
+  <img src="docs/hdri_breaker_brackets_fisheye_result.jpg" alt="Batch Brackets Circular Fisheye 360° HDRI Stitch" width="100%" />
+</p>
+
+<p align="center">
   <a href="https://buymeacoffee.com/arslansvision/hdri-breaker-solaris-32-bit-float-lat-long-studio">
     <img src="https://img.shields.io/badge/Support%20HDRI%20Breaker-Buy%20Me%20a%20Coffee%20%E2%98%95-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=000000" alt="Support HDRI Breaker — Buy Me a Coffee" />
   </a>

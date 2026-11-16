@@ -2,7 +2,11 @@
 
 # Exposure Brackets Setup, Merging & Phone/Camera RAW
 
+![Batch Brackets Circular Fisheye 360° HDRI Result](../hdri_breaker_brackets_fisheye_result.jpg)
+
 Shooting and merging exposure brackets is the best way to capture **true unclamped HDR dynamic range** (sun, sky, and deep shadows) using a standard DSLR, mirrorless camera, or smartphone.
+
+> **Free Practice Sample Dataset**: Want to test right away? Download the 12 sample bracketed fisheye photos in **[`docs/samples/tutorial5/`](../samples/tutorial5/)** (3 camera angles × 4 exposures each, 26.8 EV dynamic range).
 
 ---
 
@@ -42,17 +46,21 @@ Building a 360° HDRI from bracketed shots works in **2 stages**:
 2. **All Direction Tiles → 1 360° Environment Map**: All merged tiles stitch around the sphere to build the final **2:1 Lat/Long HDRI**.
 
 ### Method A: 1-Click Full 360° Shoot (`Batch Brackets...` — Recommended)
-Suppose you shot **8 angles × 3 brackets = 24 photos**:
+Suppose you shot **3 angles × 4 brackets = 12 photos** (like the included [`tutorial5`](../samples/tutorial5/) sample set):
 1. In **1. Plate / Sequence Input**, click **Batch Brackets...**.
-2. Select **all 24 photos** at once.
-3. Enter **`3`** *(brackets per angle)* — or leave **`0`** to auto-detect by EXIF timestamp gaps / EV cycle.
+2. Select **all 12 photos** (`DSC01318.jpg` – `DSC01329.jpg`) at once.
+3. In the **Batch Bracket Grouping & Auto-Setup** dialog:
+   - **Brackets per angle**: Enter **`4`** *(or leave **`0`** when your brackets have >3.5 s pauses between angles or alternating EV cycles)*.
+   - Keep **`☑ Auto-detect Lens (Fisheye/Rectilinear), 360° Layout, Auto-Align & Equalize EV`** checked *(uncheck if you prefer manual setup)*.
 4. HDRI Breaker automatically:
-   - Merges each group of 3 into a 32-bit `.exr` (`angle_01... [3 brackets]`, `angle_02... [3 brackets]`, ...).
-   - Places all 8 merged angle rows into the Multi-Position table (hover any row to see its source bracket filenames), spreads them across 360°, and builds the **2:1 Lat/Long environment map**.
-5. Finish the stitch:
-   - Click **Auto-Align (Spherical)** → **Equalize EV**.
-   - Fill missing zenith/nadir with **Pick Sky Area** / **Pick Ground Area** and clean seams/tripod with **Brush Paint (`B`)**.
-   - Click **Apply / Collapse (`Ctrl+Enter`)** → **Generate 32-bit Float EXR**.
+   - Merges each group of 4 exposures into a 32-bit `.exr` (`angle_01... [4 brackets]`, `angle_02... [4 brackets]`, `angle_03... [4 brackets]`).
+   - Detects circular fisheye dark corners and sets **`Lens = fisheye_equidistant`**, **`FOV° = 180.0`** (or `rectilinear` + EXIF FOV for standard lenses).
+   - Spreads all angles across `360°`, runs **Analyze**, **Auto-Align (Spherical)**, and **Equalize EV**.
+   - *(Tip: Hover any `[N brackets]` row or right-click → **Inspect Bracket Group** to verify its source files, or drag the bar below the table to resize the plate list.)*
+5. Finish the HDRI:
+   - Fine-tune manually if needed with **Move / Align Plates (`E`)** (right-click any plate on the canvas to **Hide**, **Solo**, **Reorder**, or **Delete**).
+   - Fill missing zenith/nadir with **Pick Sky Area** / **Pick Ground Area** (or **Nadir Cleanup**) and clean seams with **Brush Paint (`B`)**.
+   - Click **Apply / Collapse (`Ctrl+Enter`)** → set final **Resolution** → **Generate 32-bit Float EXR**.
 
 ### Method B: Merging Raw Rows Already in the Multi-Position Table
 1. Hold `Ctrl`/`Shift` and select the rows belonging to **Angle 1** (e.g., 3 exposures of the same view).
