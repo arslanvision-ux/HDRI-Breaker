@@ -788,6 +788,15 @@ def project_multiview_plates_to_latlong(
             ndc_x = (cam_x / safe_z) / tan_half_fov_x
             ndc_y = (cam_y / safe_z) / tan_half_fov_y
 
+        is_circular_fisheye = False
+        if lens in ("fisheye_equidistant", "fisheye_equisolid") and iw >= 16 and ih >= 16:
+            c_pts = np.array([img[2, 2], img[2, iw - 3], img[ih - 3, 2], img[ih - 3, iw - 3]], dtype=np.float32)
+            c_lum = float(np.max(0.2126 * c_pts[:, 0] + 0.7152 * c_pts[:, 1] + 0.0722 * c_pts[:, 2]))
+            mid_p = img[ih // 2, iw // 2]
+            m_lum = float(0.2126 * mid_p[0] + 0.7152 * mid_p[1] + 0.0722 * mid_p[2])
+            if c_lum < 0.015 and m_lum > 0.02:
+                is_circular_fisheye = True
+
         r2_all = ndc_x * ndc_x + ndc_y * ndc_y
         if abs(k1) > 1e-6:
             dist = 1.0 + k1 * r2_all
@@ -798,6 +807,9 @@ def project_multiview_plates_to_latlong(
             src_x = ndc_x
             src_y = ndc_y
             inside = in_front & (np.abs(src_x) <= 1.0) & (np.abs(src_y) <= 1.0)
+        if is_circular_fisheye:
+            r_circ_all = np.hypot(src_x, src_y / max(iw / float(max(ih, 1)), 1e-4))
+            inside = inside & (r_circ_all <= 0.985)
 
         iy_loc, ix = np.where(inside)
         if len(iy_loc) == 0:
@@ -813,6 +825,9 @@ def project_multiview_plates_to_latlong(
         edge_x = np.clip((1.0 - np.abs(nx_in)) / f_w, 0.0, 1.0)
         edge_y = np.clip((1.0 - np.abs(ny_in)) / f_w, 0.0, 1.0)
         feather = (edge_x * edge_y).astype(np.float32)
+        if is_circular_fisheye:
+            r_circ_in = r_circ_all[iy_loc, ix]
+            feather = (feather * np.clip((0.985 - r_circ_in) / f_w, 0.0, 1.0)).astype(np.float32)
 
         # Exclude masked plate regions (u, v in [0, 1])
         ex_rects = getattr(view, "exclude_rects", None)

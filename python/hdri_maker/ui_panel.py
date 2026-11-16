@@ -2477,7 +2477,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.pt_az_spin = _mk_spin(-360.0, 360.0, 0.0, 1.0, 1)
         self.pt_el_spin = _mk_spin(-89.0, 89.0, 0.0, 1.0, 1)
         self.pt_roll_spin = _mk_spin(-180.0, 180.0, 0.0, 1.0, 1)
-        self.pt_fov_spin = _mk_spin(10.0, 165.0, 90.0, 1.0, 1)
+        self.pt_fov_spin = _mk_spin(10.0, 210.0, 90.0, 1.0, 1)
         self.pt_sx_spin = _mk_spin(0.3, 3.0, 1.0, 0.02, 2)
         self.pt_sy_spin = _mk_spin(0.3, 3.0, 1.0, 0.02, 2)
         self.pt_warp_spin = _mk_spin(-0.45, 0.45, 0.0, 0.01, 2)
@@ -3567,7 +3567,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             roll = (v.cam_roll_deg + du * 240.0 + 180.0) % 360.0 - 180.0
             v.cam_roll_deg = roll
         elif mode == "scale":
-            v.fov_h_deg = float(np.clip(v.fov_h_deg + (du - dv) * 140.0, 10.0, 165.0))
+            v.fov_h_deg = float(np.clip(v.fov_h_deg + (du - dv) * 140.0, 10.0, 210.0))
         elif mode == "warp":
             v.warp_k1 = float(np.clip(v.warp_k1 + du * 1.0, -0.45, 0.45))
         self._refresh_plate_transform_bar()
@@ -3588,7 +3588,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         v = self._views[idx]
         step = 2.0 if delta > 0 else -2.0
-        v.fov_h_deg = float(np.clip(v.fov_h_deg + step, 10.0, 165.0))
+        v.fov_h_deg = float(np.clip(v.fov_h_deg + step, 10.0, 210.0))
         self._sync_view_to_table_and_bar(idx)
         self._schedule_preview_update()
 
