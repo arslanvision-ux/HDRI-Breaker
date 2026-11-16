@@ -9,6 +9,10 @@ from __future__ import annotations
 import math
 import os
 import re
+import shutil
+import struct
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,8 +40,303 @@ except ImportError:
     HAS_HOU = False
 
 
-LDR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tga"}
+LDR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tga", ".tif", ".tiff"}
 HDR_EXTENSIONS = {".exr", ".hdr", ".pic", ".rat"}
+RAW_EXTENSIONS = {
+    ".dng", ".cr2", ".cr3", ".nef", ".nrw", ".arw", ".srf", ".sr2",
+    ".raf", ".orf", ".rw2", ".pef", ".srw", ".rwl", ".3fr", ".iiq",
+    ".gpr", ".raw",
+}
+HEIF_EXTENSIONS = {".heic", ".heif"}
+
+
+def _read_exif_from_tiff_container(path: str) -> Dict[str, Any]:
+    """Pure-Python TIFF/EXIF IFD parser for DNG/CR2/NEF/ARW/TIFF Orientation & FocalLength."""
+    out: Dict[str, Any] = {}
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return out
+            if hdr[:2] == b"II":
+                bo = "<"
+            elif hdr[:2] == b"MM":
+                bo = ">"
+            else:
+                return out
+            magic = struct.unpack(bo + "H", hdr[2:4])[0]
+            if magic != 42:
+                return out
+            ifd0_off = struct.unpack(bo + "I", hdr[4:8])[0]
+
+            def _read_ifd(offset: int) -> Dict[int, Any]:
+                tags: Dict[int, Any] = {}
+                if offset <= 0:
+                    return tags
+                f.seek(offset)
+                raw_cnt = f.read(2)
+                if len(raw_cnt) < 2:
+                    return tags
+                cnt = struct.unpack(bo + "H", raw_cnt)[0]
+                if cnt > 512:
+                    return tags
+                entries = f.read(cnt * 12)
+                for i in range(0, len(entries) - 11, 12):
+                    tag, typ, nval, val_off = struct.unpack(bo + "HHII", entries[i : i + 12])
+                    if typ == 3 and nval == 1:  # SHORT
+                        v = struct.unpack(bo + "H", entries[i + 8 : i + 10])[0]
+                        tags[tag] = v
+                    elif typ == 4 and nval == 1:  # LONG
+                        tags[tag] = val_off
+                    elif typ == 5 and nval == 1:  # RATIONAL
+                        cur = f.tell()
+                        f.seek(val_off)
+                        rb = f.read(8)
+                        f.seek(cur)
+                        if len(rb) == 8:
+                            num, den = struct.unpack(bo + "II", rb)
+                            if den != 0:
+                                tags[tag] = float(num) / float(den)
+                return tags
+
+            ifd0 = _read_ifd(ifd0_off)
+            if 274 in ifd0:
+                out["orient"] = int(ifd0[274])
+            exif_off = ifd0.get(34665)
+            if exif_off:
+                exif_ifd = _read_ifd(int(exif_off))
+                if 41989 in exif_ifd:
+                    out["focal_35"] = float(exif_ifd[41989])
+                if 37386 in exif_ifd:
+                    out["focal_mm"] = float(exif_ifd[37386])
+    except Exception:
+        pass
+    return out
+
+
+def _decode_with_windows_wic(path: str) -> Optional[np.ndarray]:
+    """Decode DNG/RAW/HEIC via Windows Imaging Component (PresentationCore) if codecs are installed."""
+    if os.name != "nt":
+        return None
+    tmp_png = None
+    try:
+        fd, tmp_png = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        ps_script = (
+            "Add-Type -AssemblyName PresentationCore; "
+            f"$src = '{path.replace(chr(39), chr(39)*2)}'; "
+            f"$dst = '{tmp_png.replace(chr(39), chr(39)*2)}'; "
+            "$stream = [System.IO.File]::OpenRead($src); "
+            "try { "
+            "$dec = [System.Windows.Media.Imaging.BitmapDecoder]::Create($stream, "
+            "[System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, "
+            "[System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad); "
+            "$enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder; "
+            "$enc.Frames.Add($dec.Frames[0]); "
+            "$out = [System.IO.File]::Create($dst); "
+            "try { $enc.Save($out) } finally { $out.Dispose() } "
+            "} finally { $stream.Dispose() }"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True,
+            timeout=25,
+        )
+        if res.returncode == 0 and os.path.isfile(tmp_png) and os.path.getsize(tmp_png) > 0:
+            if HAS_OIIO:
+                inp = oiio.ImageInput.open(tmp_png)
+                if inp is not None:
+                    try:
+                        data = inp.read_image(oiio.FLOAT)
+                        if data is not None:
+                            arr = np.asarray(data, dtype=np.float32)
+                            if arr.ndim == 2:
+                                arr = np.repeat(arr[:, :, None], 3, axis=2)
+                            elif arr.shape[2] >= 3:
+                                arr = arr[:, :, :3]
+                            return np.ascontiguousarray(arr, dtype=np.float32)
+                    finally:
+                        inp.close()
+            elif HAS_PIL:
+                with Image.open(tmp_png) as im:
+                    return np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
+    except Exception:
+        pass
+    finally:
+        if tmp_png and os.path.isfile(tmp_png):
+            try:
+                os.remove(tmp_png)
+            except OSError:
+                pass
+    return None
+
+
+def _read_raw_or_heif_pixels(resolved: str, ext: str) -> Tuple[np.ndarray, bool, str]:
+    """
+    Decode camera/phone RAW (.dng, ProRAW, .cr2, .nef, .arw, etc.) or .heic/.heif
+    into (pixels_float32_rgb, is_hdr, detected_colorspace).
+    """
+    if ext in RAW_EXTENSIONS:
+        # 1. rawpy (LibRaw) -> true 16-bit linear Rec.709 / sRGB primaries
+        try:
+            import rawpy
+
+            with rawpy.imread(resolved) as raw:
+                rgb16 = raw.postprocess(
+                    output_bps=16,
+                    no_auto_bright=True,
+                    output_color=rawpy.ColorSpace.sRGB,
+                    gamma=(1, 1),
+                    use_camera_wb=True,
+                )
+            arr = np.asarray(rgb16, dtype=np.float32) / 65535.0
+            if arr.ndim == 2:
+                arr = np.repeat(arr[:, :, None], 3, axis=2)
+            elif arr.shape[2] >= 3:
+                arr = arr[:, :, :3]
+            return np.ascontiguousarray(arr, dtype=np.float32), True, "Linear"
+        except ImportError:
+            pass
+
+        # 2. dcraw CLI -> 16-bit linear TIFF
+        dcraw_bin = shutil.which("dcraw")
+        if dcraw_bin:
+            tmp_tif = None
+            try:
+                res = subprocess.run([dcraw_bin, "-c", "-w", "-4", "-T", resolved], capture_output=True, timeout=45)
+                if res.returncode == 0 and res.stdout:
+                    fd, tmp_tif = tempfile.mkstemp(suffix=".tif")
+                    os.close(fd)
+                    with open(tmp_tif, "wb") as tf:
+                        tf.write(res.stdout)
+                    if HAS_OIIO:
+                        inp = oiio.ImageInput.open(tmp_tif)
+                        if inp is not None:
+                            try:
+                                data = inp.read_image(oiio.FLOAT)
+                                if data is not None:
+                                    arr = np.asarray(data, dtype=np.float32)[:, :, :3]
+                                    return np.ascontiguousarray(arr, dtype=np.float32), True, "Linear"
+                            finally:
+                                inp.close()
+            except Exception:
+                pass
+            finally:
+                if tmp_tif and os.path.isfile(tmp_tif):
+                    try:
+                        os.remove(tmp_tif)
+                    except OSError:
+                        pass
+
+        # 3. ImageMagick / darktable-cli -> temp 32-bit EXR
+        for cli_name in ("magick", "darktable-cli"):
+            cli_bin = shutil.which(cli_name)
+            if not cli_bin:
+                continue
+            tmp_exr = None
+            try:
+                fd, tmp_exr = tempfile.mkstemp(suffix=".exr")
+                os.close(fd)
+                cmd = (
+                    [cli_bin, resolved, "-auto-orient", tmp_exr]
+                    if cli_name == "magick"
+                    else [cli_bin, resolved, tmp_exr]
+                )
+                res = subprocess.run(cmd, capture_output=True, timeout=60)
+                if res.returncode == 0 and os.path.isfile(tmp_exr) and os.path.getsize(tmp_exr) > 0 and HAS_OIIO:
+                    inp = oiio.ImageInput.open(tmp_exr)
+                    if inp is not None:
+                        try:
+                            data = inp.read_image(oiio.FLOAT)
+                            if data is not None:
+                                arr = np.asarray(data, dtype=np.float32)[:, :, :3]
+                                return np.ascontiguousarray(arr, dtype=np.float32), True, "Linear"
+                        finally:
+                            inp.close()
+            except Exception:
+                pass
+            finally:
+                if tmp_exr and os.path.isfile(tmp_exr):
+                    try:
+                        os.remove(tmp_exr)
+                    except OSError:
+                        pass
+
+        # 4. Windows WIC (supports DNG/RAW if Windows Raw Image Extension is installed)
+        wic_arr = _decode_with_windows_wic(resolved)
+        if wic_arr is not None:
+            return wic_arr, False, "sRGB"
+
+        # 5. PIL fallback (works for some uncompressed/Linear DNG IFDs)
+        if HAS_PIL:
+            try:
+                with Image.open(resolved) as img:
+                    try:
+                        from PIL import ImageOps
+
+                        img = ImageOps.exif_transpose(img)
+                    except Exception:
+                        pass
+                    if min(img.size) >= 256:
+                        rgb_img = img.convert("RGB")
+                        arr = np.asarray(rgb_img, dtype=np.float32) / 255.0
+                        return np.ascontiguousarray(arr, dtype=np.float32), False, "sRGB"
+            except Exception:
+                pass
+
+        raise RuntimeError(
+            f"Cannot decode camera/phone RAW file '{os.path.basename(resolved)}' with built-in Houdini OIIO/PIL. "
+            "Install 'rawpy' into Houdini Python (`hython -m pip install rawpy`) or install ImageMagick / dcraw."
+        )
+
+    if ext in HEIF_EXTENSIONS:
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+            if HAS_PIL:
+                with Image.open(resolved) as img:
+                    try:
+                        from PIL import ImageOps
+
+                        img = ImageOps.exif_transpose(img)
+                    except Exception:
+                        pass
+                    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+                    return np.ascontiguousarray(arr, dtype=np.float32), False, "sRGB"
+        except ImportError:
+            pass
+
+        cli_bin = shutil.which("magick")
+        if cli_bin:
+            tmp_png = None
+            try:
+                fd, tmp_png = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+                res = subprocess.run([cli_bin, resolved, "-auto-orient", tmp_png], capture_output=True, timeout=45)
+                if res.returncode == 0 and os.path.isfile(tmp_png) and HAS_PIL:
+                    with Image.open(tmp_png) as img:
+                        arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+                        return np.ascontiguousarray(arr, dtype=np.float32), False, "sRGB"
+            except Exception:
+                pass
+            finally:
+                if tmp_png and os.path.isfile(tmp_png):
+                    try:
+                        os.remove(tmp_png)
+                    except OSError:
+                        pass
+
+        wic_arr = _decode_with_windows_wic(resolved)
+        if wic_arr is not None:
+            return wic_arr, False, "sRGB"
+
+        raise RuntimeError(
+            f"Cannot decode HEIC/HEIF file '{os.path.basename(resolved)}'. "
+            "Install 'pillow-heif' into Houdini Python (`hython -m pip install pillow-heif`) or ImageMagick."
+        )
+
+    raise RuntimeError(f"Unsupported RAW/HEIF extension: {ext}")
 
 # Exact 3x3 chromaticity conversion matrices (D60 <-> D65 Bradford adapted)
 # ACEScg (AP1, D60) -> Linear sRGB / Rec.709 (D65)
@@ -247,7 +546,9 @@ def read_plate(
     pixels: Optional[np.ndarray] = None
     detected_cs = "Linear" if is_hdr else "sRGB"
 
-    if HAS_OIIO:
+    if ext in RAW_EXTENSIONS or ext in HEIF_EXTENSIONS:
+        pixels, is_hdr, detected_cs = _read_raw_or_heif_pixels(resolved, ext)
+    elif HAS_OIIO:
         inp = oiio.ImageInput.open(resolved)
         if inp is None:
             raise RuntimeError(f"OpenImageIO failed to open {resolved}: {oiio.geterror()}")
@@ -600,6 +901,16 @@ def read_plate_metadata(path: str) -> Dict[str, Any]:
                         orient = int(ori)
         except Exception:
             pass
+
+    if focal_35 is None and focal_mm is None:
+        tiff_exif = _read_exif_from_tiff_container(path)
+        if tiff_exif:
+            if "focal_35" in tiff_exif and float(tiff_exif["focal_35"]) > 1.0:
+                focal_35 = float(tiff_exif["focal_35"])
+            if "focal_mm" in tiff_exif and float(tiff_exif["focal_mm"]) > 1.0:
+                focal_mm = float(tiff_exif["focal_mm"])
+            if "orient" in tiff_exif and orient == 1:
+                orient = int(tiff_exif["orient"])
 
     if orient == 6:
         result["roll_deg"] = -90.0

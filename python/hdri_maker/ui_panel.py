@@ -607,7 +607,10 @@ class PreviewLabel(QtWidgets.QLabel):
     def dragEnterEvent(self, event) -> None:
         md = event.mimeData() if hasattr(event, "mimeData") else None
         if md is not None and md.hasUrls():
-            exts = (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff")
+            exts = (
+                ".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff",
+                ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2", ".pef", ".srw", ".heic", ".heif",
+            )
             if any(u.toLocalFile().lower().endswith(exts) for u in md.urls()):
                 event.acceptProposedAction()
                 return
@@ -616,7 +619,10 @@ class PreviewLabel(QtWidgets.QLabel):
     def dropEvent(self, event) -> None:
         md = event.mimeData() if hasattr(event, "mimeData") else None
         if md is not None and md.hasUrls():
-            exts = (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff")
+            exts = (
+                ".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff",
+                ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2", ".pef", ".srw", ".heic", ".heif",
+            )
             paths = [u.toLocalFile() for u in md.urls() if u.toLocalFile().lower().endswith(exts)]
             if paths:
                 self.filesDropped.emit(paths)
@@ -1294,7 +1300,7 @@ class MacbethWBDialog(QtWidgets.QDialog):
             self,
             "Select Macbeth ColorChecker Reference Image",
             self.path_edit.text().strip(),
-            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff);;All Files (*)",
+            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;RAW / Phone (*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.heic *.heif);;All Files (*)",
         )
         if path:
             self.path_edit.setText(path)
@@ -2560,7 +2566,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self,
             "Select Plate Image or Sequence Frame",
             "",
-            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff);;All Files (*)",
+            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;RAW / Phone (*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.heic *.heif);;All Files (*)",
         )
         if path:
             self.plate_path_edit.setText(path)
@@ -2888,7 +2894,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self,
             "Select Multiple Plate Images (Different Positions)",
             "",
-            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff);;All Files (*)",
+            "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;RAW / Phone (*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.heic *.heif);;All Files (*)",
         )
         if not paths:
             return
@@ -4281,7 +4287,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self,
             "Select Bracketed Exposure Plates to Merge into 32-bit HDR EXR",
             "",
-            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.exr *.hdr);;All Files (*)",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.exr *.hdr *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;All Files (*)",
         )
         if not paths or len(paths) < 2:
             if paths:
