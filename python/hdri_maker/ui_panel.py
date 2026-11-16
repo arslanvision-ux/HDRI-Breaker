@@ -368,6 +368,7 @@ class PreviewLabel(QtWidgets.QLabel):
     plateDragMoved = Signal(int, float, float, str)
     plateDragFinished = Signal(int)
     plateWheelScaled = Signal(int, float)
+    plateContextMenuRequested = Signal(int, object)
     brushStrokeStarted = Signal(float, float)
     brushStrokeMoved = Signal(float, float)
     brushStrokeFinished = Signal()
@@ -576,6 +577,25 @@ class PreviewLabel(QtWidgets.QLabel):
         v = (pos.y() - prect.y()) / float(prect.height())
         return (u, v)
 
+    def _emit_plate_context_menu(self, event, pos: QtCore.QPoint) -> None:
+        uv = self._pos_to_uv(pos)
+        if uv is None or not self._plate_views:
+            return
+        hit_plate = hit_test_plate_uv(
+            self._plate_views,
+            uv[0],
+            uv[1],
+            azimuth_offset_deg=self._plate_az_offset,
+            vertical_shift_deg=self._plate_v_shift,
+        )
+        if hit_plate is None:
+            return
+        self._selected_plate_idx = hit_plate
+        self.plateSelected.emit(hit_plate)
+        self.update()
+        gpos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+        self.plateContextMenuRequested.emit(hit_plate, gpos)
+
     def _hit_test_region(self, u: float, v: float):
         """Return (kind, idx, mode, edges, rect) if (u, v) hits an existing region."""
         tol_u = 0.018
@@ -680,12 +700,19 @@ class PreviewLabel(QtWidgets.QLabel):
                 self.setCursor(Qt.SizeHorCursor)
                 event.accept()
                 return
+        if event.button() == Qt.RightButton and self._plate_edit_mode and self._pick_mode is None and not self._brush_enabled:
+            self._rclick_press_pos = pos
+        else:
+            self._rclick_press_pos = None
         if event.button() in (Qt.MiddleButton, Qt.RightButton) or (is_alt and event.button() == Qt.LeftButton):
             if self._zoom > 1.001:
                 self._panning = True
                 self._pan_start_pos = pos
                 self._pan_start_uv = (self._pan_uv[0], self._pan_uv[1])
                 self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+                return
+            if event.button() == Qt.RightButton and self._plate_edit_mode and self._pick_mode is None and not self._brush_enabled:
                 event.accept()
                 return
         if self._pick_mode and event.button() == Qt.LeftButton:
@@ -893,8 +920,33 @@ class PreviewLabel(QtWidgets.QLabel):
         if self._panning:
             self._panning = False
             self._pan_start_pos = None
-            self.setCursor(Qt.CrossCursor if self._pick_mode else Qt.ArrowCursor)
+            self.setCursor(Qt.CrossCursor if self._pick_mode else (Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor))
+            rpos = getattr(self, "_rclick_press_pos", None)
+            self._rclick_press_pos = None
+            if (
+                event.button() == Qt.RightButton
+                and rpos is not None
+                and self._plate_edit_mode
+                and self._pick_mode is None
+                and not self._brush_enabled
+            ):
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                if (pos - rpos).manhattanLength() <= 4:
+                    self._emit_plate_context_menu(event, pos)
             return
+        if (
+            event.button() == Qt.RightButton
+            and self._plate_edit_mode
+            and self._pick_mode is None
+            and not self._brush_enabled
+            and getattr(self, "_rclick_press_pos", None) is not None
+        ):
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            rpos = self._rclick_press_pos
+            self._rclick_press_pos = None
+            if (pos - rpos).manhattanLength() <= 4:
+                self._emit_plate_context_menu(event, pos)
+                return
         if self._plate_drag_mode is not None:
             idx = self._selected_plate_idx
             self._plate_drag_mode = None
@@ -1075,7 +1127,7 @@ class PreviewLabel(QtWidgets.QLabel):
                 hud_msg = f"{mode_names.get(self._pick_mode, self._pick_mode)}  |  Drag box on canvas"
                 hud_accent = QtGui.QColor(56, 189, 248)
             elif self._plate_edit_mode:
-                hud_msg = "Edit Plates (E)  |  Drag: Move Az/El  |  Corner: Scale  |  Shift+Drag: Roll  |  Ctrl+Drag: Warp"
+                hud_msg = "Edit Plates (E)  |  Drag: Move Az/El  |  Corner: Scale  |  Shift+Drag: Roll  |  Right-Click: Plate Menu"
                 hud_accent = QtGui.QColor(34, 211, 238)
             else:
                 hud_msg = "Inspect  |  Wheel: Zoom  |  Middle/Right-Drag: Pan  |  F: Fit  |  B: Brush  |  E: Edit Plates"
@@ -2099,6 +2151,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.plateDragMoved.connect(self._on_viewer_plate_dragged)
         self.preview_label.plateDragFinished.connect(self._on_viewer_plate_drag_finished)
         self.preview_label.plateWheelScaled.connect(self._on_viewer_plate_wheel_scaled)
+        self.preview_label.plateContextMenuRequested.connect(self._on_viewer_plate_context_menu)
         self._selected_plate_idx: int = 0
         self._updating_plate_ui: bool = False
         layout.addWidget(self.preview_label, stretch=1)
@@ -3380,6 +3433,113 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         v.fov_h_deg = float(np.clip(v.fov_h_deg + step, 10.0, 165.0))
         self._sync_view_to_table_and_bar(idx)
         self._schedule_preview_update()
+
+    def _on_viewer_plate_context_menu(self, idx: int, global_pos: QtCore.QPoint) -> None:
+        if not (0 <= idx < len(self._views)) or idx >= self.multiview_table.rowCount():
+            return
+        v = self._views[idx]
+        name = os.path.basename(v.source_path) if v.source_path else f"Plate #{idx + 1}"
+        menu = QtWidgets.QMenu(self)
+        title_act = menu.addAction(f"Plate #{idx + 1}: {name}")
+        title_act.setEnabled(False)
+        menu.addSeparator()
+
+        hide_act = menu.addAction("Hide Plate (Disable)")
+        solo_act = menu.addAction("Solo This Plate")
+        any_hidden = any(
+            self.multiview_table.item(r, 0) is not None
+            and self.multiview_table.item(r, 0).checkState() != Qt.Checked
+            for r in range(self.multiview_table.rowCount())
+        )
+        show_all_act = menu.addAction("Show All Plates") if any_hidden else None
+        menu.addSeparator()
+
+        up_act = menu.addAction("Move Up in Blend Order (↑)")
+        up_act.setEnabled(idx > 0)
+        dn_act = menu.addAction("Move Down in Blend Order (↓)")
+        dn_act.setEnabled(idx < self.multiview_table.rowCount() - 1)
+        menu.addSeparator()
+
+        vig_act = menu.addAction("Auto-Estimate Vignette")
+        n_masks = len(getattr(v, "exclude_rects", []) or [])
+        clr_mask_act = menu.addAction(f"Clear Exclude Masks ({n_masks})") if n_masks > 0 else None
+        reset_tf_act = menu.addAction("Reset Plate Transform (Roll/Scale/Warp/EV)")
+        menu.addSeparator()
+        del_act = menu.addAction("Delete Plate")
+
+        exec_fn = getattr(menu, "exec", None) or getattr(menu, "exec_", None)
+        chosen = exec_fn(global_pos)
+        if chosen is None:
+            return
+        if chosen == hide_act:
+            self._push_undo_snapshot(f"Hide Plate #{idx + 1}")
+            self.multiview_table.blockSignals(True)
+            try:
+                it0 = self.multiview_table.item(idx, 0)
+                if it0 is not None:
+                    it0.setCheckState(Qt.Unchecked)
+                self._apply_multiview_row_visual_state(idx, False)
+            finally:
+                self.multiview_table.blockSignals(False)
+            self._views[idx].enabled = False
+            self._sync_after_multiview_enable_change(update_status=True)
+            self._commit_undo_baseline()
+        elif chosen == solo_act:
+            self._push_undo_snapshot(f"Solo Plate #{idx + 1}")
+            self.multiview_table.blockSignals(True)
+            try:
+                for r in range(self.multiview_table.rowCount()):
+                    en = (r == idx)
+                    it0 = self.multiview_table.item(r, 0)
+                    if it0 is not None:
+                        it0.setCheckState(Qt.Checked if en else Qt.Unchecked)
+                    self._apply_multiview_row_visual_state(r, en)
+                    if r < len(self._views):
+                        self._views[r].enabled = en
+            finally:
+                self.multiview_table.blockSignals(False)
+            self._sync_after_multiview_enable_change(update_status=True)
+            self._commit_undo_baseline()
+        elif show_all_act is not None and chosen == show_all_act:
+            self._push_undo_snapshot("Show All Plates")
+            self.multiview_table.blockSignals(True)
+            try:
+                for r in range(self.multiview_table.rowCount()):
+                    it0 = self.multiview_table.item(r, 0)
+                    if it0 is not None:
+                        it0.setCheckState(Qt.Checked)
+                    self._apply_multiview_row_visual_state(r, True)
+                    if r < len(self._views):
+                        self._views[r].enabled = True
+            finally:
+                self.multiview_table.blockSignals(False)
+            self._sync_after_multiview_enable_change(update_status=True)
+            self._commit_undo_baseline()
+        elif chosen == up_act:
+            self.multiview_table.selectRow(idx)
+            self._move_selected_multiview_row(-1)
+        elif chosen == dn_act:
+            self.multiview_table.selectRow(idx)
+            self._move_selected_multiview_row(1)
+        elif chosen == vig_act:
+            self._selected_plate_idx = idx
+            self._on_auto_estimate_vignette()
+        elif clr_mask_act is not None and chosen == clr_mask_act:
+            self._push_undo_snapshot(f"Clear Masks Plate #{idx + 1}")
+            self._selected_plate_idx = idx
+            self._on_clear_plate_masks()
+            self._commit_undo_baseline()
+        elif chosen == reset_tf_act:
+            self._push_undo_snapshot(f"Reset Plate #{idx + 1} Transform")
+            self._selected_plate_idx = idx
+            self._on_reset_selected_plate_transform()
+            self._commit_undo_baseline()
+        elif chosen == del_act:
+            self._push_undo_snapshot(f"Delete Plate #{idx + 1}")
+            self.multiview_table.removeRow(idx)
+            self._sync_after_multiview_list_change(removed_indices=[idx])
+            self._commit_undo_baseline()
+            self.status_label.setText(f"Deleted Plate #{idx + 1}: {name}.")
 
     def _on_undo_light(self) -> None:
         if self._light_regions:
