@@ -537,7 +537,8 @@ def _create_pbr_shader_for_engine(
         _set_vop_parm(rstd, "refl_roughness", float(roughness))
         if use_display_color and "redshift::RSUserDataColor" in vop_types:
             rud = ml.createNode("redshift::RSUserDataColor", f"{name}_rs_dc")
-            _set_vop_parm(rud, "attribute", "displayColor")
+            _set_vop_parm(rud, "attribute", "Cd")
+            _set_vop_parm(rud, "shader_skipdefvalparms", 0)
             _vop_connect(rstd, "base_color", rud, "out")
         else:
             _set_vop_parm_tuple(rstd, "base_color", color_rgb)
@@ -1011,9 +1012,11 @@ for idx, cs in enumerate(macbeth_srgb):
     pm.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
     lin = _srgb_to_lin_rec709(cs)
     col_out = _rec709_to_acescg(lin) if use_acescg else lin
-    pm.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set(
-        [Gf.Vec3f(float(col_out[0]), float(col_out[1]), float(col_out[2]))]
-    )
+    col_vec = Gf.Vec3f(float(col_out[0]), float(col_out[1]), float(col_out[2]))
+    pm.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set([col_vec])
+    UsdGeom.PrimvarsAPI(pm.GetPrim()).CreatePrimvar(
+        "Cd", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+    ).Set([col_vec] * 4)
 
 # 4. Circular Ground Disc with Top-Down Planar HDRI Projection + Soft Blending Transparency
 disc = UsdGeom.Mesh.Define(stage, f"{{root}}/ground_disc")
