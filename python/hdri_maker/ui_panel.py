@@ -7,6 +7,7 @@ launched as a floating window from a shelf tool.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import json
 import os
@@ -141,6 +142,131 @@ UI_THEMES: Dict[str, Dict[str, str]] = {
 }
 
 
+class FlowLayout(QtWidgets.QLayout):
+    """Responsive wrapping layout so dense toolbars wrap instead of clipping."""
+
+    def __init__(self, parent=None, margin: int = 0, spacing: int = 4):
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items: List[QtWidgets.QLayoutItem] = []
+
+    def __del__(self):
+        item = self.takeAt(0)
+        while item:
+            item = self.takeAt(0)
+
+    def addItem(self, item: QtWidgets.QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(0) if hasattr(Qt, "Orientations") else Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QtCore.QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QtCore.QSize:
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QtCore.QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect: QtCore.QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        effective = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x = effective.x()
+        y = effective.y()
+        line_h = 0
+        sp = max(0, self.spacing())
+        for item in self._items:
+            wid = item.widget()
+            if wid is not None and wid.isHidden():
+                continue
+            hint = item.sizeHint()
+            next_x = x + hint.width() + sp
+            if next_x - sp > effective.right() and line_h > 0:
+                x = effective.x()
+                y = y + line_h + sp
+                next_x = x + hint.width() + sp
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x = next_x
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + margins.bottom()
+
+
+class CollapsibleGroupBox(QtWidgets.QWidget):
+    """Collapsible section with clickable header to reduce vertical scrolling."""
+
+    def __init__(self, title: str, parent=None, collapsed: bool = False):
+        super().__init__(parent)
+        self._title = title
+        self._collapsed = bool(collapsed)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        self.toggle_btn = QtWidgets.QToolButton()
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(not self._collapsed)
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.toggle_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.toggle_btn.setStyleSheet(
+            "QToolButton { text-align: left; font-weight: bold; padding: 5px 8px; "
+            "border: 1px solid #3e4555; border-radius: 4px; background-color: #252a34; color: #e2e8f0; }"
+            "QToolButton:hover { border-color: #60a5fa; }"
+        )
+        self.toggle_btn.toggled.connect(self._on_toggled)
+        outer.addWidget(self.toggle_btn)
+
+        self.body = QtWidgets.QFrame()
+        self.body.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.body.setStyleSheet(
+            "QFrame { border: 1px solid #353b48; border-top: none; border-radius: 0 0 4px 4px; padding: 4px; }"
+        )
+        self.body.setVisible(not self._collapsed)
+        outer.addWidget(self.body)
+        self._sync_header_text()
+
+    def _sync_header_text(self) -> None:
+        arrow = "▾" if not self._collapsed else "▸"
+        self.toggle_btn.setText(f"{arrow}  {self._title}")
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self._collapsed = not bool(expanded)
+        self.body.setVisible(bool(expanded))
+        self._sync_header_text()
+
+    def setCollapsed(self, collapsed: bool) -> None:
+        self.toggle_btn.setChecked(not bool(collapsed))
+
+
 class SliderResetControl(QtWidgets.QWidget):
     """Compact horizontal slider + numeric readout + reset button."""
 
@@ -247,10 +373,12 @@ class PreviewLabel(QtWidgets.QLabel):
     brushStrokeFinished = Signal()
     brushCloneSourcePicked = Signal(float, float)
     brushParamAdjusted = Signal(str, float)
+    filesDropped = Signal(list)
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self._pick_mode: Optional[str] = None  # None, "sky", "ground", "light", or "wb"
         self._pick_shape: str = "rect"  # "rect" or "circle"
         self._drag_start: Optional[QtCore.QPoint] = None
@@ -475,6 +603,26 @@ class PreviewLabel(QtWidgets.QLabel):
                     return (kind, idx, "resize", (near_l, near_t, near_r, near_b), (lo_u, lo_v, hi_u, hi_v))
                 return (kind, idx, "move", (False, False, False, False), (lo_u, lo_v, hi_u, hi_v))
         return None
+
+    def dragEnterEvent(self, event) -> None:
+        md = event.mimeData() if hasattr(event, "mimeData") else None
+        if md is not None and md.hasUrls():
+            exts = (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff")
+            if any(u.toLocalFile().lower().endswith(exts) for u in md.urls()):
+                event.acceptProposedAction()
+                return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        md = event.mimeData() if hasattr(event, "mimeData") else None
+        if md is not None and md.hasUrls():
+            exts = (".exr", ".hdr", ".jpg", ".jpeg", ".png", ".tif", ".tiff")
+            paths = [u.toLocalFile() for u in md.urls() if u.toLocalFile().lower().endswith(exts)]
+            if paths:
+                self.filesDropped.emit(paths)
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
 
     def wheelEvent(self, event) -> None:
         if self._source_pixmap is None or self._source_pixmap.isNull():
@@ -904,9 +1052,69 @@ class PreviewLabel(QtWidgets.QLabel):
                     if self._brush_adjust_mode is not None and self._brush_hud_text:
                         painter.setPen(QtGui.QPen(QtGui.QColor(255, 230, 100), 1))
                         painter.drawText(int(bx + rx + 8), int(by + 4), self._brush_hud_text)
+            # On-canvas active mode banner / shortcut hint pill
+            if self._brush_enabled:
+                hud_msg = (
+                    f"Brush ({self._brush_mode})  |  Drag: Paint  |  Ctrl+Click: Clone Src  "
+                    "|  [ / ]: Size  |  Ctrl+Z: Undo"
+                )
+                hud_accent = QtGui.QColor(245, 158, 11)
+            elif self._pick_mode is not None:
+                mode_names = {
+                    "sky": "Pick Sky Area",
+                    "ground": "Pick Ground Area",
+                    "light": "Pick Light Area",
+                    "wb": "Pick Neutral WB",
+                }
+                hud_msg = f"{mode_names.get(self._pick_mode, self._pick_mode)}  |  Drag box on canvas"
+                hud_accent = QtGui.QColor(56, 189, 248)
+            elif self._plate_edit_mode:
+                hud_msg = "Edit Plates (E)  |  Drag: Move Az/El  |  Corner: Scale  |  Shift+Drag: Roll  |  Ctrl+Drag: Warp"
+                hud_accent = QtGui.QColor(34, 211, 238)
+            else:
+                hud_msg = "Inspect  |  Wheel: Zoom  |  Middle/Right-Drag: Pan  |  F: Fit  |  B: Brush  |  E: Edit Plates"
+                hud_accent = QtGui.QColor(148, 163, 184)
+            fm = painter.fontMetrics()
+            txt_w = fm.horizontalAdvance(hud_msg) if hasattr(fm, "horizontalAdvance") else fm.width(hud_msg)
+            pill_w = min(self.width() - 20, txt_w + 22)
+            pill_rect = QtCore.QRectF(10, 10, max(120, pill_w), 24)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.setBrush(QtGui.QColor(15, 23, 42, 185))
+            painter.setPen(QtGui.QPen(hud_accent, 1))
+            painter.drawRoundedRect(pill_rect, 6, 6)
+            painter.setPen(QtGui.QColor(241, 245, 249))
+            painter.drawText(
+                pill_rect.adjusted(10, 0, -8, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                hud_msg,
+            )
             painter.end()
             return
-        super().paintEvent(event)
+        # Empty-state onboarding card when no HDRI is loaded yet
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        card_w = min(460, max(260, w - 48))
+        card_h = 132
+        card = QtCore.QRectF((w - card_w) * 0.5, (h - card_h) * 0.5, card_w, card_h)
+        painter.setBrush(QtGui.QColor(30, 35, 46, 220))
+        painter.setPen(QtGui.QPen(QtGui.QColor(71, 85, 105), 1.5, Qt.DashLine))
+        painter.drawRoundedRect(card, 10, 10)
+        f_title = painter.font()
+        f_title.setBold(True)
+        f_title.setPointSizeF(max(10.0, f_title.pointSizeF() + 1.5))
+        painter.setFont(f_title)
+        painter.setPen(QtGui.QColor(226, 232, 240))
+        painter.drawText(card.adjusted(16, 20, -16, -64), Qt.AlignCenter, "Drop EXR / HDR / JPG / PNG Plates Here")
+        f_sub = self.font()
+        painter.setFont(f_sub)
+        painter.setPen(QtGui.QColor(148, 163, 184))
+        painter.drawText(
+            card.adjusted(16, 56, -16, -16),
+            Qt.AlignCenter | Qt.TextWordWrap,
+            "Or use 'Browse...' / 'Add Plates...' on the left, then click Analyze Plate(s) & Generate Preview.",
+        )
+        painter.end()
 
 
 class MacbethCanvasLabel(QtWidgets.QLabel):
@@ -1264,6 +1472,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._wb_gains: tuple = (1.0, 1.0, 1.0)
         self._wb_undo_stack: List[tuple] = []
         self._action_undo_stack: List[str] = []
+        self._undo_stack: List[Dict[str, Any]] = []
+        self._last_committed_state: Optional[Dict[str, Any]] = None
+        self._restoring_undo: bool = False
+        self._pending_undo_label: str = "Parameter Change"
+        self._undo_coalesce_timer = QtCore.QTimer(self)
+        self._undo_coalesce_timer.setSingleShot(True)
+        self._undo_coalesce_timer.setInterval(350)
+        self._undo_coalesce_timer.timeout.connect(self._flush_pending_undo)
         self._macbeth_path: str = ""
         self._macbeth_colorspace: str = "Auto"
         self._thumb_cache: Dict[tuple, QtGui.QIcon] = {}
@@ -1288,14 +1504,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._raw_rough_cache: Optional[tuple] = None
 
         self._build_ui()
-        QShortcutCls = getattr(QtGui, "QShortcut", None) or getattr(QtWidgets, "QShortcut", None)
-        if QShortcutCls is not None:
-            self._undo_shortcut = QShortcutCls(QtGui.QKeySequence.Undo, self)
-            self._undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-            self._undo_shortcut.activated.connect(self._on_global_undo)
+        self._install_shortcuts()
+        self._install_global_undo_hooks()
         self._apply_ui_scale(self.ui_scale_slider.value())
         if restore_session:
             self._auto_load_session()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -1347,30 +1562,33 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("Ready. Load a plate or image sequence to begin.")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #9ecbff; padding: 4px;")
-        save_btn = QtWidgets.QPushButton("Save State...")
-        save_btn.setToolTip("Save current plates, positions, tuning, and inpaint areas to a JSON preset")
-        save_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        save_btn.clicked.connect(self._on_save_state)
 
-        load_btn = QtWidgets.QPushButton("Load State...")
-        load_btn.setToolTip("Load a saved HDRI Maker JSON preset")
-        load_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        load_btn.clicked.connect(self._on_load_state)
+        self.global_undo_btn = QtWidgets.QPushButton("Undo (Ctrl+Z)")
+        self.global_undo_btn.setEnabled(False)
+        self.global_undo_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.global_undo_btn.setToolTip("Undo the last parameter or canvas edit (Ctrl+Z)")
+        self.global_undo_btn.clicked.connect(self._on_global_undo)
 
-        reload_btn = QtWidgets.QPushButton("Reload Code")
-        reload_btn.setToolTip("Hot-reload all hdri_maker Python modules without restarting Houdini")
-        reload_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        reload_btn.clicked.connect(self._on_reload_code)
+        self.reset_all_btn = QtWidgets.QPushButton("Reset All")
+        self.reset_all_btn.setToolTip("Clear all plates, edits, apply/collapse history, and reset all parameters to start fresh")
+        self.reset_all_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.reset_all_btn.clicked.connect(self._on_reset_all_setup)
 
-        reset_all_btn = QtWidgets.QPushButton("Reset All")
-        reset_all_btn.setToolTip("Clear all plates, edits, apply/collapse history, and reset all parameters to start fresh")
-        reset_all_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        reset_all_btn.clicked.connect(self._on_reset_all_setup)
-
-        debug_btn = QtWidgets.QPushButton("Debug Log")
-        debug_btn.setToolTip(f"Open live Debug Log window (also written to {DEBUG_LOG_PATH})")
-        debug_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        debug_btn.clicked.connect(self._on_open_debug_log)
+        tools_btn = QtWidgets.QToolButton()
+        tools_btn.setText("Tools ▾")
+        tools_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        tools_btn.setToolTip("Preset Save/Load, Debug Log, and Hot-Reload")
+        tools_menu = QtWidgets.QMenu(tools_btn)
+        act_save = tools_menu.addAction("Save State...")
+        act_save.triggered.connect(self._on_save_state)
+        act_load = tools_menu.addAction("Load State...")
+        act_load.triggered.connect(self._on_load_state)
+        tools_menu.addSeparator()
+        act_debug = tools_menu.addAction("Debug Log...")
+        act_debug.triggered.connect(self._on_open_debug_log)
+        act_reload = tools_menu.addAction("Reload Code")
+        act_reload.triggered.connect(self._on_reload_code)
+        tools_btn.setMenu(tools_menu)
 
         theme_lbl = QtWidgets.QLabel("Theme:")
         self.theme_combo = QtWidgets.QComboBox()
@@ -1378,22 +1596,20 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.theme_combo.setToolTip("Select HDRI Breaker UI color theme for high-contrast button visibility")
         self.theme_combo.currentIndexChanged.connect(lambda *_: self._apply_ui_scale(self.ui_scale_slider.value()))
 
-        ui_scale_lbl = QtWidgets.QLabel("UI Scale:")
+        ui_scale_lbl = QtWidgets.QLabel("Scale:")
         self.ui_scale_slider = SliderResetControl(0.60, 1.40, 1.00, 0.05, decimals=2)
         self.ui_scale_slider.setToolTip("Scale the HDRI Breaker UI fonts, buttons, and row heights (0.60x - 1.40x)")
-        self.ui_scale_slider.setMaximumWidth(210)
+        self.ui_scale_slider.setMaximumWidth(175)
         self.ui_scale_slider.valueChanged.connect(self._apply_ui_scale)
 
         status_row.addWidget(self.status_label, stretch=1)
+        status_row.addWidget(self.global_undo_btn)
+        status_row.addWidget(self.reset_all_btn)
+        status_row.addWidget(tools_btn)
         status_row.addWidget(theme_lbl)
         status_row.addWidget(self.theme_combo)
         status_row.addWidget(ui_scale_lbl)
         status_row.addWidget(self.ui_scale_slider)
-        status_row.addWidget(save_btn)
-        status_row.addWidget(load_btn)
-        status_row.addWidget(reset_all_btn)
-        status_row.addWidget(debug_btn)
-        status_row.addWidget(reload_btn)
         right_layout.addLayout(status_row)
 
         splitter = QtWidgets.QSplitter(Qt.Horizontal)
@@ -1406,9 +1622,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         splitter.splitterMoved.connect(lambda *_: self._update_preview_pixmap())
         root_layout.addWidget(splitter)
 
-    def _build_plate_group(self) -> QtWidgets.QGroupBox:
-        grp = QtWidgets.QGroupBox("1. Plate / Sequence Input")
-        form = QtWidgets.QFormLayout(grp)
+    def _build_plate_group(self) -> CollapsibleGroupBox:
+        grp = CollapsibleGroupBox("1. Plate / Sequence Input")
+        form = QtWidgets.QFormLayout(grp.body)
 
         # Path row
         path_row = QtWidgets.QHBoxLayout()
@@ -1531,8 +1747,22 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         unify_fov_btn = QtWidgets.QPushButton("Unify FOV")
         unify_fov_btn.setToolTip("Match all listed plates to the selected plate's (or first plate's) FOV° and reset Scale X/Y to 1.0")
         unify_fov_btn.clicked.connect(self._on_unify_plate_fovs)
+        mv_up_btn = QtWidgets.QPushButton("↑")
+        mv_up_btn.setMaximumWidth(30)
+        mv_up_btn.setToolTip("Move selected plate row up in blend order")
+        mv_up_btn.clicked.connect(lambda: self._move_selected_multiview_row(-1))
+        mv_dn_btn = QtWidgets.QPushButton("↓")
+        mv_dn_btn.setMaximumWidth(30)
+        mv_dn_btn.setToolTip("Move selected plate row down in blend order")
+        mv_dn_btn.clicked.connect(lambda: self._move_selected_multiview_row(1))
+        mv_order_row = QtWidgets.QHBoxLayout()
+        mv_order_row.setContentsMargins(0, 0, 0, 0)
+        mv_order_row.setSpacing(3)
+        mv_order_row.addWidget(unify_fov_btn, stretch=1)
+        mv_order_row.addWidget(mv_up_btn)
+        mv_order_row.addWidget(mv_dn_btn)
         mv_btn_grid.addWidget(eq_ev_btn, 2, 0, 1, 2)
-        mv_btn_grid.addWidget(unify_fov_btn, 2, 2)
+        mv_btn_grid.addLayout(mv_order_row, 2, 2)
         form.addRow("Multi-Position:", mv_btn_grid)
 
         self.multiview_table = QtWidgets.QTableWidget(0, 6)
@@ -1565,15 +1795,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         form.addRow(self.multiview_table)
 
         self.analyze_btn = QtWidgets.QPushButton("Analyze Plate(s) & Generate Preview")
-        self.analyze_btn.setMinimumHeight(32)
+        self.analyze_btn.setMinimumHeight(34)
+        self.analyze_btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; border: 1px solid #3b82f6; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1d4ed8; }"
+        )
         self.analyze_btn.clicked.connect(self._on_analyze_clicked)
         form.addRow(self.analyze_btn)
 
         return grp
 
-    def _build_analysis_group(self) -> QtWidgets.QGroupBox:
-        grp = QtWidgets.QGroupBox("2. Extracted Lighting Data")
-        layout = QtWidgets.QVBoxLayout(grp)
+    def _build_analysis_group(self) -> CollapsibleGroupBox:
+        grp = CollapsibleGroupBox("2. Extracted Lighting Data")
+        layout = QtWidgets.QVBoxLayout(grp.body)
 
         self.metrics_label = QtWidgets.QLabel("No plate analyzed yet.")
         self.metrics_label.setWordWrap(True)
@@ -1602,9 +1836,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
         return grp
 
-    def _build_synthesis_group(self) -> QtWidgets.QGroupBox:
-        grp = QtWidgets.QGroupBox("3. 32-bit Lat/Long Synthesis Tuning")
-        form = QtWidgets.QFormLayout(grp)
+    def _build_synthesis_group(self) -> CollapsibleGroupBox:
+        grp = CollapsibleGroupBox("3. 32-bit Lat/Long Synthesis Tuning")
+        form = QtWidgets.QFormLayout(grp.body)
 
         res_row = QtWidgets.QHBoxLayout()
         self.res_combo = QtWidgets.QComboBox()
@@ -1950,7 +2184,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row.addWidget(zoom_in_btn)
         layout.addLayout(ev_row)
 
-        ctrl_row = QtWidgets.QHBoxLayout()
+        ctrl_row = FlowLayout(margin=2, spacing=4)
         self.pick_sky_btn = QtWidgets.QPushButton("Pick Sky Area")
         self.pick_sky_btn.setCheckable(True)
         self.pick_sky_btn.toggled.connect(lambda c: self._toggle_pick_mode("sky", c))
@@ -1987,6 +2221,37 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         clear_area_btn = QtWidgets.QPushButton("Clear Areas")
         clear_area_btn.clicked.connect(self._clear_inpaint_areas)
 
+        self.brush_btn = QtWidgets.QPushButton("Brush Paint (B)")
+        self.brush_btn.setCheckable(True)
+        self.brush_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #b45309; color: #ffffff; font-weight: bold; }"
+        )
+        self.brush_btn.setToolTip(
+            "Paint directly on the 32-bit float 2:1 HDRI canvas (Shortcut: B):\n"
+            "• Heal / Inpaint: Clean spots/tripods from surrounding ring\n"
+            "• Clone Stamp: Ctrl+Click to pick source, then paint (360° wrap-aware)\n"
+            "• Blur / Burn / Dodge / Desaturate: Smooth seams, dim fireflies, or boost highlights"
+        )
+        self.brush_btn.toggled.connect(self._on_toggle_brush_mode)
+
+        self.bake_edits_btn = QtWidgets.QPushButton("Apply / Collapse")
+        self.bake_edits_btn.setCheckable(False)
+        self.bake_edits_btn.setAutoDefault(False)
+        self.bake_edits_btn.setDefault(False)
+        self.bake_edits_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #0891b2; font-weight: bold; padding: 3px 8px; }"
+            "QPushButton:hover { background-color: #0e7490; color: #ffffff; }"
+        )
+        self.bake_edits_btn.setToolTip(
+            "Apply & collapse plate stitching, sky/ground/light inpainting, and brush strokes into a fast 32-bit canvas\n"
+            "(Shortcut: Ctrl+Enter) so tweaking Exposure, CCT, Saturation, Blur, etc. becomes instant."
+        )
+        self.bake_edits_btn.clicked.connect(self._on_bake_edits_to_canvas)
+        self.unbake_edits_btn = QtWidgets.QPushButton("Unbake")
+        self.unbake_edits_btn.setEnabled(False)
+        self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
+        self.unbake_edits_btn.clicked.connect(self._on_unbake_edits)
+
         ctrl_row.addWidget(self.pick_sky_btn)
         ctrl_row.addWidget(self.pick_gnd_btn)
         ctrl_row.addWidget(self.pick_light_btn)
@@ -1997,22 +2262,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(self.remove_hotspot_chk)
         ctrl_row.addWidget(undo_light_btn)
         ctrl_row.addWidget(clear_area_btn)
+        ctrl_row.addWidget(self.brush_btn)
+        ctrl_row.addWidget(self.bake_edits_btn)
+        ctrl_row.addWidget(self.unbake_edits_btn)
         layout.addLayout(ctrl_row)
 
-        # Interactive 32-bit Float Canvas Brush Toolbar
-        brush_row = QtWidgets.QHBoxLayout()
-        self.brush_btn = QtWidgets.QPushButton("Brush Paint")
-        self.brush_btn.setCheckable(True)
-        self.brush_btn.setStyleSheet(
-            "QPushButton:checked { background-color: #b45309; color: #ffffff; font-weight: bold; }"
-        )
-        self.brush_btn.setToolTip(
-            "Paint directly on the 32-bit float 2:1 HDRI canvas:\n"
-            "• Heal / Inpaint: Clean spots/tripods from surrounding ring\n"
-            "• Clone Stamp: Ctrl+Click to pick source, then paint (360° wrap-aware)\n"
-            "• Blur / Burn / Dodge / Desaturate: Smooth seams, dim fireflies, or boost highlights"
-        )
-        self.brush_btn.toggled.connect(self._on_toggle_brush_mode)
+        # Contextual 32-bit Float Canvas Brush Toolbar (shown only when Brush Paint is active)
+        self.brush_toolbar_widget = QtWidgets.QWidget()
+        self.brush_toolbar_widget.setVisible(False)
+        brush_row = FlowLayout(self.brush_toolbar_widget, margin=2, spacing=6)
         self.brush_mode_combo = QtWidgets.QComboBox()
         self.brush_mode_combo.addItems([
             "Heal / Inpaint",
@@ -2026,61 +2284,38 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.brush_size_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_size_slider.setRange(5, 120)
         self.brush_size_slider.setValue(25)
-        self.brush_size_slider.setMaximumWidth(60)
+        self.brush_size_slider.setMaximumWidth(70)
         self.brush_size_slider.valueChanged.connect(self._on_brush_config_changed)
         self.brush_strength_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_strength_slider.setRange(10, 100)
         self.brush_strength_slider.setValue(85)
-        self.brush_strength_slider.setMaximumWidth(58)
+        self.brush_strength_slider.setMaximumWidth(64)
         self.brush_strength_slider.valueChanged.connect(self._on_brush_config_changed)
         self.brush_soft_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.brush_soft_slider.setRange(10, 100)
         self.brush_soft_slider.setValue(65)
-        self.brush_soft_slider.setMaximumWidth(58)
+        self.brush_soft_slider.setMaximumWidth(64)
         self.brush_soft_slider.valueChanged.connect(self._on_brush_config_changed)
-        undo_brush_btn = QtWidgets.QPushButton("Undo (Ctrl+Z)")
-        undo_brush_btn.setToolTip("Undo last brush stroke (Ctrl+Z)")
-        undo_brush_btn.clicked.connect(self._on_undo_brush)
         clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
         clear_brush_btn.clicked.connect(self._on_clear_brush)
-        self.bake_edits_btn = QtWidgets.QPushButton("Apply / Collapse")
-        self.bake_edits_btn.setCheckable(False)
-        self.bake_edits_btn.setAutoDefault(False)
-        self.bake_edits_btn.setDefault(False)
-        self.bake_edits_btn.setStyleSheet(
-            "QPushButton { border: 1px solid #0891b2; font-weight: bold; padding: 3px 8px; }"
-            "QPushButton:hover { background-color: #0e7490; color: #ffffff; }"
-        )
-        self.bake_edits_btn.setToolTip(
-            "Apply & collapse plate stitching, sky/ground/light inpainting, and brush strokes into a fast 32-bit canvas\n"
-            "so tweaking Exposure, CCT, Saturation, Blur, etc. becomes instant."
-        )
-        self.bake_edits_btn.clicked.connect(self._on_bake_edits_to_canvas)
-        self.unbake_edits_btn = QtWidgets.QPushButton("Unbake")
-        self.unbake_edits_btn.setEnabled(False)
-        self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
-        self.unbake_edits_btn.clicked.connect(self._on_unbake_edits)
 
-        brush_row.addWidget(self.brush_btn)
+        brush_row.addWidget(QtWidgets.QLabel("Mode:"))
         brush_row.addWidget(self.brush_mode_combo)
-        brush_row.addWidget(QtWidgets.QLabel("Size:"))
+        brush_row.addWidget(QtWidgets.QLabel("Size ([/]):"))
         brush_row.addWidget(self.brush_size_slider)
         brush_row.addWidget(QtWidgets.QLabel("Strength:"))
         brush_row.addWidget(self.brush_strength_slider)
         brush_row.addWidget(QtWidgets.QLabel("Soft:"))
         brush_row.addWidget(self.brush_soft_slider)
-        brush_row.addWidget(undo_brush_btn)
         brush_row.addWidget(clear_brush_btn)
-        brush_row.addWidget(self.bake_edits_btn)
-        brush_row.addWidget(self.unbake_edits_btn)
-        brush_row.addStretch(1)
-        layout.addLayout(brush_row)
+        layout.addWidget(self.brush_toolbar_widget)
 
         self.preview_label.brushCloneSourcePicked.connect(self._on_brush_clone_src_picked)
         self.preview_label.brushStrokeStarted.connect(self._on_brush_stroke_started)
         self.preview_label.brushStrokeMoved.connect(self._on_brush_stroke_moved)
         self.preview_label.brushStrokeFinished.connect(self._on_brush_stroke_finished)
         self.preview_label.brushParamAdjusted.connect(self._on_brush_param_adjusted)
+        self.preview_label.filesDropped.connect(self._on_preview_files_dropped)
 
         self.plate_transform_bar = QtWidgets.QWidget()
         pt_layout = QtWidgets.QHBoxLayout(self.plate_transform_bar)
@@ -2236,13 +2471,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         lookdev_form.addRow("", self.diffuse_split_chk)
         layout.addLayout(lookdev_form)
 
-        btn_row = QtWidgets.QHBoxLayout()
+        btn_row = FlowLayout(margin=2, spacing=6)
         self.export_btn = QtWidgets.QPushButton("Generate 32-bit Float EXR")
         self.export_btn.setMinimumHeight(34)
+        self.export_btn.setStyleSheet(
+            "QPushButton { background-color: #059669; color: #ffffff; font-weight: bold; border: 1px solid #10b981; border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #047857; }"
+        )
         self.export_btn.clicked.connect(self._on_export_exr)
 
         self.dome_btn = QtWidgets.QPushButton("Create / Update Solaris Dome Light")
         self.dome_btn.setMinimumHeight(34)
+        self.dome_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #d97706; font-weight: bold; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #b45309; color: #ffffff; }"
+        )
         self.dome_btn.clicked.connect(self._on_create_domelight)
 
         self.rig_btn = QtWidgets.QPushButton("Create / Update Area Light (/stage)")
@@ -3119,13 +3362,17 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
     def _on_undo_light(self) -> None:
         if self._light_regions:
+            self._push_undo_snapshot("Undo Light Area")
             self._light_regions.pop()
             self._extracted_lights = []
             self._last_light_exr_paths = []
+            self._commit_undo_baseline()
             self._regenerate_preview()
             self.status_label.setText(f"Removed last light. {len(self._light_regions)} light(s) selected.")
 
     def _clear_inpaint_areas(self) -> None:
+        if self._sky_rect is not None or self._ground_rect is not None or self._light_regions:
+            self._push_undo_snapshot("Clear Areas")
         self._sky_rect = None
         self._ground_rect = None
         self._light_regions = []
@@ -3135,16 +3382,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.pick_gnd_btn.setChecked(False)
         self.pick_light_btn.setChecked(False)
         self.preview_label.set_pick_mode(None)
+        self._commit_undo_baseline()
         self._regenerate_preview()
         self.status_label.setText("Cleared custom Sky/Ground/Light areas.")
 
     def _on_preview_rect_selected(self, mode: str, rect: tuple) -> None:
         if mode == "sky":
+            self._push_undo_snapshot("Pick Sky Area")
             self._sky_rect = rect
             self.pick_sky_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
             self.status_label.setText("Updated SKY selection.")
         elif mode == "ground":
+            self._push_undo_snapshot("Pick Ground Area")
             self._ground_rect = rect
             self.pick_gnd_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
@@ -3168,20 +3418,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     vertical_shift_deg=self.vshift_spin.value(),
                 )
                 if mapped is not None:
+                    self._push_undo_snapshot("Add Plate Mask")
                     self._views[idx].exclude_rects.append(mapped)
                     self._sync_view_to_table_and_bar(idx)
+                    self._commit_undo_baseline()
                     self._regenerate_preview(fast=False)
                     self.status_label.setText(
                         f"Added exclude mask to Plate #{idx + 1} ({len(self._views[idx].exclude_rects)} total)."
                     )
             return
         else:
+            self._push_undo_snapshot("Pick Light Area")
             shape = self._current_light_shape()
             self._light_regions.append({"rect": rect, "shape": shape})
             self._last_light_exr_paths = []
             self.status_label.setText(
                 f"Added Light #{len(self._light_regions)} ({shape.upper()}). Drag another or uncheck Pick Light Area."
             )
+        self._commit_undo_baseline()
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         self._regenerate_preview()
 
@@ -3229,6 +3483,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_delta = float(np.clip(np.log2(0.18 / max(lum, 1e-4)), -6.0, 6.0))
         self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
         self._action_undo_stack.append("wb")
+        self._undo_stack.append({"kind": "wb", "label": "Neutral WB"})
+        self._refresh_undo_ui()
         self._wb_gains = (
             float(np.clip(self._wb_gains[0] * gains[0], 0.1, 10.0)),
             float(np.clip(self._wb_gains[1] * gains[1], 0.1, 10.0)),
@@ -3271,6 +3527,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         """Apply sampled 3-channel White Balance gains (and optional EV delta) to HDRI synthesis."""
         self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
         self._action_undo_stack.append("wb")
+        self._undo_stack.append({"kind": "wb", "label": "Neutral WB"})
+        self._refresh_undo_ui()
         self._wb_gains = (
             float(np.clip(gains[0], 0.1, 10.0)),
             float(np.clip(gains[1], 0.1, 10.0)),
@@ -3292,6 +3550,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if self._wb_gains != (1.0, 1.0, 1.0):
             self._wb_undo_stack.append((tuple(self._wb_gains), float(self.ev_spin.value())))
             self._action_undo_stack.append("wb")
+            self._undo_stack.append({"kind": "wb", "label": "Reset WB"})
+            self._refresh_undo_ui()
         self._wb_gains = (1.0, 1.0, 1.0)
         self._regenerate_preview()
         self.status_label.setText("Reset White Balance gains to (1.000, 1.000, 1.000).")
@@ -3312,14 +3572,266 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         )
         return True
 
+    def _install_shortcuts(self) -> None:
+        QShortcutCls = getattr(QtGui, "QShortcut", None) or getattr(QtWidgets, "QShortcut", None)
+        if QShortcutCls is None:
+            return
+        self._shortcuts: List[Any] = []
+
+        def _bind(seq, slot) -> None:
+            sc = QShortcutCls(QtGui.QKeySequence(seq), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
+
+        _bind(QtGui.QKeySequence.Undo, self._on_global_undo)
+        _bind("F", self.preview_label.reset_zoom)
+        _bind("H", self.preview_label.reset_zoom)
+        _bind("[", lambda: self._nudge_brush_size(-5))
+        _bind("]", lambda: self._nudge_brush_size(5))
+        _bind("B", lambda: self.brush_btn.toggle())
+        _bind("E", lambda: self.edit_plates_btn.toggle())
+        _bind("Ctrl+Return", self._on_bake_edits_to_canvas)
+        _bind("Ctrl+Enter", self._on_bake_edits_to_canvas)
+
+    def _nudge_brush_size(self, delta: int) -> None:
+        if not hasattr(self, "brush_size_slider"):
+            return
+        val = int(
+            np.clip(
+                self.brush_size_slider.value() + int(delta),
+                self.brush_size_slider.minimum(),
+                self.brush_size_slider.maximum(),
+            )
+        )
+        self.brush_size_slider.setValue(val)
+        self.status_label.setText(f"Brush Size: {val / 10.0:.1f}%")
+
+    def _install_global_undo_hooks(self) -> None:
+        """Track all parameter widget edits with coalesced snapshots so Ctrl+Z undoes any change."""
+        tracked = [
+            (self.plate_path_edit, "Plate Path"),
+            (self.colorspace_combo, "Input Color Space"),
+            (self.seq_mode_combo, "Sequence Mode"),
+            (self.use_range_chk, "Limit Frame Range"),
+            (self.start_frame_spin, "Start Frame"),
+            (self.end_frame_spin, "End Frame"),
+            (self.step_frame_spin, "Step Frame"),
+            (self.fov_spin, "Camera FOV"),
+            (self.cam_az_spin, "Camera Azimuth"),
+            (self.cam_el_spin, "Camera Elevation"),
+            (self.max_hotspots_spin, "Max Hotspots"),
+            (self.ldr_boost_spin, "LDR Highlight Boost"),
+            (self.res_combo, "Output Resolution"),
+            (self.out_cs_combo, "Output Color Space"),
+            (self.ev_spin, "Exposure (EV)"),
+            (self.hs_boost_spin, "Hotspot Boost"),
+            (self.hs_soft_spin, "Hotspot Softness"),
+            (self.wrap_spin, "Ambient Wrap"),
+            (self.sky_gain_spin, "Sky Gain"),
+            (self.gnd_gain_spin, "Ground Gain"),
+            (self.sat_spin, "Saturation"),
+            (self.temp_k_spin, "Target CCT (K)"),
+            (self.temp_blend_spin, "CCT Blend"),
+            (self.plate_blend_spin, "Plate Proj Blend"),
+            (self.yaw_spin, "HDRI Yaw"),
+            (self.vshift_spin, "Horizon Shift"),
+            (self.stitch_blend_spin, "Stitch Blend"),
+            (self.inpaint_chk, "Enable Inpaint"),
+            (self.sky_blend_slider, "Sky Blend"),
+            (self.gnd_blend_slider, "Ground Blend"),
+            (self.sky_blur_slider, "Sky Blur"),
+            (self.gnd_blur_slider, "Ground Blur"),
+            (self.hdri_blur_slider, "HDRI Blur"),
+            (self.sky_fill_slider, "Physical Sky Fill"),
+            (self.highlight_recovery_slider, "Highlight Recovery"),
+            (self.nadir_cleanup_slider, "Nadir Cleanup"),
+            (self.temporal_stab_slider, "Temporal Smooth"),
+            (self.neutralize_env_chk, "Neutralize Environment"),
+            (self.diffuse_split_chk, "Companion Diffuse EXR"),
+            (self.remove_hotspot_chk, "Inpaint Light Out"),
+            (self.light_shape_combo, "Light Shape"),
+            (self.light_res_combo, "Light Tex Res"),
+            (self.light_blur_slider, "Light Area Blur"),
+            (self.lookdev_chk, "Create Lookdev Tripod"),
+            (self.tripod_y_slider, "Tripod Y Height"),
+            (self.ground_radius_slider, "Ground Radius"),
+            (self.ground_proj_blur_slider, "Ground Proj Blur"),
+            (self.ground_feather_slider, "Ground Feather"),
+            (self.ground_emission_slider, "Ground Emission"),
+            (self.render_engine_combo, "Render Engine"),
+            (self.ground_shader_combo, "Ground Shader"),
+            (self.preview_ev_slider, "Preview EV"),
+            (self.preview_roughness_slider, "Preview Roughness"),
+            (self.preview_tonemap_combo, "Preview Tonemap"),
+        ]
+        for w, label in tracked:
+            if w is None:
+                continue
+            if hasattr(w, "editingFinished"):
+                w.editingFinished.connect(lambda l=label: self._schedule_undo_snapshot(l))
+            if hasattr(w, "valueChanged"):
+                w.valueChanged.connect(lambda *_a, l=label: self._schedule_undo_snapshot(l))
+            elif hasattr(w, "toggled"):
+                w.toggled.connect(lambda *_a, l=label: self._schedule_undo_snapshot(l))
+            elif hasattr(w, "currentIndexChanged"):
+                w.currentIndexChanged.connect(lambda *_a, l=label: self._schedule_undo_snapshot(l))
+
+    def _commit_undo_baseline(self) -> None:
+        self._undo_coalesce_timer.stop()
+        try:
+            self._last_committed_state = copy.deepcopy(self.get_state_dict())
+        except Exception:
+            self._last_committed_state = None
+
+    def _schedule_undo_snapshot(self, label: str) -> None:
+        if self._suppress_auto_preview or self._restoring_undo:
+            return
+        self._pending_undo_label = label
+        self._undo_coalesce_timer.start()
+
+    def _flush_pending_undo(self) -> None:
+        if self._suppress_auto_preview or self._restoring_undo:
+            return
+        if self._last_committed_state is None:
+            self._commit_undo_baseline()
+            return
+        try:
+            curr = self.get_state_dict()
+        except Exception:
+            return
+        if curr != self._last_committed_state:
+            self._undo_stack.append(
+                {
+                    "kind": "state",
+                    "label": self._pending_undo_label or "Parameter Change",
+                    "state": copy.deepcopy(self._last_committed_state),
+                }
+            )
+            if len(self._undo_stack) > 40:
+                self._undo_stack.pop(0)
+            self._last_committed_state = copy.deepcopy(curr)
+            self._refresh_undo_ui()
+
+    def _push_undo_snapshot(self, label: str) -> None:
+        """Record current committed state before an immediate discrete edit."""
+        if self._suppress_auto_preview or self._restoring_undo:
+            return
+        self._flush_pending_undo()
+        try:
+            snap = copy.deepcopy(self.get_state_dict())
+        except Exception:
+            return
+        self._undo_stack.append({"kind": "state", "label": label, "state": snap})
+        if len(self._undo_stack) > 40:
+            self._undo_stack.pop(0)
+        self._last_committed_state = copy.deepcopy(snap)
+        self._refresh_undo_ui()
+
+    def _refresh_undo_ui(self) -> None:
+        if not hasattr(self, "global_undo_btn"):
+            return
+        if self._undo_stack:
+            top_label = self._undo_stack[-1].get("label", "Edit")
+            self.global_undo_btn.setEnabled(True)
+            self.global_undo_btn.setText(f"Undo: {top_label}")
+            self.global_undo_btn.setToolTip(f"Undo '{top_label}' (Ctrl+Z) — {len(self._undo_stack)} step(s) available")
+        else:
+            self.global_undo_btn.setEnabled(False)
+            self.global_undo_btn.setText("Undo (Ctrl+Z)")
+            self.global_undo_btn.setToolTip("Undo the last parameter or canvas edit (Ctrl+Z)")
+
+    def _move_selected_multiview_row(self, delta: int) -> None:
+        rows = sorted({idx.row() for idx in self.multiview_table.selectedIndexes()})
+        if len(rows) != 1:
+            self.status_label.setText("Select a single plate row to reorder.")
+            return
+        r = rows[0]
+        target = r + int(delta)
+        n = self.multiview_table.rowCount()
+        if not (0 <= target < n):
+            return
+        self._push_undo_snapshot("Reorder Plate")
+        self.multiview_table.blockSignals(True)
+        try:
+            cols = self.multiview_table.columnCount()
+            row_items = [self.multiview_table.takeItem(r, c) for c in range(cols)]
+            tgt_items = [self.multiview_table.takeItem(target, c) for c in range(cols)]
+            for c in range(cols):
+                if tgt_items[c] is not None:
+                    self.multiview_table.setItem(r, c, tgt_items[c])
+                if row_items[c] is not None:
+                    self.multiview_table.setItem(target, c, row_items[c])
+        finally:
+            self.multiview_table.blockSignals(False)
+        if 0 <= r < len(self._views) and 0 <= target < len(self._views):
+            self._views[r], self._views[target] = self._views[target], self._views[r]
+        self.multiview_table.selectRow(target)
+        self._sync_after_multiview_enable_change(update_status=False)
+        self._commit_undo_baseline()
+        self.status_label.setText(f"Moved plate row #{r + 1} to #{target + 1}.")
+
+    def _on_preview_files_dropped(self, paths: List[str]) -> None:
+        if not paths:
+            return
+        self._push_undo_snapshot("Drop Plates")
+        if len(paths) == 1 and self.multiview_table.rowCount() == 0:
+            self.plate_path_edit.setText(paths[0])
+            self._on_analyze_clicked()
+            self._commit_undo_baseline()
+            return
+        for p in paths:
+            az = 0.0
+            el = 0.0
+            fov = float(self.fov_spin.value())
+            self._add_multiview_row(p, az, el, fov, self.colorspace_combo.currentText())
+        self._sync_after_multiview_list_change()
+        self._commit_undo_baseline()
+
     def _on_global_undo(self) -> None:
+        self._flush_pending_undo()
+        if self._undo_stack:
+            entry = self._undo_stack.pop()
+            kind = entry.get("kind", "state")
+            label = entry.get("label", "Edit")
+            if kind == "wb" and self._wb_undo_stack:
+                self._on_undo_wb()
+                self._commit_undo_baseline()
+                self._refresh_undo_ui()
+                return
+            if kind == "brush" and self._brush_strokes:
+                self._on_undo_brush()
+                self._commit_undo_baseline()
+                self._refresh_undo_ui()
+                return
+            if kind == "bake":
+                self._on_unbake_edits()
+                self._commit_undo_baseline()
+                self._refresh_undo_ui()
+                return
+            if kind == "state" and isinstance(entry.get("state"), dict):
+                self._restoring_undo = True
+                self._suppress_auto_preview = True
+                try:
+                    self._apply_state_dict_inner(entry["state"])
+                finally:
+                    self._suppress_auto_preview = False
+                    self._restoring_undo = False
+                self._commit_undo_baseline()
+                self._refresh_undo_ui()
+                if self._profile is not None or self._baked_canvas_hdri is not None:
+                    self._regenerate_preview()
+                self.status_label.setText(f"Undid: {label}.")
+                return
         while self._action_undo_stack:
             kind = self._action_undo_stack.pop()
             if kind == "wb" and self._wb_undo_stack:
                 self._on_undo_wb()
+                self._refresh_undo_ui()
                 return
             if kind == "brush" and self._brush_strokes:
                 self._on_undo_brush()
+                self._refresh_undo_ui()
                 return
         if self._brush_strokes:
             self._on_undo_brush()
@@ -3327,6 +3839,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._on_undo_wb()
         else:
             self.status_label.setText("Nothing to undo.")
+        self._refresh_undo_ui()
 
     def _on_auto_level_horizon(self) -> None:
         if self._profile is None:
@@ -3463,6 +3976,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self.status_label.setText("Brush (Clone Stamp): Ctrl+Click to set Clone Source, then drag to paint.")
             else:
                 self.status_label.setText(f"Brush ({self.brush_mode_combo.currentText()}): Drag on canvas to paint in 32-bit float.")
+        if hasattr(self, "brush_toolbar_widget"):
+            self.brush_toolbar_widget.setVisible(bool(checked))
         self._on_brush_config_changed()
 
     def _on_brush_config_changed(self, *_args) -> None:
@@ -3578,6 +4093,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if self._active_brush_stroke is not None:
             self._brush_strokes.append(self._active_brush_stroke)
             self._action_undo_stack.append("brush")
+            mode = self._active_brush_stroke.get("mode", "heal")
+            self._undo_stack.append({"kind": "brush", "label": f"Brush ({mode})"})
+            self._refresh_undo_ui()
             self._active_brush_stroke = None
             self._brush_clone_offset_uv = None
             self.status_label.setText(f"Applied brush stroke ({len(self._brush_strokes)} total).")
@@ -3714,9 +4232,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
             self.unbake_edits_btn.setEnabled(True)
+            self.unbake_edits_btn.setText(f"Unbake ({len(self._bake_history)})")
             self.unbake_edits_btn.setToolTip(
                 f"Step back to previous state ({len(self._bake_history)} saved in history)"
             )
+            self._undo_stack.append({"kind": "bake", "label": "Apply / Collapse"})
+            self._refresh_undo_ui()
             self.bake_edits_btn.clearFocus()
             self._regenerate_preview()
             self.status_label.setText(
@@ -3742,6 +4263,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._baked_azimuth_offset_deg = 0.0
         has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
         self.unbake_edits_btn.setEnabled(has_more)
+        self.unbake_edits_btn.setText(
+            f"Unbake ({len(self._bake_history)})" if self._bake_history else "Unbake"
+        )
         self.unbake_edits_btn.setToolTip(
             f"Step back to previous state ({len(self._bake_history)} saved in history)"
             if has_more
@@ -4652,6 +5176,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._wb_gains = (1.0, 1.0, 1.0)
             self._wb_undo_stack.clear()
             self._action_undo_stack.clear()
+            self._undo_stack.clear()
             self._rough_cache = None
             self._raw_rough_cache = None
             self._selected_plate_idx = -1
@@ -4687,12 +5212,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.preview_label.set_source_pixmap(None)
             self.preview_label.setText("Analyze a plate or multi-view set to preview the 2:1 Lat/Long HDRI.")
             self.unbake_edits_btn.setEnabled(False)
+            self.unbake_edits_btn.setText("Unbake")
             self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
             self.hotspot_table.setRowCount(0)
             self.metrics_label.setText("Analyze a plate to see extracted lighting metrics.")
             self._refresh_plate_transform_bar()
         finally:
             self._suppress_auto_preview = False
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
         self._auto_save_session()
         self.status_label.setText("Fresh setup ready: cleared all plates, edits, bake history, and parameters.")
 
