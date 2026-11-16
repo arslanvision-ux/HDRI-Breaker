@@ -3863,10 +3863,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._refresh_undo_ui()
                 return
             if kind == "state" and isinstance(entry.get("state"), dict):
+                saved_brushes = [dict(s) for s in self._brush_strokes]
                 self._restoring_undo = True
                 self._suppress_auto_preview = True
                 try:
                     self._apply_state_dict_inner(entry["state"])
+                    self._brush_strokes = saved_brushes
                 finally:
                     self._suppress_auto_preview = False
                     self._restoring_undo = False
@@ -4150,9 +4152,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._action_undo_stack.append("brush")
             mode = self._active_brush_stroke.get("mode", "heal")
             self._undo_stack.append({"kind": "brush", "label": f"Brush ({mode})"})
-            self._refresh_undo_ui()
             self._active_brush_stroke = None
             self._brush_clone_offset_uv = None
+            self._commit_undo_baseline()
+            self._refresh_undo_ui()
             self.status_label.setText(f"Applied brush stroke ({len(self._brush_strokes)} total).")
 
     def _on_undo_brush(self) -> None:
