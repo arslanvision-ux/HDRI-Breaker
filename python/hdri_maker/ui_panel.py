@@ -2731,13 +2731,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         vignette_v1: float = 0.0,
         exclude_rects: Optional[List[Tuple[float, float, float, float]]] = None,
         enabled: bool = True,
+        bracket_sources: Optional[List[str]] = None,
     ) -> None:
         was_blocked = self.multiview_table.blockSignals(True)
         try:
             row = self.multiview_table.rowCount()
             self.multiview_table.insertRow(row)
 
-            file_item = QtWidgets.QTableWidgetItem(os.path.basename(path))
+            src_list = [str(s) for s in (bracket_sources or []) if s]
+            disp_name = os.path.basename(path)
+            if len(src_list) >= 2:
+                disp_name = f"{disp_name}  [{len(src_list)} brackets]"
+            file_item = QtWidgets.QTableWidgetItem(disp_name)
             file_item.setData(Qt.UserRole, path)
             file_item.setData(
                 Qt.UserRole + 1,
@@ -2750,9 +2755,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "exposure_ev": float(exposure_ev),
                     "vignette_v1": float(vignette_v1),
                     "exclude_rects": [list(r) for r in (exclude_rects or [])],
+                    "bracket_sources": src_list,
                 },
             )
-            file_item.setToolTip(path)
+            if len(src_list) >= 2:
+                src_lines = "\n".join(f"  • {os.path.basename(s)}" for s in src_list)
+                file_item.setToolTip(f"{path}\n\nMerged from {len(src_list)} brackets:\n{src_lines}")
+            else:
+                file_item.setToolTip(path)
             file_item.setFlags((file_item.flags() & ~Qt.ItemIsEditable) | Qt.ItemIsUserCheckable)
             file_item.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
             thumb_icon = self._make_plate_thumbnail(path, cs)
@@ -2920,25 +2930,33 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             )
 
     def _on_multiview_context_menu(self, pos: QtCore.QPoint) -> None:
+        sel_rows = sorted({idx.row() for idx in self.multiview_table.selectedIndexes()})
+        if not sel_rows and self.multiview_table.currentRow() >= 0:
+            sel_rows = [self.multiview_table.currentRow()]
         menu = QtWidgets.QMenu(self.multiview_table)
         act_add = menu.addAction("Add Plates...")
+        act_merge = menu.addAction(f"Merge Selected Rows as Brackets ({len(sel_rows)})")
         act_toggle = menu.addAction("Enable / Disable Selected Plate(s)")
         act_rm = menu.addAction("Remove Selected Plate(s)")
         act_use = menu.addAction("Set as Single Plate Path")
         menu.addSeparator()
         act_clear = menu.addAction("Clear All")
 
-        has_sel = len(self.multiview_table.selectedIndexes()) > 0 or self.multiview_table.currentRow() >= 0
+        has_sel = len(sel_rows) > 0
+        act_merge.setEnabled(len(sel_rows) >= 2)
         act_toggle.setEnabled(has_sel)
         act_rm.setEnabled(has_sel)
         act_use.setEnabled(has_sel)
         act_clear.setEnabled(self.multiview_table.rowCount() > 0)
 
-        chosen = menu.exec_(self.multiview_table.viewport().mapToGlobal(pos))
+        exec_fn = getattr(menu, "exec", None) or getattr(menu, "exec_", None)
+        chosen = exec_fn(self.multiview_table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
         if chosen == act_add:
             self._on_add_multiview_plates()
+        elif chosen == act_merge:
+            self._merge_selected_multiview_rows_as_brackets(sel_rows)
         elif chosen == act_toggle:
             rows = sorted({idx.row() for idx in self.multiview_table.selectedIndexes()})
             if not rows and self.multiview_table.currentRow() >= 0:
@@ -2972,6 +2990,43 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     self.plate_path_edit.setText(str(item.data(Qt.UserRole) or ""))
         elif chosen == act_clear:
             self._on_clear_multiview_plates()
+
+    def _merge_selected_multiview_rows_as_brackets(self, rows: List[int]) -> None:
+        rows = sorted(r for r in rows if 0 <= r < self.multiview_table.rowCount())
+        if len(rows) < 2:
+            return
+        src_paths: List[str] = []
+        for r in rows:
+            it = self.multiview_table.item(r, 0)
+            p = str(it.data(Qt.UserRole) or "") if it is not None else ""
+            if p:
+                src_paths.append(p)
+        if len(src_paths) < 2:
+            return
+        try:
+            self._push_undo_snapshot("Merge Selected Rows as Brackets")
+            first_r = rows[0]
+            az = float(self.multiview_table.item(first_r, 1).text())
+            el = float(self.multiview_table.item(first_r, 2).text())
+            fov = float(self.multiview_table.item(first_r, 3).text())
+            cs = self.multiview_table.item(first_r, 4).text()
+
+            self.status_label.setText(f"Merging {len(src_paths)} selected bracket rows into 32-bit EXR...")
+            QtWidgets.QApplication.processEvents()
+            merged_hdr = merge_ldr_brackets_to_hdr(src_paths, colorspace=cs)
+            stem, _ = os.path.splitext(src_paths[0])
+            written = write_exr_32f(f"{stem}_merged_hdr.exr", merged_hdr, output_colorspace="Linear Rec.709")
+
+            for r in sorted(rows, reverse=True):
+                self.multiview_table.removeRow(r)
+            self._add_multiview_row(written, az, el, fov, "Auto", bracket_sources=src_paths)
+            self._sync_after_multiview_list_change(removed_indices=rows)
+            self._commit_undo_baseline()
+            self.status_label.setText(
+                f"Merged {len(src_paths)} rows into {os.path.basename(written)} [{len(src_paths)} brackets]."
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Bracket merge error: {exc}")
 
     def _on_add_multiview_plates(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -4601,7 +4656,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 az = i * (360.0 / float(max(total, 1)))
                 if az > 180.0:
                     az -= 360.0
-                self._add_multiview_row(p, az, el, fov, "Auto")
+                grp_srcs = groups[i] if i < len(groups) else []
+                self._add_multiview_row(p, az, el, fov, "Auto", bracket_sources=grp_srcs)
             self._maybe_update_default_output_path(exr_paths[0])
             self._on_analyze_clicked()
             self._commit_undo_baseline()
@@ -5575,6 +5631,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "vignette_v1": float(extra.get("vignette_v1", 0.0)),
                     "exclude_rects": [list(r) for r in (extra.get("exclude_rects") or [])],
                     "enabled": (item0.checkState() == Qt.Checked) if item0 is not None else True,
+                    "bracket_sources": list(extra.get("bracket_sources") or []),
                 }
             )
         return {
@@ -5700,6 +5757,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     vignette_v1=float(row_d.get("vignette_v1", 0.0)),
                     exclude_rects=[tuple(r) for r in (row_d.get("exclude_rects") or [])],
                     enabled=bool(row_d.get("enabled", True)),
+                    bracket_sources=list(row_d.get("bracket_sources") or []),
                 )
 
         if "resolution" in data:
