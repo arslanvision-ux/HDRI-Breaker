@@ -9,7 +9,7 @@
 > 📖 **New here? Read the [Complete Step-by-Step Workflow Tutorial](docs/TUTORIAL.md)** (covering Exposure Brackets, Phone/Camera RAW & DNG, Multi-Position Stitching, 32-bit Brush Cleanup, Apply/Collapse, and Solaris Wiring).
 
 <p align="center">
-  <img src="docs/hdri_breaker_preview.jpg" alt="HDRI Breaker Main Window" width="100%" />
+  <img src="docs/hdri_breaker_ui_updated.jpg" alt="HDRI Breaker Main Window" width="100%" />
 </p>
 
 <p align="center">

@@ -2,6 +2,8 @@
 
 This guide walks through the full **HDRI Breaker** workflow in Houdini 20.0 / 20.5 / 21.0+ Solaris (`/stage`), from preparing camera/phone shots and exposure brackets to synthesizing a 32-bit float Lat/Long `.exr` and wiring a Solaris lookdev rig.
 
+![HDRI Breaker UI Overview with Collapsible Panels & 32-bit Clone Stamp Brush](hdri_breaker_ui_updated.jpg)
+
 ---
 
 ## 1. Preparing Your Images
