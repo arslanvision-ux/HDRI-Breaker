@@ -271,6 +271,52 @@ class CollapsibleGroupBox(QtWidgets.QWidget):
         self.toggle_btn.setChecked(not bool(collapsed))
 
 
+class _VerticalResizeGrip(QtWidgets.QFrame):
+    """Draggable horizontal bar to resize a target widget's height interactively."""
+
+    def __init__(self, target: QtWidgets.QWidget, min_h: int = 100, max_h: int = 720, parent=None):
+        super().__init__(parent)
+        self._target = target
+        self._min_h = int(min_h)
+        self._max_h = int(max_h)
+        self._dragging = False
+        self._start_y = 0
+        self._start_h = target.height()
+        self.setFixedHeight(8)
+        self.setCursor(Qt.SizeVerCursor)
+        self.setToolTip("Drag up/down to resize the plate list height")
+        self.setStyleSheet(
+            "QFrame { background-color: #2b313e; border-radius: 3px; }"
+            "QFrame:hover { background-color: #3b82f6; }"
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            self._start_y = pos.y()
+            self._start_h = max(self._min_h, self._target.height())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging:
+            pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else event.globalPos()
+            new_h = max(self._min_h, min(self._max_h, self._start_h + (pos.y() - self._start_y)))
+            self._target.setFixedHeight(new_h)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._dragging and event.button() == Qt.LeftButton:
+            self._dragging = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class SliderResetControl(QtWidgets.QWidget):
     """Compact horizontal slider + numeric readout + reset button."""
 
@@ -1851,19 +1897,26 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         mv_hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         for col in (1, 2, 3, 4, 5):
             mv_hdr.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        self.multiview_table.setMinimumHeight(140)
-        self.multiview_table.setMaximumHeight(240)
+        self.multiview_table.setFixedHeight(180)
         self.multiview_table.setToolTip(
             "Optional: Add multiple plates taken from different camera positions/angles.\n"
             "Double-click Az°, El°, or FOV° to adjust each photo's orientation.\n"
-            "Select rows and press Del or click × / Remove to remove plates."
+            "Select rows and press Del or click × / Remove to remove plates.\n"
+            "Drag the bar below the table to resize the plate list."
         )
         shortcut_cls = getattr(QtGui, "QShortcut", None) or getattr(QtWidgets, "QShortcut", None)
         if shortcut_cls is not None:
             del_sc = shortcut_cls(QtGui.QKeySequence.Delete, self.multiview_table)
             del_sc.setContext(Qt.WidgetWithChildrenShortcut)
             del_sc.activated.connect(self._on_remove_selected_multiview_plates)
-        form.addRow(self.multiview_table)
+        mv_wrap = QtWidgets.QWidget()
+        mv_wrap_lay = QtWidgets.QVBoxLayout(mv_wrap)
+        mv_wrap_lay.setContentsMargins(0, 0, 0, 0)
+        mv_wrap_lay.setSpacing(2)
+        mv_wrap_lay.addWidget(self.multiview_table)
+        self.multiview_resize_grip = _VerticalResizeGrip(self.multiview_table, min_h=100, max_h=720)
+        mv_wrap_lay.addWidget(self.multiview_resize_grip)
+        form.addRow(mv_wrap)
 
         self.analyze_btn = QtWidgets.QPushButton("Analyze Plate(s) & Generate Preview")
         self.analyze_btn.setMinimumHeight(34)
@@ -2936,6 +2989,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self.multiview_table)
         act_add = menu.addAction("Add Plates...")
         act_merge = menu.addAction(f"Merge Selected Rows as Brackets ({len(sel_rows)})")
+        act_inspect = None
+        if len(sel_rows) == 1:
+            it0 = self.multiview_table.item(sel_rows[0], 0)
+            extra0 = it0.data(Qt.UserRole + 1) if it0 is not None else {}
+            b_srcs = (extra0 or {}).get("bracket_sources") or []
+            if len(b_srcs) >= 2:
+                act_inspect = menu.addAction(f"Inspect Bracket Group ({len(b_srcs)} files)...")
         act_toggle = menu.addAction("Enable / Disable Selected Plate(s)")
         act_rm = menu.addAction("Remove Selected Plate(s)")
         act_use = menu.addAction("Set as Single Plate Path")
@@ -2957,6 +3017,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._on_add_multiview_plates()
         elif chosen == act_merge:
             self._merge_selected_multiview_rows_as_brackets(sel_rows)
+        elif act_inspect is not None and chosen == act_inspect:
+            it0 = self.multiview_table.item(sel_rows[0], 0)
+            extra0 = it0.data(Qt.UserRole + 1) if it0 is not None else {}
+            b_srcs = (extra0 or {}).get("bracket_sources") or []
+            listing = "\n".join(f"{idx + 1}. {s}" for idx, s in enumerate(b_srcs))
+            QtWidgets.QMessageBox.information(
+                self,
+                f"Bracket Group ({len(b_srcs)} Source Images)",
+                f"Merged Output:\n{it0.data(Qt.UserRole)}\n\nSource Brackets:\n{listing}",
+            )
         elif chosen == act_toggle:
             rows = sorted({idx.row() for idx in self.multiview_table.selectedIndexes()})
             if not rows and self.multiview_table.currentRow() >= 0:
@@ -4642,6 +4712,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         try:
             self._push_undo_snapshot("Batch Merge Brackets")
             groups = group_bracket_sequences(paths, frames_per_angle=(n_per if n_per >= 2 else None))
+            if n_per == 0 and groups and all(len(g) == 1 for g in groups):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Batch Bracket Grouping",
+                    "Auto-detect found only 1 image per group (timestamps were >3.5s apart).\n"
+                    "Please re-run Batch Brackets and enter the exact number of brackets per angle (e.g. 3 or 5).",
+                )
+                return
             self.status_label.setText(f"Merging {len(groups)} bracketed angle group(s) to 32-bit EXR...")
             QtWidgets.QApplication.processEvents()
             exr_paths = batch_merge_bracket_groups(groups, colorspace=self.colorspace_combo.currentText())
