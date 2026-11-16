@@ -818,14 +818,14 @@ def merge_ldr_brackets_to_hdr(
             evs = [med_ev - float(e) for e in exif_evs]
         else:
             mid_idx = len(imgs) // 2
-        ref_lum = max(med_lums[mid_idx], 1e-4)
-        evs = []
-        for idx, ml in enumerate(med_lums):
-            ratio = max(ml, 1e-5) / ref_lum
-            est_ev = float(np.log2(ratio))
-            if abs(est_ev) < 0.15 and idx != mid_idx:
-                est_ev = float((idx - mid_idx) * 2.0)
-            evs.append(est_ev)
+            ref_lum = max(med_lums[mid_idx], 1e-4)
+            evs = []
+            for idx, ml in enumerate(med_lums):
+                ratio = max(ml, 1e-5) / ref_lum
+                est_ev = float(np.log2(ratio))
+                if abs(est_ev) < 0.15 and idx != mid_idx:
+                    est_ev = float((idx - mid_idx) * 2.0)
+                evs.append(est_ev)
 
     accum_hdr = np.zeros((target_h, target_w, 3), dtype=np.float32)
     accum_w = np.zeros((target_h, target_w, 1), dtype=np.float32)

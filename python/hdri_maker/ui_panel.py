@@ -4735,7 +4735,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 if az > 180.0:
                     az -= 360.0
                 grp_srcs = groups[i] if i < len(groups) else []
-                self._add_multiview_row(p, az, el, fov, "Auto", bracket_sources=grp_srcs)
+                grp_fov = fov
+                if grp_srcs:
+                    m0 = read_plate_metadata(grp_srcs[0])
+                    if m0.get("fov_h_deg") is not None:
+                        grp_fov = float(m0["fov_h_deg"])
+                self._add_multiview_row(p, az, el, grp_fov, "Auto", bracket_sources=grp_srcs)
             self._maybe_update_default_output_path(exr_paths[0])
             self._on_analyze_clicked()
             self._commit_undo_baseline()
