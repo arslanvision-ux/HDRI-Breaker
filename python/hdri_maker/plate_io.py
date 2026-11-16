@@ -88,6 +88,12 @@ def _read_exif_from_tiff_container(path: str) -> Dict[str, Any]:
                         tags[tag] = v
                     elif typ == 4 and nval == 1:  # LONG
                         tags[tag] = val_off
+                    elif typ == 2 and nval > 4 and nval <= 64:  # ASCII
+                        cur = f.tell()
+                        f.seek(val_off)
+                        raw_s = f.read(nval)
+                        f.seek(cur)
+                        tags[tag] = raw_s.split(b"\x00", 1)[0].decode("ascii", errors="ignore").strip()
                     elif typ == 5 and nval == 1:  # RATIONAL
                         cur = f.tell()
                         f.seek(val_off)
@@ -109,6 +115,14 @@ def _read_exif_from_tiff_container(path: str) -> Dict[str, Any]:
                     out["focal_35"] = float(exif_ifd[41989])
                 if 37386 in exif_ifd:
                     out["focal_mm"] = float(exif_ifd[37386])
+                if 33434 in exif_ifd:
+                    out["exposure_time"] = float(exif_ifd[33434])
+                if 33437 in exif_ifd:
+                    out["f_number"] = float(exif_ifd[33437])
+                if 34855 in exif_ifd:
+                    out["iso"] = int(exif_ifd[34855])
+                if 36867 in exif_ifd:
+                    out["datetime"] = str(exif_ifd[36867])
     except Exception:
         pass
     return out
@@ -798,7 +812,12 @@ def merge_ldr_brackets_to_hdr(
     if ev_offsets is not None and len(ev_offsets) == len(imgs):
         evs = sorted(float(v) for v in ev_offsets)
     else:
-        mid_idx = len(imgs) // 2
+        exif_evs = [read_plate_metadata(paths[int(i)]).get("ev100") for i in order]
+        if all(e is not None for e in exif_evs):
+            med_ev = float(np.median([float(e) for e in exif_evs]))
+            evs = [med_ev - float(e) for e in exif_evs]
+        else:
+            mid_idx = len(imgs) // 2
         ref_lum = max(med_lums[mid_idx], 1e-4)
         evs = []
         for idx, ml in enumerate(med_lums):
@@ -846,18 +865,40 @@ def merge_ldr_brackets_to_hdr(
 
 def read_plate_metadata(path: str) -> Dict[str, Any]:
     """
-    Extract camera FOV (horizontal degrees) and roll orientation (degrees) from
-    EXIF / OpenImageIO metadata when available.
+    Extract camera FOV (horizontal degrees), roll orientation (degrees), and
+    EXIF exposure/timestamp metadata when available.
 
     Returns:
-        {"fov_h_deg": Optional[float], "roll_deg": float, "focal_mm": Optional[float]}
+        {
+            "fov_h_deg": Optional[float],
+            "roll_deg": float,
+            "focal_mm": Optional[float],
+            "exposure_time": Optional[float],
+            "f_number": Optional[float],
+            "iso": Optional[int],
+            "ev100": Optional[float],
+            "timestamp": Optional[float],
+        }
     """
-    result: Dict[str, Any] = {"fov_h_deg": None, "roll_deg": 0.0, "focal_mm": None}
+    result: Dict[str, Any] = {
+        "fov_h_deg": None,
+        "roll_deg": 0.0,
+        "focal_mm": None,
+        "exposure_time": None,
+        "f_number": None,
+        "iso": None,
+        "ev100": None,
+        "timestamp": None,
+    }
     if not path or not os.path.isfile(path):
         return result
 
     focal_35: Optional[float] = None
     focal_mm: Optional[float] = None
+    exposure_time: Optional[float] = None
+    f_number: Optional[float] = None
+    iso_val: Optional[int] = None
+    dt_str: str = ""
     orient: int = 1
     width: int = 0
     height: int = 0
@@ -878,37 +919,81 @@ def read_plate_metadata(path: str) -> Dict[str, Any]:
                     if val > 1.0:
                         focal_mm = float(val)
                         break
+                for key in ("ExposureTime", "Exif:ExposureTime"):
+                    val = spec.get_float_attribute(key, 0.0)
+                    if val > 0.0:
+                        exposure_time = float(val)
+                        break
+                for key in ("FNumber", "Exif:FNumber"):
+                    val = spec.get_float_attribute(key, 0.0)
+                    if val > 0.0:
+                        f_number = float(val)
+                        break
+                for key in ("Exif:ISOSpeedRatings", "ISOSpeedRatings", "Exif:PhotographicSensitivity"):
+                    val = spec.get_int_attribute(key, 0)
+                    if val > 0:
+                        iso_val = int(val)
+                        break
+                for key in ("Exif:DateTimeOriginal", "DateTime"):
+                    s = spec.get_string_attribute(key, "")
+                    if s:
+                        dt_str = str(s)
+                        break
                 orient = int(spec.get_int_attribute("Orientation", 1))
                 inp.close()
         except Exception:
             pass
 
-    if focal_35 is None and HAS_PIL:
+    if (focal_35 is None or exposure_time is None or f_number is None) and HAS_PIL:
         try:
             with Image.open(path) as im:
-                width, height = im.size
+                if width == 0:
+                    width, height = im.size
                 exif = im.getexif() if hasattr(im, "getexif") else None
                 if exif:
-                    # 41989 = FocalLengthIn35mmFilm, 37386 = FocalLength, 274 = Orientation
                     f35 = exif.get(41989)
-                    if f35 and float(f35) > 1.0:
+                    if focal_35 is None and f35 and float(f35) > 1.0:
                         focal_35 = float(f35)
                     fl = exif.get(37386)
-                    if fl is not None:
+                    if focal_mm is None and fl is not None:
                         focal_mm = float(fl)
+                    et = exif.get(33434)
+                    if exposure_time is None and et is not None and float(et) > 0.0:
+                        exposure_time = float(et)
+                    fn = exif.get(33437)
+                    if f_number is None and fn is not None and float(fn) > 0.0:
+                        f_number = float(fn)
+                    iv = exif.get(34855)
+                    if iso_val is None and iv is not None:
+                        if isinstance(iv, (tuple, list)):
+                            iv = iv[0] if iv else None
+                        if iv and int(iv) > 0:
+                            iso_val = int(iv)
+                    if not dt_str:
+                        dt_raw = exif.get(36867) or exif.get(306)
+                        if dt_raw:
+                            dt_str = str(dt_raw)
                     ori = exif.get(274)
-                    if ori is not None:
+                    if ori is not None and orient == 1:
                         orient = int(ori)
         except Exception:
             pass
 
-    if focal_35 is None and focal_mm is None:
+    if focal_35 is None or exposure_time is None or f_number is None:
         tiff_exif = _read_exif_from_tiff_container(path)
         if tiff_exif:
-            if "focal_35" in tiff_exif and float(tiff_exif["focal_35"]) > 1.0:
+            if focal_35 is None and "focal_35" in tiff_exif and float(tiff_exif["focal_35"]) > 1.0:
                 focal_35 = float(tiff_exif["focal_35"])
-            if "focal_mm" in tiff_exif and float(tiff_exif["focal_mm"]) > 1.0:
+            if focal_mm is None and "focal_mm" in tiff_exif and float(tiff_exif["focal_mm"]) > 1.0:
                 focal_mm = float(tiff_exif["focal_mm"])
+            if exposure_time is None and "exposure_time" in tiff_exif and float(tiff_exif["exposure_time"]) > 0.0:
+                exposure_time = float(tiff_exif["exposure_time"])
+            if f_number is None and "f_number" in tiff_exif and float(tiff_exif["f_number"]) > 0.0:
+                f_number = float(tiff_exif["f_number"])
+            if iso_val is None and "iso" in tiff_exif and int(tiff_exif["iso"]) > 0:
+                iso_val = int(tiff_exif["iso"])
+            if not dt_str and "datetime" in tiff_exif:
+                dt_str = str(tiff_exif["datetime"])
             if "orient" in tiff_exif and orient == 1:
                 orient = int(tiff_exif["orient"])
 
@@ -919,15 +1004,103 @@ def read_plate_metadata(path: str) -> Dict[str, Any]:
     elif orient == 3:
         result["roll_deg"] = 180.0
 
-    # Only trust FocalLengthIn35mmFilm, or raw focal_mm >= 14mm (avoid phone 4mm lens / 36mm sensor mismatch)
     used_focal = focal_35 if focal_35 is not None else (focal_mm if (focal_mm is not None and focal_mm >= 14.0) else None)
     if used_focal is not None and used_focal > 1.0:
-        # 36mm full-frame sensor width baseline; adjust if portrait aspect
         sensor_w = 36.0 if width >= height or height == 0 else 24.0
         fov_rad = 2.0 * math.atan(sensor_w / (2.0 * used_focal))
         result["fov_h_deg"] = float(np.clip(math.degrees(fov_rad), 10.0, 165.0))
         result["focal_mm"] = float(used_focal)
+
+    result["exposure_time"] = exposure_time
+    result["f_number"] = f_number
+    result["iso"] = iso_val
+    if exposure_time and exposure_time > 0.0 and f_number and f_number > 0.0:
+        iso_eff = float(iso_val) if (iso_val and iso_val > 0) else 100.0
+        result["ev100"] = float(math.log2((f_number ** 2) / exposure_time) - math.log2(iso_eff / 100.0))
+
+    ts: Optional[float] = None
+    if dt_str:
+        try:
+            import datetime as _dt
+
+            ts = _dt.datetime.strptime(dt_str[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+        except Exception:
+            ts = None
+    if ts is None:
+        try:
+            ts = float(os.path.getmtime(path))
+        except Exception:
+            ts = None
+    result["timestamp"] = ts
     return result
+
+
+def group_bracket_sequences(
+    paths: List[str],
+    frames_per_angle: Optional[int] = None,
+) -> List[List[str]]:
+    """
+    Group a flat list of bracketed photos from a 360° shoot into per-angle bracket groups.
+
+    If `frames_per_angle` (>= 2) is given, chunks deterministically into groups of that size.
+    Otherwise, groups by EXIF timestamp gaps (> 3.0s) or EV cycle resets.
+    """
+    clean = [p for p in paths if p and os.path.isfile(p)]
+    if not clean:
+        return []
+    metas = [(p, read_plate_metadata(p)) for p in clean]
+    metas.sort(key=lambda item: (item[1].get("timestamp") or 0.0, item[0]))
+
+    if frames_per_angle is not None and frames_per_angle >= 2:
+        n = int(frames_per_angle)
+        return [[p for p, _ in metas[i : i + n]] for i in range(0, len(metas), n) if len(metas[i : i + n]) >= 1]
+
+    groups: List[List[str]] = [[metas[0][0]]]
+    prev_ts = metas[0][1].get("timestamp")
+    prev_ev = metas[0][1].get("ev100")
+    ev_dir: Optional[int] = None  # +1 ascending, -1 descending
+
+    for p, m in metas[1:]:
+        ts = m.get("timestamp")
+        ev = m.get("ev100")
+        split = False
+        if ts is not None and prev_ts is not None and (ts - prev_ts) > 3.5:
+            split = True
+        elif ev is not None and prev_ev is not None:
+            diff = ev - prev_ev
+            if abs(diff) > 0.25:
+                cur_dir = 1 if diff > 0 else -1
+                if ev_dir is not None and cur_dir != ev_dir and len(groups[-1]) >= 2:
+                    split = True
+                else:
+                    ev_dir = cur_dir
+        if split:
+            groups.append([p])
+            ev_dir = None
+        else:
+            groups[-1].append(p)
+        prev_ts = ts
+        prev_ev = ev
+    return groups
+
+
+def batch_merge_bracket_groups(
+    groups: List[List[str]],
+    out_dir: Optional[str] = None,
+    colorspace: str = "Auto",
+) -> List[str]:
+    """Merge each bracket group into a 32-bit float Linear Rec.709 EXR and return output paths."""
+    out_paths: List[str] = []
+    for idx, grp in enumerate(groups, start=1):
+        if not grp:
+            continue
+        merged = merge_ldr_brackets_to_hdr(grp, colorspace=colorspace)
+        base_dir = out_dir or os.path.dirname(grp[0]) or "."
+        stem = os.path.splitext(os.path.basename(grp[0]))[0]
+        dst = os.path.join(base_dir, f"angle_{idx:02d}_{stem}_merged_hdr.exr")
+        written = write_exr_32f(dst, merged, output_colorspace="Linear Rec.709")
+        out_paths.append(written)
+    return out_paths
 
 
 def format_frame_path(pattern: str, frame: int) -> str:

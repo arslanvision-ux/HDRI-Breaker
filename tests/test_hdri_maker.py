@@ -742,6 +742,51 @@ class TestHDRIMaker(unittest.TestCase):
         except ImportError:
             pass
 
+    def test_batch_brackets_exif_ev_sun_and_lookdev_spheres(self) -> None:
+        from hdri_maker.hdri_generator import (
+            HDRISynthesisParams,
+            reconstruct_physical_sun_disk,
+            render_lookdev_sphere_preview_srgb,
+        )
+        from hdri_maker.plate_io import (
+            batch_merge_bracket_groups,
+            group_bracket_sequences,
+            write_exr_32f,
+        )
+        from hdri_maker.solaris_stage import sync_solaris_dome_live
+
+        # 1. Batch bracket grouping & merging (2 angles x 2 brackets)
+        bracket_paths = []
+        for ang_idx in range(2):
+            for ev_idx, val in enumerate((0.15, 0.75)):
+                arr = np.full((32, 32, 3), val, dtype=np.float32)
+                p = os.path.join(self.tmpdir.name, f"ang{ang_idx}_b{ev_idx}.exr")
+                write_exr_32f(p, arr, output_colorspace="Linear Rec.709")
+                bracket_paths.append(p)
+        groups = group_bracket_sequences(bracket_paths, frames_per_angle=2)
+        self.assertEqual(len(groups), 2)
+        merged_exrs = batch_merge_bracket_groups(groups, out_dir=self.tmpdir.name)
+        self.assertEqual(len(merged_exrs), 2)
+        for mp in merged_exrs:
+            self.assertTrue(os.path.isfile(mp))
+
+        # 2. Physical sun disk reconstruction
+        sky = np.full((64, 128, 3), 0.25, dtype=np.float32)
+        sky[16, 64] = [1.0, 0.95, 0.85]
+        reconstructed = reconstruct_physical_sun_disk(sky, strength=1.0)
+        self.assertGreater(float(np.max(reconstructed)), 50.0)
+        self.assertEqual(HDRISynthesisParams(sun_reconstruct=1.0).sun_reconstruct, 1.0)
+
+        # 3. Lookdev Sphere Preview (Chrome + 18% Gray ball)
+        spheres = render_lookdev_sphere_preview_srgb(reconstructed, width=256, height=128)
+        self.assertEqual(spheres.shape, (128, 256, 3))
+        self.assertEqual(spheres.dtype, np.uint8)
+        self.assertGreater(int(np.max(spheres)), 20)
+
+        # 4. Solaris Live Sync helper (graceful False outside Houdini or when no dome exists)
+        res = sync_solaris_dome_live(None, yaw_deg=45.0, exposure_ev=0.5)
+        self.assertIsInstance(res, bool)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

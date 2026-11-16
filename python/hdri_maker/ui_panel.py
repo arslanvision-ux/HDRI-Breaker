@@ -30,6 +30,7 @@ from .hdri_generator import (
     extract_and_inpaint_multiple_hotspots,
     generate_diffuse_irradiance_hdri,
     generate_latlong_hdri,
+    render_lookdev_sphere_preview_srgb,
     render_preview_srgb,
 )
 from .lighting_analyzer import (
@@ -50,6 +51,8 @@ from .lighting_analyzer import (
     rgb_to_cct_kelvin,
 )
 from .plate_io import (
+    batch_merge_bracket_groups,
+    group_bracket_sequences,
     linear_to_srgb,
     merge_ldr_brackets_to_hdr,
     read_plate,
@@ -67,6 +70,7 @@ from .solaris_stage import (
     export_solaris_rig_usd,
     list_scene_cameras,
     read_scene_camera_params,
+    sync_solaris_dome_live,
 )
 
 try:
@@ -1698,9 +1702,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "Select 2+ bracketed LDR/HDR exposures (-2 EV, 0 EV, +2 EV) to merge into a 32-bit float HDR EXR"
         )
         merge_hdr_btn.clicked.connect(self._on_merge_brackets_clicked)
+        batch_hdr_btn = QtWidgets.QPushButton("Batch Brackets...")
+        batch_hdr_btn.setToolTip(
+            "Select all bracketed photos from a 360° shoot: auto-groups by angle/timestamp, merges each to 32-bit EXR, and loads into Multi-Position"
+        )
+        batch_hdr_btn.clicked.connect(self._on_batch_merge_brackets_clicked)
         path_row.addWidget(self.plate_path_edit)
         path_row.addWidget(browse_btn)
         path_row.addWidget(merge_hdr_btn)
+        path_row.addWidget(batch_hdr_btn)
         form.addRow("Plate Path:", path_row)
 
         # Colorspace & Sequence mode
@@ -1940,6 +1950,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.sky_fill_slider.setToolTip("Synthesize a physical Rayleigh/Mie sky gradient & HDR sun disc in uncovered upper-hemisphere gaps")
         self.highlight_recovery_slider = SliderResetControl(0.0, 10.0, 0.0, 0.25)
         self.highlight_recovery_slider.setToolTip("Reconstruct smooth physical HDR peak energy inside clipped LDR highlight cores (sun/softboxes)")
+        self.sun_reconstruct_slider = SliderResetControl(0.0, 2.0, 0.0, 0.05, decimals=2)
+        self.sun_reconstruct_slider.setToolTip("Synthesize a physically scaled limb-darkened HDR solar disk + aureole at the brightest sky peak")
         self.nadir_cleanup_slider = SliderResetControl(0.0, 1.0, 0.0, 0.02)
         self.nadir_cleanup_slider.setToolTip("Seam-aware radial clone & pole smoothing to clean up tripods or shadows at the nadir")
         self.temporal_stab_slider = SliderResetControl(0.0, 1.0, 0.0, 0.05)
@@ -1979,6 +1991,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         form.addRow("HDRI Blur:", self.hdri_blur_slider)
         form.addRow("Physical Sky Fill:", self.sky_fill_slider)
         form.addRow("Highlight Recovery:", self.highlight_recovery_slider)
+        form.addRow("Sun Reconstruct:", self.sun_reconstruct_slider)
         form.addRow("Nadir Cleanup:", self.nadir_cleanup_slider)
         form.addRow("Temporal Smooth:", self.temporal_stab_slider)
         form.addRow("", self.inpaint_chk)
@@ -2014,6 +2027,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.hdri_blur_slider,
             self.sky_fill_slider,
             self.highlight_recovery_slider,
+            self.sun_reconstruct_slider,
             self.nadir_cleanup_slider,
         ):
             ctrl.valueChanged.connect(self._schedule_preview_update)
@@ -2165,7 +2179,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row = FlowLayout(margin=0, spacing=4)
         ev_row.addWidget(QtWidgets.QLabel("View:"))
         self.preview_tonemap_combo = QtWidgets.QComboBox()
-        self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear", "Overlap Diff"])
+        self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear", "Overlap Diff", "Lookdev Spheres"])
         self.preview_tonemap_combo.setToolTip(
             "Preview display transform (does not affect exported 32-bit float linear EXR)"
         )
@@ -2540,7 +2554,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.diffuse_split_chk = QtWidgets.QCheckBox("Export Companion Diffuse EXR (_diffuse.exr)")
         self.diffuse_split_chk.setToolTip("Write a firefly-free clamped & smoothed diffuse/irradiance EXR alongside the full-range specular EXR")
         self.diffuse_split_chk.setChecked(False)
+        self.live_sync_solaris_chk = QtWidgets.QCheckBox("Live Sync Dome (/stage)")
+        self.live_sync_solaris_chk.setToolTip("Push HDRI Yaw° and Exposure (EV) changes live onto /stage/hdri_maker_domelight")
+        self.live_sync_solaris_chk.setChecked(False)
         lookdev_form.addRow("", self.diffuse_split_chk)
+        lookdev_form.addRow("", self.live_sync_solaris_chk)
         layout.addLayout(lookdev_form)
 
         btn_row = FlowLayout(margin=2, spacing=6)
@@ -3108,6 +3126,20 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("Analyze at least 2 overlapping plates before equalizing EV.")
             return
         try:
+            exif_evs = [
+                read_plate_metadata(v.source_path).get("ev100") if v.source_path else None
+                for v in self._views
+            ]
+            if all(e is not None for e in exif_evs):
+                med_ev = float(np.median([float(e) for e in exif_evs]))
+                for idx, ev100 in enumerate(exif_evs):
+                    self._views[idx].exposure_ev = float(np.clip(float(ev100) - med_ev, -8.0, 8.0))
+                    self._sync_view_to_table_and_bar(idx)
+                self._regenerate_preview()
+                self.status_label.setText(
+                    f"Equalized exposure across {len(self._views)} plates using EXIF EV100 (median {med_ev:.2f})."
+                )
+                return
             eq = auto_equalize_plate_exposures(self._views)
             for idx, v in enumerate(eq):
                 self._views[idx].exposure_ev = v.exposure_ev
@@ -3190,6 +3222,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
             physical_sky_fill=self.sky_fill_slider.value(),
             highlight_recovery=self.highlight_recovery_slider.value(),
+            sun_reconstruct=self.sun_reconstruct_slider.value(),
             nadir_cleanup=self.nadir_cleanup_slider.value(),
             neutralize_environment=self.neutralize_env_chk.isChecked(),
             temporal_stabilize=self.temporal_stab_slider.value(),
@@ -3858,6 +3891,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             (self.hdri_blur_slider, "HDRI Blur"),
             (self.sky_fill_slider, "Physical Sky Fill"),
             (self.highlight_recovery_slider, "Highlight Recovery"),
+            (self.sun_reconstruct_slider, "Sun Reconstruct"),
             (self.nadir_cleanup_slider, "Nadir Cleanup"),
             (self.temporal_stab_slider, "Temporal Smooth"),
             (self.neutralize_env_chk, "Neutralize Environment"),
@@ -4528,6 +4562,55 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         except Exception as exc:
             self.status_label.setText(f"Bracket merge error: {exc}")
 
+    def _on_batch_merge_brackets_clicked(self) -> None:
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select All Bracketed Photos from 360° Shoot (Auto-Grouped by Angle)",
+            "",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.exr *.hdr *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;All Files (*)",
+        )
+        if not paths or len(paths) < 2:
+            if paths:
+                self.status_label.setText("Select bracketed photos from 2+ angles (or use Merge Brackets... for 1 angle).")
+            return
+        n_per, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Batch Bracket Grouping",
+            "Brackets per camera angle (0 = Auto-detect by EXIF timestamp / EV cycle):",
+            0,
+            0,
+            15,
+            1,
+        )
+        if not ok:
+            return
+        try:
+            self._push_undo_snapshot("Batch Merge Brackets")
+            groups = group_bracket_sequences(paths, frames_per_angle=(n_per if n_per >= 2 else None))
+            self.status_label.setText(f"Merging {len(groups)} bracketed angle group(s) to 32-bit EXR...")
+            QtWidgets.QApplication.processEvents()
+            exr_paths = batch_merge_bracket_groups(groups, colorspace=self.colorspace_combo.currentText())
+            if not exr_paths:
+                self.status_label.setText("No bracket groups produced.")
+                return
+            self.multiview_table.setRowCount(0)
+            total = len(exr_paths)
+            fov = self.fov_spin.value()
+            el = self.cam_el_spin.value()
+            for i, p in enumerate(exr_paths):
+                az = i * (360.0 / float(max(total, 1)))
+                if az > 180.0:
+                    az -= 360.0
+                self._add_multiview_row(p, az, el, fov, "Auto")
+            self._maybe_update_default_output_path(exr_paths[0])
+            self._on_analyze_clicked()
+            self._commit_undo_baseline()
+            self.status_label.setText(
+                f"Batch-merged {len(paths)} photos into {len(exr_paths)} 32-bit EXR angle(s) and analyzed."
+            )
+        except Exception as exc:
+            self.status_label.setText(f"Batch bracket merge error: {exc}")
+
     def _on_analyze_clicked(self) -> None:
         n_mv = self.multiview_table.rowCount()
         self._log_debug(f"Analyze clicked: multiview_rows={n_mv}")
@@ -4825,6 +4908,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._update_preview_pixmap()
             if not fast:
                 self._log_debug("Preview pixmap updated.")
+            if hasattr(self, "live_sync_solaris_chk") and self.live_sync_solaris_chk.isChecked():
+                sync_solaris_dome_live(
+                    dome_node=self._last_dome_node,
+                    yaw_deg=self.yaw_spin.value(),
+                    exposure_ev=self.ev_spin.value(),
+                )
         except Exception as exc:
             self._log_debug(f"Preview generation error: {exc}\n{traceback.format_exc()}")
             self.status_label.setText(f"Preview error: {exc}")
@@ -4870,12 +4959,23 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 return disp
 
             disp_src = _get_display_src(self._hdri_pixels, "_rough_cache", rough)
-            srgb = render_preview_srgb(
-                disp_src,
-                preview_ev=ev,
-                tonemap=tm_mode,
-                roughness_preview=0.0,
-            )
+            if tm_mode == "Lookdev Spheres":
+                srgb = render_lookdev_sphere_preview_srgb(
+                    disp_src,
+                    width=960,
+                    height=480,
+                    yaw_deg=0.0,
+                    pitch_deg=0.0,
+                    exposure_ev=ev,
+                    tonemap="ACES",
+                )
+            else:
+                srgb = render_preview_srgb(
+                    disp_src,
+                    preview_ev=ev,
+                    tonemap=tm_mode,
+                    roughness_preview=0.0,
+                )
             if (
                 hasattr(self, "ab_split_btn")
                 and self.ab_split_btn.isChecked()
@@ -5518,6 +5618,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "hdri_blur": self.hdri_blur_slider.value(),
             "physical_sky_fill": self.sky_fill_slider.value(),
             "highlight_recovery": self.highlight_recovery_slider.value(),
+            "sun_reconstruct": self.sun_reconstruct_slider.value(),
             "nadir_cleanup": self.nadir_cleanup_slider.value(),
             "temporal_stabilize": self.temporal_stab_slider.value(),
             "neutralize_environment": self.neutralize_env_chk.isChecked(),
@@ -5633,6 +5734,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.hdri_blur_slider.setValue(float(data.get("hdri_blur", 0.0)))
         self.sky_fill_slider.setValue(float(data.get("physical_sky_fill", 0.0)))
         self.highlight_recovery_slider.setValue(float(data.get("highlight_recovery", 0.0)))
+        self.sun_reconstruct_slider.setValue(float(data.get("sun_reconstruct", 0.0)))
         self.nadir_cleanup_slider.setValue(float(data.get("nadir_cleanup", 0.0)))
         self.temporal_stab_slider.setValue(float(data.get("temporal_stabilize", 0.0)))
         self.neutralize_env_chk.setChecked(bool(data.get("neutralize_environment", False)))

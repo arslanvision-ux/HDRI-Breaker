@@ -269,6 +269,45 @@ def create_or_update_domelight(
     return dome
 
 
+def sync_solaris_dome_live(
+    dome_node=None,
+    yaw_deg: float = 0.0,
+    exposure_ev: float = 0.0,
+    hdri_exr_path: Optional[str] = None,
+) -> bool:
+    """Push live HDRI Yaw (ry), Exposure, and optional EXR path onto an existing Solaris DomeLight."""
+    if not HAS_HOU or hou is None:
+        return False
+    dome = dome_node
+    if dome is None:
+        try:
+            stage = hou.node("/stage")
+            if stage is not None:
+                dome = stage.node("hdri_maker_domelight")
+        except Exception:
+            dome = None
+    if dome is None:
+        return False
+    try:
+        if hdri_exr_path:
+            _set_parm_control(dome, ("xn__inputstexturefile_control_shbh", "xn__inputstexturefile_control_r3a"))
+            _set_first_parm(
+                dome,
+                ("xn__inputstexturefile_r3ah", "xn__inputstexturefile_r3a", "inputs:texture:file", "texturefile"),
+                hdri_exr_path,
+            )
+        _set_parm_control(dome, ("xn__inputsexposure_control_wcb", "xn__inputsexposure_control_e5a"))
+        _set_first_parm(
+            dome,
+            ("xn__inputsexposure_vya", "xn__inputsexposure_e5a", "inputs:exposure", "exposure"),
+            float(exposure_ev),
+        )
+        _set_first_parm(dome, ("ry",), float(yaw_deg))
+        return True
+    except Exception:
+        return False
+
+
 def create_or_update_area_light_from_hotspot(
     info: ExtractedAreaLightInfo,
     light_tex_exr_path: str,

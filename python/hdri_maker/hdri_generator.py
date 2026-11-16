@@ -61,6 +61,7 @@ class HDRISynthesisParams:
     nadir_cleanup: float = 0.0
     neutralize_environment: bool = False
     temporal_stabilize: float = 0.0
+    sun_reconstruct: float = 0.0
 
 
 @dataclass
@@ -785,6 +786,9 @@ def generate_latlong_hdri(
     if p.hdri_blur > 1e-4:
         hdri = blur_latlong_hdri(hdri, p.hdri_blur)
 
+    if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
+        hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
+
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
 
 
@@ -870,12 +874,15 @@ def render_preview_srgb(
     preview_ev: float = 0.0,
     tonemap: str = "aces",
     roughness_preview: float = 0.0,
+    exposure_ev: Optional[float] = None,
 ) -> np.ndarray:
     """
     Tone-map a 32-bit float HDRI into 8-bit sRGB (H, W, 3) uint8 for UI display.
     Supports 'aces', 'false_color', 'reinhard', and 'linear', plus optional
     roughness mip-blur simulation in [0, 1].
     """
+    if exposure_ev is not None:
+        preview_ev = exposure_ev
     src = hdri_pixels.astype(np.float32)
     r_prev = float(np.clip(roughness_preview, 0.0, 1.0))
     if r_prev > 1e-3:
@@ -1520,4 +1527,172 @@ def apply_post_adjustments_to_hdri(
     if p.hdri_blur > 1e-4:
         hdri = blur_latlong_hdri(hdri, p.hdri_blur)
 
+    if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
+        hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
+
+    if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
+        hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
+
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
+
+
+def reconstruct_physical_sun_disk(
+    hdri_pixels: np.ndarray,
+    strength: float = 1.0,
+    sun_uv: Optional[Tuple[float, float]] = None,
+    sun_radius_deg: float = 0.75,
+) -> np.ndarray:
+    """
+    Synthesize a physically scaled limb-darkened solar disk + circumsolar Mie aureole
+    at the brightest sky peak (or `sun_uv`) to restore crisp directional sun shadows
+    from clipped LDR or phone skies.
+    """
+    s = float(max(0.0, strength))
+    if s <= 1e-4:
+        return hdri_pixels
+    img = np.maximum(hdri_pixels.astype(np.float32, copy=True), 0.0)
+    h, w = img.shape[:2]
+
+    if sun_uv is None:
+        sky_rows = max(4, int(h * 0.48))
+        lum_sky = compute_luminance(img[:sky_rows])
+        py, px = np.unravel_index(int(np.argmax(lum_sky)), lum_sky.shape)
+        su = (px + 0.5) / float(w)
+        sv = (py + 0.5) / float(h)
+    else:
+        su, sv = float(sun_uv[0]), float(sun_uv[1])
+        px = int(np.clip(su * w, 0, w - 1))
+        py = int(np.clip(sv * h, 0, h - 1))
+
+    # Sun direction unit vector (matches equirectangular convention)
+    az_s = (0.5 - su) * 2.0 * math.pi
+    el_s = (0.5 - sv) * math.pi
+    sx = math.cos(el_s) * math.sin(az_s)
+    sy = math.sin(el_s)
+    sz = math.cos(el_s) * math.cos(az_s)
+
+    # Sample local sun chromaticity (normalized warm tint)
+    y0, y1 = max(0, py - 2), min(h, py + 3)
+    x0, x1 = max(0, px - 2), min(w, px + 3)
+    local_rgb = np.mean(img[y0:y1, x0:x1], axis=(0, 1))
+    local_lum = max(float(0.2126 * local_rgb[0] + 0.7152 * local_rgb[1] + 0.0722 * local_rgb[2]), 1e-4)
+    sun_tint = np.clip(local_rgb / local_lum, 0.4, 2.0).astype(np.float32)
+
+    u = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
+    v = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+    az = (0.5 - u) * (2.0 * math.pi)
+    el = (0.5 - v) * math.pi
+    cos_el = np.cos(el)[:, None]
+    dx = cos_el * np.sin(az)[None, :]
+    dy = np.sin(el)[:, None]
+    dz = cos_el * np.cos(az)[None, :]
+
+    dot = np.clip(dx * sx + dy * sy + dz * sz, -1.0, 1.0)
+    theta_deg = np.degrees(np.arccos(dot))
+
+    r_disk = max(0.35, float(sun_radius_deg))
+    # Smooth anti-aliased limb-darkened solar disk + circumsolar aureole
+    disk_mask = 1.0 - _smoothstep(r_disk * 0.75, r_disk * 1.45, theta_deg)
+    limb = np.sqrt(np.maximum(1.0 - np.minimum(theta_deg / max(r_disk * 1.45, 1e-3), 1.0) ** 2, 0.0))
+    aureole = np.exp(-theta_deg / 4.2) * 0.025
+    sun_energy = s * (160.0 * disk_mask * (0.65 + 0.35 * limb) + 40.0 * aureole)
+
+    img += sun_energy[..., None] * sun_tint[None, None, :]
+    return np.ascontiguousarray(img, dtype=np.float32)
+
+
+def render_lookdev_sphere_preview_srgb(
+    hdri_pixels: np.ndarray,
+    width: int = 800,
+    height: int = 400,
+    yaw_deg: float = 0.0,
+    pitch_deg: float = 0.0,
+    exposure_ev: float = 0.0,
+    tonemap: str = "ACES",
+) -> np.ndarray:
+    """
+    Render a real-time pure-numpy 3D Lookdev Sphere preview (left: 100% Chrome Mirror Ball,
+    right: 18% Gray Diffuse Ball) lit by the current 32-bit float Lat/Long HDRI.
+    """
+    w = max(256, int(width))
+    h = max(128, int(height))
+    src = np.maximum(np.asarray(hdri_pixels, dtype=np.float32), 0.0)
+    sh, sw = src.shape[:2]
+
+    # Build a fast blurred diffuse irradiance mip for the 18% Gray ball
+    diff_src = _separable_box_blur(
+        src[:: max(1, sh // 64), :: max(1, sw // 128)],
+        rx=max(3, (sw // max(1, sw // 128)) // 8),
+        ry=max(3, (sh // max(1, sh // 64)) // 8),
+        wrap_x=True,
+    )
+    dh, dw = diff_src.shape[:2]
+
+    # Studio background
+    canvas = np.full((h, w, 3), 0.035, dtype=np.float32)
+
+    xs = np.arange(w, dtype=np.float32) + 0.5
+    ys = np.arange(h, dtype=np.float32) + 0.5
+    gx, gy = np.meshgrid(xs, ys)
+
+    radius = min(w * 0.21, h * 0.42)
+    cy = h * 0.50
+    cx_chrome = w * 0.28
+    cx_gray = w * 0.72
+
+    yaw_rad = math.radians(float(yaw_deg))
+    pitch_rad = math.radians(float(np.clip(pitch_deg, -75.0, 75.0)))
+    cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
+    cos_p, sin_p = math.cos(pitch_rad), math.sin(pitch_rad)
+
+    def _sample_equirect(img_arr: np.ndarray, vx: np.ndarray, vy: np.ndarray, vz: np.ndarray) -> np.ndarray:
+        ih, iw = img_arr.shape[:2]
+        # Apply pitch (X-axis) then yaw (Y-axis)
+        vy1 = vy * cos_p - vz * sin_p
+        vz1 = vy * sin_p + vz * cos_p
+        vx2 = vx * cos_y + vz1 * sin_y
+        vz2 = -vx * sin_y + vz1 * cos_y
+        az = np.arctan2(vx2, vz2)
+        el = np.arcsin(np.clip(vy1, -1.0, 1.0))
+        u = (0.5 - az / (2.0 * math.pi)) % 1.0
+        v = np.clip(0.5 - el / math.pi, 0.0, 1.0 - 1e-5)
+        fx = u * (iw - 1)
+        fy = v * (ih - 1)
+        x0 = np.floor(fx).astype(np.int32)
+        y0 = np.floor(fy).astype(np.int32)
+        x1 = (x0 + 1) % iw
+        y1 = np.minimum(y0 + 1, ih - 1)
+        wx = (fx - x0)[..., None]
+        wy = (fy - y0)[..., None]
+        return (
+            (img_arr[y0, x0] * (1.0 - wx) + img_arr[y0, x1] * wx) * (1.0 - wy)
+            + (img_arr[y1, x0] * (1.0 - wx) + img_arr[y1, x1] * wx) * wy
+        )
+
+    # 1. Chrome Mirror Ball (left)
+    nx_c = (gx - cx_chrome) / radius
+    ny_c = (cy - gy) / radius
+    r2_c = nx_c * nx_c + ny_c * ny_c
+    mask_c = r2_c <= 1.0
+    if np.any(mask_c):
+        nz_c = np.sqrt(np.maximum(1.0 - r2_c[mask_c], 0.0))
+        nx_m = nx_c[mask_c]
+        ny_m = ny_c[mask_c]
+        # View vector V = (0, 0, 1) toward camera -> R = 2*(N.V)*N - V = (2*nz*nx, 2*nz*ny, 2*nz^2 - 1)
+        rx = 2.0 * nz_c * nx_m
+        ry = 2.0 * nz_c * ny_m
+        rz = 2.0 * nz_c * nz_c - 1.0
+        canvas[mask_c] = _sample_equirect(src, rx, ry, rz) * 0.96
+
+    # 2. 18% Gray Diffuse Ball (right)
+    nx_g = (gx - cx_gray) / radius
+    ny_g = (cy - gy) / radius
+    r2_g = nx_g * nx_g + ny_g * ny_g
+    mask_g = r2_g <= 1.0
+    if np.any(mask_g):
+        nz_g = np.sqrt(np.maximum(1.0 - r2_g[mask_g], 0.0))
+        nx_m = nx_g[mask_g]
+        ny_m = ny_g[mask_g]
+        canvas[mask_g] = _sample_equirect(diff_src, nx_m, ny_m, nz_g) * 0.36
+
+    return render_preview_srgb(canvas, preview_ev=exposure_ev, tonemap=tonemap)
