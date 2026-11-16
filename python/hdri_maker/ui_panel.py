@@ -1524,18 +1524,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         self.setMinimumSize(480, 360)
         root_layout = QtWidgets.QHBoxLayout(self)
-        root_layout.setContentsMargins(8, 8, 8, 8)
-        root_layout.setSpacing(6)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+        root_layout.setSpacing(4)
 
         # Left Panel: Controls + Analysis (freely resizable with scrollbars if narrow)
         self._left_scroll = QtWidgets.QScrollArea()
         self._left_scroll.setWidgetResizable(True)
-        self._left_scroll.setMinimumWidth(240)
+        self._left_scroll.setMinimumWidth(180)
         self._left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_container = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_container)
-        left_layout.setContentsMargins(4, 4, 8, 4)
-        left_layout.setSpacing(8)
+        left_layout.setContentsMargins(2, 2, 4, 2)
+        left_layout.setSpacing(5)
 
         left_layout.addWidget(self._build_plate_group())
         left_layout.addWidget(self._build_analysis_group())
@@ -1547,22 +1547,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(6)
+        right_layout.setSpacing(4)
 
-        solaris_scroll = QtWidgets.QScrollArea()
-        solaris_scroll.setWidgetResizable(True)
-        solaris_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        solaris_scroll.setMinimumHeight(140)
-        solaris_scroll.setWidget(self._build_solaris_group())
+        self._solaris_scroll = QtWidgets.QScrollArea()
+        self._solaris_scroll.setWidgetResizable(True)
+        self._solaris_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._solaris_scroll.setMinimumHeight(48)
+        self._solaris_scroll.setWidget(self._build_solaris_group())
 
-        right_splitter = QtWidgets.QSplitter(Qt.Vertical)
-        right_splitter.setChildrenCollapsible(False)
-        right_splitter.addWidget(self._build_preview_group())
-        right_splitter.addWidget(solaris_scroll)
-        right_splitter.setStretchFactor(0, 3)
-        right_splitter.setStretchFactor(1, 1)
-        right_splitter.setSizes([480, 280])
-        right_layout.addWidget(right_splitter, stretch=1)
+        self._right_splitter = QtWidgets.QSplitter(Qt.Vertical)
+        self._right_splitter.setHandleWidth(6)
+        self._right_splitter.setChildrenCollapsible(True)
+        self._right_splitter.addWidget(self._build_preview_group())
+        self._right_splitter.addWidget(self._solaris_scroll)
+        self._right_splitter.setStretchFactor(0, 4)
+        self._right_splitter.setStretchFactor(1, 1)
+        self._right_splitter.setSizes([540, 230])
+        self._right_splitter.splitterMoved.connect(lambda *_: self._update_preview_pixmap())
+        right_layout.addWidget(self._right_splitter, stretch=1)
 
         status_row = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("Ready. Load a plate or image sequence to begin.")
@@ -1618,15 +1620,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         status_row.addWidget(self.ui_scale_slider)
         right_layout.addLayout(status_row)
 
-        splitter = QtWidgets.QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._left_scroll)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([560, 760])
-        splitter.splitterMoved.connect(lambda *_: self._update_preview_pixmap())
-        root_layout.addWidget(splitter)
+        self._main_splitter = QtWidgets.QSplitter(Qt.Horizontal)
+        self._main_splitter.setHandleWidth(6)
+        self._main_splitter.setChildrenCollapsible(True)
+        self._main_splitter.addWidget(self._left_scroll)
+        self._main_splitter.addWidget(right_panel)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 2)
+        self._main_splitter.setSizes([500, 820])
+        self._main_splitter.splitterMoved.connect(lambda *_: self._update_preview_pixmap())
+        root_layout.addWidget(self._main_splitter)
 
     def _build_plate_group(self) -> CollapsibleGroupBox:
         grp = CollapsibleGroupBox("1. Plate / Sequence Input")
@@ -2074,11 +2077,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         )
         self.multiview_table.verticalHeader().setDefaultSectionSize(max(28, int(round(50 * s))))
         self.setMinimumSize(max(300, int(round(480 * min(s, 1.0)))), max(240, int(round(360 * min(s, 1.0)))))
-        self._left_scroll.setMinimumWidth(max(150, int(round(240 * min(s, 1.0)))))
+        self._left_scroll.setMinimumWidth(max(140, int(round(180 * min(s, 1.0)))))
 
     def _build_preview_group(self) -> QtWidgets.QGroupBox:
         grp = QtWidgets.QGroupBox("Lat/Long 2:1 HDRI Preview")
         layout = QtWidgets.QVBoxLayout(grp)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
         self.preview_label = PreviewLabel("Analyze a plate to preview generated 32-bit Lat/Long HDRI")
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -2104,7 +2109,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.inspector_label.setStyleSheet("font-family: Consolas, monospace; padding: 2px 4px;")
         layout.addWidget(self.inspector_label)
 
-        ev_row = QtWidgets.QHBoxLayout()
+        ev_row = FlowLayout(margin=0, spacing=4)
         ev_row.addWidget(QtWidgets.QLabel("View:"))
         self.preview_tonemap_combo = QtWidgets.QComboBox()
         self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear", "Overlap Diff"])
@@ -2188,6 +2193,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row.addWidget(zoom_out_btn)
         ev_row.addWidget(self.zoom_reset_btn)
         ev_row.addWidget(zoom_in_btn)
+        self.expand_viewport_btn = QtWidgets.QPushButton("⤢")
+        self.expand_viewport_btn.setCheckable(True)
+        self.expand_viewport_btn.setMaximumWidth(28)
+        self.expand_viewport_btn.setToolTip("Expand / Restore Viewport (collapse or restore Solaris & side panels)")
+        self.expand_viewport_btn.toggled.connect(self._on_toggle_expand_viewport)
+        ev_row.addWidget(self.expand_viewport_btn)
         layout.addLayout(ev_row)
 
         ctrl_row = FlowLayout(margin=2, spacing=4)
@@ -2411,6 +2422,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _build_solaris_group(self) -> QtWidgets.QGroupBox:
         grp = QtWidgets.QGroupBox("4. Export 32-bit EXR & Solaris (/stage) Wiring")
         layout = QtWidgets.QVBoxLayout(grp)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
         out_row = QtWidgets.QHBoxLayout()
         default_out = "$HIP/tex/hdri_maker.exr" if HAS_HOU else os.path.abspath("hdri_maker.exr")
@@ -3611,6 +3624,28 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         _bind("E", lambda: self.edit_plates_btn.toggle())
         _bind("Ctrl+Return", self._on_bake_edits_to_canvas)
         _bind("Ctrl+Enter", self._on_bake_edits_to_canvas)
+
+    def _on_toggle_expand_viewport(self, checked: bool) -> None:
+        if not hasattr(self, "_right_splitter") or not hasattr(self, "_main_splitter"):
+            return
+        if checked:
+            self._saved_splitter_sizes = (
+                list(self._main_splitter.sizes()),
+                list(self._right_splitter.sizes()),
+            )
+            self._main_splitter.setSizes([0, max(600, self.width())])
+            self._right_splitter.setSizes([max(400, self.height()), 0])
+            self.status_label.setText("Expanded HDRI viewport (click ⤢ again to restore panels).")
+        else:
+            saved = getattr(self, "_saved_splitter_sizes", None)
+            if saved:
+                self._main_splitter.setSizes(saved[0])
+                self._right_splitter.setSizes(saved[1])
+            else:
+                self._main_splitter.setSizes([500, 820])
+                self._right_splitter.setSizes([540, 230])
+            self.status_label.setText("Restored side and Solaris panels.")
+        self._update_preview_pixmap()
 
     def _nudge_brush_size(self, delta: int) -> None:
         if not hasattr(self, "brush_size_slider"):

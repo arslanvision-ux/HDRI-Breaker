@@ -6,6 +6,8 @@
 
 **HDRI Breaker** is a Houdini 20.0 / 20.5 / 21.0+ Solaris (`/stage`) Lookdev & Lighting studio that extracts physical lighting metrics from single plates, multi-view camera angles, exposure brackets, or image sequences and synthesizes true **32-bit float Lat/Long (2:1) EXR** environment maps, extracted area light textures, and multi-renderer Solaris lookdev rigs (**Karma CPU/XPU**, **Redshift**, **Arnold**, and **Storm / UsdPreviewSurface**).
 
+> 📖 **New here? Read the [Complete Step-by-Step Workflow Tutorial](docs/TUTORIAL.md)** (covering Exposure Brackets, Phone/Camera RAW & DNG, Multi-Position Stitching, 32-bit Brush Cleanup, Apply/Collapse, and Solaris Wiring).
+
 <p align="center">
   <img src="docs/hdri_breaker_preview.jpg" alt="HDRI Breaker Main Window" width="100%" />
 </p>
