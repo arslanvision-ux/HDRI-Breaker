@@ -759,18 +759,7 @@ def generate_latlong_hdri(
 
     # 4e. Optional One-Click Neutralize Environment (turntable WB)
     if p.neutralize_environment:
-        mean_rgb = np.mean(hdri, axis=(0, 1))
-        mr, mg, mb = max(float(mean_rgb[0]), 1e-5), max(float(mean_rgb[1]), 1e-5), max(float(mean_rgb[2]), 1e-5)
-        mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
-        neut_gains = np.array(
-            [
-                float(np.clip(mlum / mr, 0.25, 4.0)),
-                float(np.clip(mlum / mg, 0.25, 4.0)),
-                float(np.clip(mlum / mb, 0.25, 4.0)),
-            ],
-            dtype=np.float32,
-        )
-        hdri *= neut_gains[None, None, :]
+        hdri = neutralize_hdri_environment(hdri)
 
     # 5. Saturation adjustment in linear space
     if abs(p.saturation - 1.0) > 1e-4:
@@ -1504,18 +1493,7 @@ def apply_post_adjustments_to_hdri(
         hdri = _apply_nadir_cleanup(hdri, strength=p.nadir_cleanup)
 
     if p.neutralize_environment:
-        mean_rgb = np.mean(hdri, axis=(0, 1))
-        mr, mg, mb = max(float(mean_rgb[0]), 1e-5), max(float(mean_rgb[1]), 1e-5), max(float(mean_rgb[2]), 1e-5)
-        mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
-        neut_gains = np.array(
-            [
-                float(np.clip(mlum / mr, 0.25, 4.0)),
-                float(np.clip(mlum / mg, 0.25, 4.0)),
-                float(np.clip(mlum / mb, 0.25, 4.0)),
-            ],
-            dtype=np.float32,
-        )
-        hdri *= neut_gains[None, None, :]
+        hdri = neutralize_hdri_environment(hdri)
 
     if abs(p.saturation - 1.0) > 1e-4:
         lum = compute_luminance(hdri)[..., None]
@@ -1530,10 +1508,51 @@ def apply_post_adjustments_to_hdri(
     if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
         hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
 
-    if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
-        hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
-
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
+
+
+def neutralize_hdri_environment(
+    hdri_pixels: np.ndarray,
+    chroma_retain: float = 0.25,
+    wb_strength: float = 0.55,
+) -> np.ndarray:
+    """
+    Neutralize heavy ambient color casts for turntable lookdev without inverting
+    a blue sky into an orange cast on the ground or key light.
+
+    Uses solid-angle (sin(theta)) weighted mid-tone irradiance for gentle WB,
+    followed by chroma-cast suppression toward Rec.709 luminance.
+    """
+    img = np.maximum(hdri_pixels.astype(np.float32, copy=False), 0.0)
+    h = img.shape[0]
+    lum = compute_luminance(img)
+    p95 = float(np.percentile(lum, 95.0))
+    # Solid-angle weight sin(theta) so poles/zenith sky do not dominate equirectangular mean,
+    # and exclude extreme HDR sun/specular outliers above p95.
+    theta = (np.arange(h, dtype=np.float32) + 0.5) * (np.pi / float(max(h, 1)))
+    sin_w = np.sin(theta)[:, None]
+    mid_mask = (lum > 1e-5) & (lum <= max(p95, 1e-4))
+    weights = np.where(mid_mask, sin_w, 0.0)
+    w_sum = float(np.sum(weights))
+    if w_sum > 1e-6:
+        mean_rgb = np.sum(img * weights[..., None], axis=(0, 1)) / w_sum
+    else:
+        mean_rgb = np.mean(img, axis=(0, 1))
+
+    mr = max(float(mean_rgb[0]), 1e-5)
+    mg = max(float(mean_rgb[1]), 1e-5)
+    mb = max(float(mean_rgb[2]), 1e-5)
+    mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
+
+    # Gentle WB correction (clamped to [0.70, 1.45]) so blue sky doesn't over-warm the ground
+    raw_gains = np.array([mlum / mr, mlum / mg, mlum / mb], dtype=np.float32)
+    gains = np.clip(1.0 + (raw_gains - 1.0) * float(wb_strength), 0.70, 1.45)
+    balanced = img * gains[None, None, :]
+
+    # Strip remaining heavy ambient color cast while preserving luminance & contrast
+    bal_lum = compute_luminance(balanced)[..., None]
+    out = bal_lum + (balanced - bal_lum) * float(np.clip(chroma_retain, 0.0, 1.0))
+    return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)
 
 
 def reconstruct_physical_sun_disk(
