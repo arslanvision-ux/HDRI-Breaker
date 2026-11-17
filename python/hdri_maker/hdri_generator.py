@@ -1513,26 +1513,30 @@ def apply_post_adjustments_to_hdri(
 
 def neutralize_hdri_environment(
     hdri_pixels: np.ndarray,
-    chroma_retain: float = 0.25,
-    wb_strength: float = 0.55,
+    wb_strength: float = 0.90,
 ) -> np.ndarray:
     """
-    Neutralize heavy ambient color casts for turntable lookdev without inverting
-    a blue sky into an orange cast on the ground or key light.
+    Estimate and remove global illuminant color cast for turntable lookdev without
+    desaturating true scene colors or warming outdoor blue-sky HDRIs.
 
-    Uses solid-angle (sin(theta)) weighted mid-tone irradiance for gentle WB,
-    followed by chroma-cast suppression toward Rec.709 luminance.
+    Estimates the illuminant from the lowest-chroma mid-tone pixels (weighted by
+    solid angle sin(theta)), so saturated sky/foliage do not bias the white balance.
     """
     img = np.maximum(hdri_pixels.astype(np.float32, copy=False), 0.0)
     h = img.shape[0]
     lum = compute_luminance(img)
     p95 = float(np.percentile(lum, 95.0))
-    # Solid-angle weight sin(theta) so poles/zenith sky do not dominate equirectangular mean,
-    # and exclude extreme HDR sun/specular outliers above p95.
     theta = (np.arange(h, dtype=np.float32) + 0.5) * (np.pi / float(max(h, 1)))
     sin_w = np.sin(theta)[:, None]
-    mid_mask = (lum > 1e-5) & (lum <= max(p95, 1e-4))
-    weights = np.where(mid_mask, sin_w, 0.0)
+
+    # Measure per-pixel normalized chroma so saturated sky/grass/objects don't skew WB
+    max_c = np.max(img, axis=2)
+    min_c = np.min(img, axis=2)
+    chroma = (max_c - min_c) / np.maximum(lum, 1e-4)
+
+    mid_mask = (lum > 1e-4) & (lum <= max(p95, 1e-3))
+    chroma_w = 1.0 / (1.0 + (chroma * 8.0) ** 2)
+    weights = np.where(mid_mask, sin_w * chroma_w, 0.0)
     w_sum = float(np.sum(weights))
     if w_sum > 1e-6:
         mean_rgb = np.sum(img * weights[..., None], axis=(0, 1)) / w_sum
@@ -1544,14 +1548,9 @@ def neutralize_hdri_environment(
     mb = max(float(mean_rgb[2]), 1e-5)
     mlum = max(0.2126 * mr + 0.7152 * mg + 0.0722 * mb, 1e-5)
 
-    # Gentle WB correction (clamped to [0.70, 1.45]) so blue sky doesn't over-warm the ground
     raw_gains = np.array([mlum / mr, mlum / mg, mlum / mb], dtype=np.float32)
-    gains = np.clip(1.0 + (raw_gains - 1.0) * float(wb_strength), 0.70, 1.45)
-    balanced = img * gains[None, None, :]
-
-    # Strip remaining heavy ambient color cast while preserving luminance & contrast
-    bal_lum = compute_luminance(balanced)[..., None]
-    out = bal_lum + (balanced - bal_lum) * float(np.clip(chroma_retain, 0.0, 1.0))
+    gains = np.clip(1.0 + (raw_gains - 1.0) * float(wb_strength), 0.30, 3.50)
+    out = img * gains[None, None, :]
     return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)
 
 
