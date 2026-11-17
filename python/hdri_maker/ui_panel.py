@@ -2692,10 +2692,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         lookdev_form.addRow("Ground Emission:", self.ground_emission_slider)
         lookdev_form.addRow("Render Engine:", self.render_engine_combo)
         lookdev_form.addRow("Ground Shader:", self.ground_shader_combo)
-        self.diffuse_split_chk = QtWidgets.QCheckBox("Export Companion Diffuse EXR (_diffuse.exr)")
-        self.diffuse_split_chk.setToolTip("Write a firefly-free clamped & smoothed diffuse/irradiance EXR alongside the full-range specular EXR")
-        self.diffuse_split_chk.setChecked(False)
-        lookdev_form.addRow("", self.diffuse_split_chk)
         layout.addWidget(self.lookdev_ground_section)
 
         btn_row = FlowLayout(margin=2, spacing=6)
@@ -2762,6 +2758,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         res_row.addWidget(self.res_combo)
         res_row.addWidget(QtWidgets.QLabel("Out Space:"))
         res_row.addWidget(self.out_cs_combo)
+        self.diffuse_split_chk = QtWidgets.QCheckBox(
+            "Also Export Diffuse/GI EXR (_diffuse.exr — firefly-free)"
+        )
+        self.diffuse_split_chk.setToolTip(
+            "Write a second soft-clamped & blurred 32-bit EXR (*_diffuse.exr) alongside your main HDRI.\n"
+            "Use it on a separate Diffuse/GI Dome Light (visibleToDiffuse=1, visibleToGlossy=0) to eliminate\n"
+            "path-tracer fireflies & GI noise while keeping the main EXR sharp for specular reflections."
+        )
+        self.diffuse_split_chk.setChecked(False)
+        res_row.addWidget(self.diffuse_split_chk)
         res_row.addStretch(1)
         layout.addLayout(res_row)
 
