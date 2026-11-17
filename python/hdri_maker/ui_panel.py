@@ -3961,20 +3961,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._push_undo_snapshot("Synthesize Dome from Macbeth")
         base_rgb = cct_to_rgb(max(2000.0, min(15000.0, float(cct))))
         r, g, b = [float(c) for c in base_rgb]
-        sky_col = (min(2.0, r * 0.95), min(2.0, g * 1.02), min(2.0, b * 1.22))
-        zen_col = (sky_col[0] * 0.72, sky_col[1] * 0.80, sky_col[2] * 1.05)
-        hor_col = (r * 0.85, g * 0.85, b * 0.82)
-        gnd_col = (r * 0.24, g * 0.23, b * 0.21)
-        nad_col = (r * 0.14, g * 0.13, b * 0.12)
+        # Scene-referred linear studio/environment levels (avoid blowing out upper sky to pure white)
+        sky_col = (r * 0.36, g * 0.38, b * 0.44)
+        zen_col = (r * 0.26, g * 0.29, b * 0.36)
+        hor_col = (r * 0.34, g * 0.34, b * 0.33)
+        gnd_col = (r * 0.14, g * 0.13, b * 0.12)
+        nad_col = (r * 0.08, g * 0.075, b * 0.07)
         ev100 = float(np.log2(max(lum, 1e-4) / 0.18) + 8.0)
-        key_peak = float(max(4.5, lum * 25.0))
+        key_peak = float(max(2.5, lum * 12.0))
         key_hs = HotspotLight(
             index=0,
             plate_u=0.5 + 35.0 / 360.0,
-            plate_v=0.5 - 42.0 / 180.0,
+            plate_v=0.5 - 45.0 / 180.0,
             azimuth_deg=35.0,
-            elevation_deg=42.0,
-            radius_deg=14.0,
+            elevation_deg=45.0,
+            radius_deg=10.0,
             peak_intensity=key_peak,
             mean_intensity=key_peak * 0.5,
             color_rgb=(r, g, b),
@@ -4014,9 +4015,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._suppress_auto_preview = True
         try:
             self.plate_blend_spin.setValue(0.0)
-            self.sky_fill_slider.setValue(0.45)
-            self.wrap_spin.setValue(0.70)
-            self.hs_boost_spin.setValue(1.0)
+            self.sky_fill_slider.setValue(0.0)
+            self.wrap_spin.setValue(0.75)
+            self.hs_boost_spin.setValue(0.35)
             self._wb_gains = (1.0, 1.0, 1.0)
             if abs(ev_delta) > 1e-4:
                 self.ev_spin.setValue(float(np.clip(self.ev_spin.value() + ev_delta, -10.0, 10.0)))
