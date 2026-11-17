@@ -2615,7 +2615,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.lookdev_chk.setChecked(True)
         layout.addWidget(self.lookdev_chk)
 
-        lookdev_form = QtWidgets.QFormLayout()
+        self.lookdev_ground_section = CollapsibleGroupBox(
+            "Lookdev Tripod & Ground Projection Parameters",
+            collapsed=True,
+        )
+        lookdev_form = QtWidgets.QFormLayout(self.lookdev_ground_section.body)
+        lookdev_form.setContentsMargins(4, 4, 4, 4)
+        lookdev_form.setSpacing(4)
         self.tripod_y_slider = SliderResetControl(0.2, 10.0, 1.5, 0.05, decimals=2)
         self.tripod_y_slider.setToolTip("Tripod Y height (meters) used for the Lookdev Tripod and ground projection camera")
         self.ground_radius_slider = SliderResetControl(1.0, 100.0, 10.0, 0.5, decimals=1)
@@ -2662,7 +2668,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.diffuse_split_chk.setToolTip("Write a firefly-free clamped & smoothed diffuse/irradiance EXR alongside the full-range specular EXR")
         self.diffuse_split_chk.setChecked(False)
         lookdev_form.addRow("", self.diffuse_split_chk)
-        layout.addLayout(lookdev_form)
+        layout.addWidget(self.lookdev_ground_section)
 
         btn_row = FlowLayout(margin=2, spacing=6)
         self.export_btn = QtWidgets.QPushButton("Generate 32-bit Float EXR")
