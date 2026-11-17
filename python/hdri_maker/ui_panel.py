@@ -1794,6 +1794,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.plate_path_edit = QtWidgets.QLineEdit()
         self.plate_path_edit.setPlaceholderText("e.g. D:/plates/shot.$F4.exr or plate.jpg")
         browse_btn = QtWidgets.QPushButton("Browse...")
+        browse_btn.setToolTip("Select 1 plate/sequence file OR select multiple plates at once to populate Multi-Position")
         browse_btn.clicked.connect(self._on_browse_plate)
         merge_hdr_btn = QtWidgets.QPushButton("Merge Brackets...")
         merge_hdr_btn.setToolTip(
@@ -1827,8 +1828,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         mode_row.addWidget(self.seq_mode_combo)
         form.addRow("Input Mode:", mode_row)
 
-        # Frame range
-        fr_row = QtWidgets.QHBoxLayout()
+        # Frame range (shown dynamically only when Sequence mode is active)
+        self._frames_row_label = QtWidgets.QLabel("Frames:")
+        self._frames_row_widget = QtWidgets.QWidget()
+        fr_row = QtWidgets.QHBoxLayout(self._frames_row_widget)
+        fr_row.setContentsMargins(0, 0, 0, 0)
         self.start_frame_spin = QtWidgets.QSpinBox()
         self.start_frame_spin.setRange(-999999, 999999)
         self.start_frame_spin.setValue(1)
@@ -1846,7 +1850,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         fr_row.addWidget(self.end_frame_spin)
         fr_row.addWidget(QtWidgets.QLabel("Step:"))
         fr_row.addWidget(self.step_frame_spin)
-        form.addRow("Frames:", fr_row)
+        form.addRow(self._frames_row_label, self._frames_row_widget)
+        self.seq_mode_combo.currentTextChanged.connect(self._on_seq_mode_changed)
+        self._on_seq_mode_changed(self.seq_mode_combo.currentText())
 
         # Camera mapping & hotspot settings
         cam_row = QtWidgets.QHBoxLayout()
@@ -1884,55 +1890,58 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         hs_row.addWidget(self.ldr_boost_spin)
         form.addRow("Detection:", hs_row)
 
-        # Multi-Position Plate List (for multiple photos taken from different angles)
-        mv_btn_grid = QtWidgets.QGridLayout()
-        add_multi_btn = QtWidgets.QPushButton("Add Plates...")
-        add_multi_btn.setToolTip("Browse and add one or more plate images to the list")
-        add_multi_btn.clicked.connect(self._on_add_multiview_plates)
-        add_curr_btn = QtWidgets.QPushButton("Add Current")
-        add_curr_btn.setToolTip("Add the current Plate Path above to the list")
-        add_curr_btn.clicked.connect(self._on_add_current_plate)
-        rm_mv_btn = QtWidgets.QPushButton("Remove")
-        rm_mv_btn.setToolTip("Remove selected plate(s) from the list (Del)")
-        rm_mv_btn.clicked.connect(self._on_remove_selected_multiview_plates)
+        # Multi-Position Plates Sub-Section (grouped cleanly)
+        mv_section = CollapsibleGroupBox("Multi-Position Plates (360° Stitching)")
+        mv_lay = QtWidgets.QVBoxLayout(mv_section.body)
+        mv_lay.setContentsMargins(4, 4, 4, 4)
+        mv_lay.setSpacing(4)
+
+        mv_align_row = FlowLayout(margin=0, spacing=4)
         auto_360_btn = QtWidgets.QPushButton("Auto 360°")
         auto_360_btn.setToolTip("Evenly distribute Azimuth° across 360° for all listed plates")
         auto_360_btn.clicked.connect(self._on_auto_distribute_360)
         align_btn = QtWidgets.QPushButton("Auto-Align (Spherical)")
         align_btn.setToolTip("Refine overlapping plate Azimuth°/Elevation° via coarse-to-fine spherical image correlation")
         align_btn.clicked.connect(self._on_auto_align_plates)
-        clear_mv_btn = QtWidgets.QPushButton("Clear")
-        clear_mv_btn.setToolTip("Remove all plates from the list")
-        clear_mv_btn.clicked.connect(self._on_clear_multiview_plates)
-        mv_btn_grid.addWidget(add_multi_btn, 0, 0)
-        mv_btn_grid.addWidget(add_curr_btn, 0, 1)
-        mv_btn_grid.addWidget(rm_mv_btn, 0, 2)
-        mv_btn_grid.addWidget(auto_360_btn, 1, 0)
-        mv_btn_grid.addWidget(align_btn, 1, 1)
-        mv_btn_grid.addWidget(clear_mv_btn, 1, 2)
         eq_ev_btn = QtWidgets.QPushButton("Equalize EV")
         eq_ev_btn.setToolTip("Automatically match exposure across overlapping plates to eliminate brightness seams")
         eq_ev_btn.clicked.connect(self._on_equalize_plate_exposures)
         unify_fov_btn = QtWidgets.QPushButton("Unify FOV")
         unify_fov_btn.setToolTip("Match all listed plates to the selected plate's (or first plate's) FOV° and reset Scale X/Y to 1.0")
         unify_fov_btn.clicked.connect(self._on_unify_plate_fovs)
+        mv_align_row.addWidget(auto_360_btn)
+        mv_align_row.addWidget(align_btn)
+        mv_align_row.addWidget(eq_ev_btn)
+        mv_align_row.addWidget(unify_fov_btn)
+        mv_lay.addLayout(mv_align_row)
+
+        mv_manage_row = QtWidgets.QHBoxLayout()
+        mv_manage_row.setContentsMargins(0, 0, 0, 0)
+        mv_manage_row.setSpacing(4)
+        add_curr_btn = QtWidgets.QPushButton("+ Add Path")
+        add_curr_btn.setToolTip("Append the current Plate Path above to the Multi-Position list")
+        add_curr_btn.clicked.connect(self._on_add_current_plate)
         mv_up_btn = QtWidgets.QPushButton("↑")
-        mv_up_btn.setMaximumWidth(30)
+        mv_up_btn.setFixedWidth(28)
         mv_up_btn.setToolTip("Move selected plate row up in blend order")
         mv_up_btn.clicked.connect(lambda: self._move_selected_multiview_row(-1))
         mv_dn_btn = QtWidgets.QPushButton("↓")
-        mv_dn_btn.setMaximumWidth(30)
+        mv_dn_btn.setFixedWidth(28)
         mv_dn_btn.setToolTip("Move selected plate row down in blend order")
         mv_dn_btn.clicked.connect(lambda: self._move_selected_multiview_row(1))
-        mv_order_row = QtWidgets.QHBoxLayout()
-        mv_order_row.setContentsMargins(0, 0, 0, 0)
-        mv_order_row.setSpacing(3)
-        mv_order_row.addWidget(unify_fov_btn, stretch=1)
-        mv_order_row.addWidget(mv_up_btn)
-        mv_order_row.addWidget(mv_dn_btn)
-        mv_btn_grid.addWidget(eq_ev_btn, 2, 0, 1, 2)
-        mv_btn_grid.addLayout(mv_order_row, 2, 2)
-        form.addRow("Multi-Position:", mv_btn_grid)
+        rm_mv_btn = QtWidgets.QPushButton("Remove")
+        rm_mv_btn.setToolTip("Remove selected plate(s) from the list (Del)")
+        rm_mv_btn.clicked.connect(self._on_remove_selected_multiview_plates)
+        clear_mv_btn = QtWidgets.QPushButton("Clear All")
+        clear_mv_btn.setToolTip("Remove all plates from the list")
+        clear_mv_btn.clicked.connect(self._on_clear_multiview_plates)
+        mv_manage_row.addWidget(add_curr_btn)
+        mv_manage_row.addStretch(1)
+        mv_manage_row.addWidget(mv_up_btn)
+        mv_manage_row.addWidget(mv_dn_btn)
+        mv_manage_row.addWidget(rm_mv_btn)
+        mv_manage_row.addWidget(clear_mv_btn)
+        mv_lay.addLayout(mv_manage_row)
 
         self.multiview_table = QtWidgets.QTableWidget(0, 6)
         self.multiview_table.setHorizontalHeaderLabels(
@@ -1961,14 +1970,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             del_sc = shortcut_cls(QtGui.QKeySequence.Delete, self.multiview_table)
             del_sc.setContext(Qt.WidgetWithChildrenShortcut)
             del_sc.activated.connect(self._on_remove_selected_multiview_plates)
-        mv_wrap = QtWidgets.QWidget()
-        mv_wrap_lay = QtWidgets.QVBoxLayout(mv_wrap)
-        mv_wrap_lay.setContentsMargins(0, 0, 0, 0)
-        mv_wrap_lay.setSpacing(2)
-        mv_wrap_lay.addWidget(self.multiview_table)
+        mv_lay.addWidget(self.multiview_table)
         self.multiview_resize_grip = _VerticalResizeGrip(self.multiview_table, min_h=100, max_h=720)
-        mv_wrap_lay.addWidget(self.multiview_resize_grip)
-        form.addRow(mv_wrap)
+        mv_lay.addWidget(self.multiview_resize_grip)
+        form.addRow(mv_section)
 
         analyze_row = QtWidgets.QHBoxLayout()
         analyze_row.setContentsMargins(0, 0, 0, 0)
@@ -2762,16 +2767,43 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             if plate_dir:
                 self.out_path_edit.setText(os.path.join(plate_dir, "hdri_maker.exr").replace("\\", "/"))
 
+    def _on_seq_mode_changed(self, mode_text: str) -> None:
+        is_seq = mode_text != "Single Frame"
+        if hasattr(self, "_frames_row_label"):
+            self._frames_row_label.setVisible(is_seq)
+        if hasattr(self, "_frames_row_widget"):
+            self._frames_row_widget.setVisible(is_seq)
+
     def _on_browse_plate(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "Select Plate Image or Sequence Frame",
+            "Select Plate Image(s) or Sequence Frame",
             "",
             "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;RAW / Phone (*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.heic *.heif);;All Files (*)",
         )
-        if path:
-            self.plate_path_edit.setText(path)
-            self._maybe_update_default_output_path(path)
+        if not paths:
+            return
+        if len(paths) == 1 and self.multiview_table.rowCount() == 0:
+            self.plate_path_edit.setText(paths[0])
+            self._maybe_update_default_output_path(paths[0])
+            return
+        start_idx = self.multiview_table.rowCount()
+        total = start_idx + len(paths)
+        fov = self.fov_spin.value()
+        el = self.cam_el_spin.value()
+        cs = self.colorspace_combo.currentText()
+        metas = [read_plate_metadata(p) for p in paths]
+        valid_fovs = [float(m["fov_h_deg"]) for m in metas if m.get("fov_h_deg") is not None]
+        batch_fallback_fov = float(np.median(valid_fovs)) if valid_fovs else fov
+        for i, (p, meta) in enumerate(zip(paths, metas)):
+            az = ((start_idx + i) * (360.0 / max(total, 1)))
+            if az > 180.0:
+                az -= 360.0
+            plate_fov = float(meta["fov_h_deg"]) if meta.get("fov_h_deg") is not None else batch_fallback_fov
+            plate_roll = float(meta.get("roll_deg", 0.0))
+            self._add_multiview_row(p, az, el, plate_fov, cs, roll=plate_roll)
+        self._maybe_update_default_output_path(paths[0])
+        self.status_label.setText(f"Added {len(paths)} plate(s) to Multi-Position list.")
 
     def _make_plate_thumbnail(
         self, path: str, cs: str = "Auto", thumb_w: int = 68, thumb_h: int = 44
