@@ -2032,18 +2032,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         grp = CollapsibleGroupBox("3. 32-bit Lat/Long Synthesis Tuning")
         form = QtWidgets.QFormLayout(grp.body)
 
-        res_row = QtWidgets.QHBoxLayout()
-        self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["1024 x 512", "2048 x 1024", "4096 x 2048", "8192 x 4096"])
-        self.res_combo.setCurrentIndex(1)
-        self.res_combo.setToolTip("Output resolution for the synthesized 32-bit float Lat/Long Dome HDRI (up to 8K)")
-        self.out_cs_combo = QtWidgets.QComboBox()
-        self.out_cs_combo.addItems(["Linear Rec.709", "ACEScg"])
-        res_row.addWidget(self.res_combo)
-        res_row.addWidget(QtWidgets.QLabel("Out Space:"))
-        res_row.addWidget(self.out_cs_combo)
-        form.addRow("Resolution:", res_row)
-
         self.ev_spin = SliderResetControl(-10.0, 10.0, 0.0, 0.05)
         self.hs_boost_spin = SliderResetControl(0.0, 20.0, 0.0, 0.1)
         self.hs_soft_spin = SliderResetControl(0.2, 5.0, 1.0, 0.05)
@@ -2123,8 +2111,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         form.addRow(regen_btn)
 
         # Dynamically update HDRI viewer whenever any tuning parameter changes
-        self.res_combo.currentIndexChanged.connect(self._schedule_preview_update)
-        self.out_cs_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.inpaint_chk.toggled.connect(self._schedule_preview_update)
         self.neutralize_env_chk.toggled.connect(self._schedule_preview_update)
         for ctrl in (
@@ -2613,16 +2599,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        out_row = QtWidgets.QHBoxLayout()
-        default_out = "$HIP/tex/hdri_maker.exr" if HAS_HOU else os.path.abspath("hdri_maker.exr")
-        self.out_path_edit = QtWidgets.QLineEdit(default_out)
-        out_browse = QtWidgets.QPushButton("Browse...")
-        out_browse.clicked.connect(self._on_browse_output)
-        out_row.addWidget(QtWidgets.QLabel("Output EXR:"))
-        out_row.addWidget(self.out_path_edit)
-        out_row.addWidget(out_browse)
-        layout.addLayout(out_row)
-
         self.lookdev_chk = QtWidgets.QCheckBox(
             "Create Lookdev Tripod (Chrome/18% Gray/ACEScg Macbeth) + Circular Ground Projection (/stage)"
         )
@@ -2726,6 +2702,34 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         btn_row.addWidget(self.update_lookdev_btn)
         btn_row.addWidget(self.export_usd_btn)
         layout.addLayout(btn_row)
+
+        # Output Resolution, Color Space & Destination Path directly below Export buttons
+        res_row = QtWidgets.QHBoxLayout()
+        res_row.setSpacing(6)
+        self.res_combo = QtWidgets.QComboBox()
+        self.res_combo.addItems(["1024 x 512", "2048 x 1024", "4096 x 2048", "8192 x 4096"])
+        self.res_combo.setCurrentIndex(1)
+        self.res_combo.setToolTip("Output resolution for the synthesized 32-bit float Lat/Long Dome HDRI (up to 8K)")
+        self.res_combo.currentIndexChanged.connect(self._schedule_preview_update)
+        self.out_cs_combo = QtWidgets.QComboBox()
+        self.out_cs_combo.addItems(["Linear Rec.709", "ACEScg"])
+        self.out_cs_combo.currentIndexChanged.connect(self._schedule_preview_update)
+        res_row.addWidget(QtWidgets.QLabel("Output Resolution:"))
+        res_row.addWidget(self.res_combo)
+        res_row.addWidget(QtWidgets.QLabel("Out Space:"))
+        res_row.addWidget(self.out_cs_combo)
+        res_row.addStretch(1)
+        layout.addLayout(res_row)
+
+        out_row = QtWidgets.QHBoxLayout()
+        default_out = "$HIP/tex/hdri_maker.exr" if HAS_HOU else os.path.abspath("hdri_maker.exr")
+        self.out_path_edit = QtWidgets.QLineEdit(default_out)
+        out_browse = QtWidgets.QPushButton("Browse...")
+        out_browse.clicked.connect(self._on_browse_output)
+        out_row.addWidget(QtWidgets.QLabel("Output EXR:"))
+        out_row.addWidget(self.out_path_edit)
+        out_row.addWidget(out_browse)
+        layout.addLayout(out_row)
 
         return grp
 
