@@ -2400,15 +2400,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.reset_wb_btn = QtWidgets.QPushButton("Reset WB")
         self.reset_wb_btn.setToolTip("Reset sampled Macbeth / Neutral White Balance gains back to (1.0, 1.0, 1.0)")
         self.reset_wb_btn.clicked.connect(self._on_reset_wb)
-        self.light_shape_combo = QtWidgets.QComboBox()
-        self.light_shape_combo.addItems(["Rectangle", "Circle"])
-        self.light_shape_combo.currentIndexChanged.connect(self._on_light_shape_changed)
-        self.remove_hotspot_chk = QtWidgets.QCheckBox("Inpaint Light Out")
-        self.remove_hotspot_chk.setChecked(True)
-        self.remove_hotspot_chk.toggled.connect(self._regenerate_preview)
-        undo_light_btn = QtWidgets.QPushButton("Undo Light")
-        undo_light_btn.setToolTip("Remove the last picked Area Light")
-        undo_light_btn.clicked.connect(self._on_undo_light)
         clear_area_btn = QtWidgets.QPushButton("Clear Areas")
         clear_area_btn.clicked.connect(self._clear_inpaint_areas)
 
@@ -2449,9 +2440,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(self.pick_wb_btn)
         ctrl_row.addWidget(self.macbeth_wb_btn)
         ctrl_row.addWidget(self.reset_wb_btn)
-        ctrl_row.addWidget(self.light_shape_combo)
-        ctrl_row.addWidget(self.remove_hotspot_chk)
-        ctrl_row.addWidget(undo_light_btn)
         ctrl_row.addWidget(clear_area_btn)
         ctrl_row.addWidget(self.brush_btn)
         ctrl_row.addWidget(self.bake_edits_btn)
@@ -2576,22 +2564,51 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.plate_transform_bar.setVisible(False)
         layout.addWidget(self.plate_transform_bar)
 
-        light_row = QtWidgets.QHBoxLayout()
-        light_row.addWidget(QtWidgets.QLabel("Light Area Blur:"))
+        self.light_toolbar_widget = QtWidgets.QWidget()
+        light_flow = FlowLayout(self.light_toolbar_widget, margin=2, spacing=6)
+
+        self.light_shape_combo = QtWidgets.QComboBox()
+        self.light_shape_combo.addItems(["Rectangle", "Circle"])
+        self.light_shape_combo.currentIndexChanged.connect(self._on_light_shape_changed)
+        light_flow.addWidget(self.light_shape_combo)
+
+        self.remove_hotspot_chk = QtWidgets.QCheckBox("Inpaint Light Out")
+        self.remove_hotspot_chk.setChecked(True)
+        self.remove_hotspot_chk.toggled.connect(self._regenerate_preview)
+        light_flow.addWidget(self.remove_hotspot_chk)
+
+        undo_light_btn = QtWidgets.QPushButton("Undo Light")
+        undo_light_btn.setToolTip("Remove the last picked Area Light")
+        undo_light_btn.clicked.connect(self._on_undo_light)
+        light_flow.addWidget(undo_light_btn)
+
+        light_flow.addWidget(QtWidgets.QLabel("Light Blur:"))
         self.light_blur_slider = SliderResetControl(0.0, 1.0, 0.0, 0.01, decimals=2)
+        self.light_blur_slider.setMaximumWidth(210)
         self.light_blur_slider.setToolTip("Smoothly blur the picked Light Area region(s) in the HDRI")
         self.light_blur_slider.valueChanged.connect(self._schedule_preview_update)
-        light_row.addWidget(self.light_blur_slider, stretch=1)
-        light_row.addSpacing(12)
-        light_row.addWidget(QtWidgets.QLabel("Light Tex Res:"))
+        light_flow.addWidget(self.light_blur_slider)
+
+        light_flow.addWidget(QtWidgets.QLabel("Light Tex Res:"))
         self.light_res_combo = QtWidgets.QComboBox()
         self.light_res_combo.addItems(["256 x 256", "512 x 512", "1024 x 1024", "2048 x 2048"])
         self.light_res_combo.setCurrentIndex(1)
         self.light_res_combo.setToolTip("Output texture resolution for extracted Solaris Area Light EXR(s), independent of Dome HDRI resolution")
-        light_row.addWidget(self.light_res_combo)
-        layout.addLayout(light_row)
+        light_flow.addWidget(self.light_res_combo)
+
+        self.light_toolbar_widget.setVisible(False)
+        layout.addWidget(self.light_toolbar_widget)
 
         return grp
+
+    def _refresh_light_toolbar_visibility(self) -> None:
+        """Show light controls only when Pick Light Area is active or light regions exist."""
+        if hasattr(self, "light_toolbar_widget"):
+            active = (
+                (hasattr(self, "pick_light_btn") and self.pick_light_btn.isChecked())
+                or bool(getattr(self, "_light_regions", None))
+            )
+            self.light_toolbar_widget.setVisible(active)
 
     def _build_solaris_group(self) -> QtWidgets.QGroupBox:
         grp = QtWidgets.QGroupBox("4. Export 32-bit EXR & Solaris (/stage) Wiring")
@@ -3395,6 +3412,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(f"Unified all {n_rows} plate(s) to FOV {target_fov:.1f}° (Scale X/Y = 1.0).")
 
     def _on_browse_output(self) -> None:
@@ -3488,6 +3506,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             wb_on = hasattr(self, "pick_wb_btn") and self.pick_wb_btn.isChecked()
             if not (self.pick_sky_btn.isChecked() or self.pick_gnd_btn.isChecked() or self.pick_light_btn.isChecked() or wb_on):
                 self.preview_label.set_pick_mode(None)
+        self._refresh_light_toolbar_visibility()
 
     def _toggle_plate_edit_mode(self, checked: bool) -> None:
         self._log_debug(f"Move/Align Plates toggled: {checked} (views={len(self._views)})")
@@ -3802,6 +3821,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._last_light_exr_paths = []
             self._commit_undo_baseline()
             self._regenerate_preview()
+            self._refresh_light_toolbar_visibility()
             self.status_label.setText(f"Removed last light. {len(self._light_regions)} light(s) selected.")
 
     def _clear_inpaint_areas(self) -> None:
@@ -3820,6 +3840,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText("Cleared custom Sky/Ground/Light areas.")
 
     def _on_preview_rect_selected(self, mode: str, rect: tuple) -> None:
@@ -3874,6 +3896,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._commit_undo_baseline()
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         self._regenerate_preview()
+        self._refresh_light_toolbar_visibility()
 
     def _on_preview_region_edited(self, kind: str, idx: int, new_rect: tuple) -> None:
         if kind == "sky":
@@ -3934,6 +3957,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(
             f"Calibrated neutral patch ({patch_cct:.0f} K, Duv {duv:+.4f}, Lum {lum:.3f}) -> "
             f"WB Gains ({self._wb_gains[0]:.3f}, {self._wb_gains[1]:.3f}, {self._wb_gains[2]:.3f})."
@@ -4058,6 +4082,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(
             f"Synthesized clean 32-bit Dome HDRI from Macbeth ({cct:.0f} K, Duv {duv:+.4f}, EV100 {ev100:.1f})."
         )
@@ -4111,6 +4136,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(
             f"Applied {source_label} WB Gains: "
             f"(R={self._wb_gains[0]:.3f}, G={self._wb_gains[1]:.3f}, B={self._wb_gains[2]:.3f})."
@@ -4126,6 +4152,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText("Reset White Balance gains to (1.000, 1.000, 1.000).")
 
     def _on_undo_wb(self) -> bool:
@@ -4141,6 +4168,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(
             f"Undid White Balance -> Gains ({self._wb_gains[0]:.3f}, {self._wb_gains[1]:.3f}, {self._wb_gains[2]:.3f})."
         )
@@ -4513,6 +4541,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(f"Estimated Plate #{idx + 1} Vignette lift = {v1:.2f}.")
 
     def _on_toggle_ab_split(self, checked: bool) -> None:
@@ -4719,6 +4748,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(f"Undid last brush stroke ({len(self._brush_strokes)} remaining).")
 
     def _on_clear_brush(self) -> None:
@@ -4734,6 +4764,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText("Cleared all brush strokes.")
 
     def _on_bake_edits_to_canvas(self) -> None:
@@ -4882,6 +4913,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._regenerate_preview()
         self._commit_undo_baseline()
         self._refresh_undo_ui()
+        self._refresh_light_toolbar_visibility()
         self.status_label.setText(
             f"Restored previous state ({len(self._bake_history)} remaining in history)."
         )
@@ -5927,6 +5959,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.hotspot_table.setRowCount(0)
             self.metrics_label.setText("Analyze a plate to see extracted lighting metrics.")
             self._refresh_plate_transform_bar()
+            self._refresh_light_toolbar_visibility()
         finally:
             self._suppress_auto_preview = False
         self._commit_undo_baseline()
@@ -6146,6 +6179,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             )
         if "light_shape" in data:
             self.light_shape_combo.setCurrentText(str(data["light_shape"]))
+        self._refresh_light_toolbar_visibility()
         if "light_resolution" in data:
             self.light_res_combo.setCurrentText(str(data["light_resolution"]))
         self.light_blur_slider.setValue(float(data.get("light_region_blur", 0.0)))
