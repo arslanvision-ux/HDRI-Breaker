@@ -1325,6 +1325,7 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self._sampled_duv: float = 0.0
         self._sampled_lum: float = 0.18
         self._apply_requested: bool = False
+        self._synth_dome_requested: bool = False
         self._match_exposure: bool = False
         self._ev_delta: float = 0.0
 
@@ -1358,6 +1359,14 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self.ev_slider.valueChanged.connect(self._on_ev_changed)
         ev_row.addWidget(self.ev_slider, stretch=1)
         ev_row.addWidget(self.ev_lbl)
+        ev_row.addWidget(QtWidgets.QLabel("Mode:"))
+        self.sample_mode_combo = QtWidgets.QComboBox()
+        self.sample_mode_combo.addItems(["Single Neutral Patch", "Full 6x4 Chart Box (Auto Gray Ramp)"])
+        self.sample_mode_combo.setToolTip(
+            "Single Neutral Patch: drag over 1 gray patch.\n"
+            "Full 6x4 Chart Box: drag a box around the whole ColorChecker to auto-sample the 4 mid-gray patches."
+        )
+        ev_row.addWidget(self.sample_mode_combo)
         layout.addLayout(ev_row)
 
         # Image canvas
@@ -1386,11 +1395,17 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self.apply_btn = QtWidgets.QPushButton("Apply WB to HDRI")
         self.apply_btn.setProperty("accent", "true")
         self.apply_btn.clicked.connect(self._on_apply)
+        self.synth_dome_btn = QtWidgets.QPushButton("Synthesize Clean Dome (Macbeth Only)")
+        self.synth_dome_btn.setToolTip(
+            "No 360° plate needed: create a clean, chart-free procedural 32-bit Dome HDRI matched to this Macbeth shot's WB, CCT, and EV"
+        )
+        self.synth_dome_btn.clicked.connect(self._on_synth_dome)
         reset_btn = QtWidgets.QPushButton("Reset WB (1, 1, 1)")
         reset_btn.clicked.connect(self._on_reset)
         close_btn = QtWidgets.QPushButton("Cancel")
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(self.apply_btn, stretch=1)
+        btn_row.addWidget(self.synth_dome_btn)
         btn_row.addWidget(reset_btn)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
@@ -1444,13 +1459,41 @@ class MacbethWBDialog(QtWidgets.QDialog):
             return None
         h, w, _ = self._pixels.shape
         u0, v0, u1, v1 = rect
-        x0 = int(np.clip(min(u0, u1) * w, 0, max(0, w - 2)))
-        x1 = int(np.clip(max(u0, u1) * w, x0 + 1, w))
-        y0 = int(np.clip(min(v0, v1) * h, 0, max(0, h - 2)))
-        y1 = int(np.clip(max(v0, v1) * h, y0 + 1, h))
-        patch = self._pixels[y0:y1, x0:x1]
-        mean_rgb = tuple(float(v) for v in np.mean(patch, axis=(0, 1)))
-        gains, cct, duv, lum = compute_neutral_wb_gains(mean_rgb)
+        lo_u, hi_u = min(u0, u1), max(u0, u1)
+        lo_v, hi_v = min(v0, v1), max(v0, v1)
+        if hasattr(self, "sample_mode_combo") and "6x4" in self.sample_mode_combo.currentText():
+            # Sample the 4 mid-neutral patches (cols 1..4 of bottom row 3) inside the 6x4 chart box
+            cw = max(1e-4, hi_u - lo_u)
+            ch = max(1e-4, hi_v - lo_v)
+            samples = []
+            lum_18 = None
+            for col in (1, 2, 3, 4):
+                cu0 = lo_u + (col + 0.30) / 6.0 * cw
+                cu1 = lo_u + (col + 0.70) / 6.0 * cw
+                cv0 = lo_v + (3.30 / 4.0) * ch
+                cv1 = lo_v + (3.70 / 4.0) * ch
+                px0 = int(np.clip(cu0 * w, 0, max(0, w - 2)))
+                px1 = int(np.clip(cu1 * w, px0 + 1, w))
+                py0 = int(np.clip(cv0 * h, 0, max(0, h - 2)))
+                py1 = int(np.clip(cv1 * h, py0 + 1, h))
+                p_rgb = np.mean(self._pixels[py0:py1, px0:px1], axis=(0, 1))
+                samples.append(p_rgb)
+                if col == 3:
+                    lum_18 = float(0.2126 * p_rgb[0] + 0.7152 * p_rgb[1] + 0.0722 * p_rgb[2])
+            mean_rgb = tuple(float(v) for v in np.mean(samples, axis=0))
+            gains, cct, duv, lum = compute_neutral_wb_gains(mean_rgb)
+            if lum_18 is not None and lum_18 > 1e-4:
+                lum = lum_18
+            mode_tag = "6x4 Chart Gray Ramp"
+        else:
+            x0 = int(np.clip(lo_u * w, 0, max(0, w - 2)))
+            x1 = int(np.clip(hi_u * w, x0 + 1, w))
+            y0 = int(np.clip(lo_v * h, 0, max(0, h - 2)))
+            y1 = int(np.clip(hi_v * h, y0 + 1, h))
+            patch = self._pixels[y0:y1, x0:x1]
+            mean_rgb = tuple(float(v) for v in np.mean(patch, axis=(0, 1)))
+            gains, cct, duv, lum = compute_neutral_wb_gains(mean_rgb)
+            mode_tag = "Single Patch"
         self._sampled_gains = gains
         self._sampled_cct = cct
         self._sampled_duv = duv
@@ -1458,7 +1501,7 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self._ev_delta = float(np.clip(np.log2(0.18 / max(lum, 1e-4)), -6.0, 6.0))
         self.canvas.set_sampled_rect(rect)
         self.readout_label.setText(
-            f"Sampled RGB: ({mean_rgb[0]:.3f}, {mean_rgb[1]:.3f}, {mean_rgb[2]:.3f}) | "
+            f"[{mode_tag}] RGB: ({mean_rgb[0]:.3f}, {mean_rgb[1]:.3f}, {mean_rgb[2]:.3f}) | "
             f"Measured: {cct:.0f} K (Duv {duv:+.4f}) | "
             f"WB Gains: (R {gains[0]:.3f}, G {gains[1]:.3f}, B {gains[2]:.3f})"
         )
@@ -1466,6 +1509,13 @@ class MacbethWBDialog(QtWidgets.QDialog):
 
     def _on_apply(self) -> None:
         self._apply_requested = True
+        self._synth_dome_requested = False
+        self._match_exposure = self.match_exp_chk.isChecked()
+        self.accept()
+
+    def _on_synth_dome(self) -> None:
+        self._apply_requested = True
+        self._synth_dome_requested = True
         self._match_exposure = self.match_exp_chk.isChecked()
         self.accept()
 
@@ -1919,14 +1969,26 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         mv_wrap_lay.addWidget(self.multiview_resize_grip)
         form.addRow(mv_wrap)
 
+        analyze_row = QtWidgets.QHBoxLayout()
+        analyze_row.setContentsMargins(0, 0, 0, 0)
+        analyze_row.setSpacing(6)
         self.analyze_btn = QtWidgets.QPushButton("Analyze Plate(s) & Generate Preview")
         self.analyze_btn.setMinimumHeight(34)
         self.analyze_btn.setStyleSheet(
-            "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; border: 1px solid #3b82f6; border-radius: 4px; }"
+            "QPushButton { background-color: #2563eb; color: #ffffff; font-weight: bold; border: 1px solid #3b82f6; border-radius: 4px; padding: 4px 10px; }"
             "QPushButton:hover { background-color: #1d4ed8; }"
         )
         self.analyze_btn.clicked.connect(self._on_analyze_clicked)
-        form.addRow(self.analyze_btn)
+        self.quick_1photo_btn = QtWidgets.QPushButton("Quick 1-Photo Dome")
+        self.quick_1photo_btn.setMinimumHeight(34)
+        self.quick_1photo_btn.setToolTip(
+            "One-click preset for a single quick on-set photo: analyzes the plate and configures "
+            "Physical Sky Fill, Inpaint Sky/Ground, Ambient Wrap, and Sun Reconstruction automatically."
+        )
+        self.quick_1photo_btn.clicked.connect(self._on_quick_single_photo_preset)
+        analyze_row.addWidget(self.analyze_btn, stretch=2)
+        analyze_row.addWidget(self.quick_1photo_btn, stretch=1)
+        form.addRow(analyze_row)
 
         return grp
 
@@ -3856,11 +3918,113 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if exec_fn() == QtWidgets.QDialog.Accepted and dlg._apply_requested:
             self._macbeth_path = dlg.path_edit.text().strip()
             self._macbeth_colorspace = dlg.cs_combo.currentText()
-            self.apply_wb_gains(
-                dlg._sampled_gains,
-                ev_delta=dlg._ev_delta if dlg._match_exposure else 0.0,
-                source_label=f"Macbeth ({os.path.basename(self._macbeth_path)})" if self._macbeth_path else "Macbeth",
-            )
+            if getattr(dlg, "_synth_dome_requested", False):
+                self._synthesize_dome_from_macbeth(
+                    cct=float(dlg._sampled_cct),
+                    duv=float(dlg._sampled_duv),
+                    lum=float(dlg._sampled_lum),
+                    gains=tuple(dlg._sampled_gains),
+                    ev_delta=float(dlg._ev_delta) if dlg._match_exposure else 0.0,
+                )
+            else:
+                self.apply_wb_gains(
+                    dlg._sampled_gains,
+                    ev_delta=dlg._ev_delta if dlg._match_exposure else 0.0,
+                    source_label=f"Macbeth ({os.path.basename(self._macbeth_path)})" if self._macbeth_path else "Macbeth",
+                )
+
+    def _synthesize_dome_from_macbeth(
+        self,
+        cct: float,
+        duv: float,
+        lum: float,
+        gains: tuple,
+        ev_delta: float = 0.0,
+    ) -> None:
+        """Synthesize a clean, chart-free procedural 32-bit Dome HDRI matched to an on-set Macbeth shot."""
+        from .lighting_analyzer import LightingProfile, cct_to_rgb
+
+        self._push_undo_snapshot("Synthesize Dome from Macbeth")
+        base_rgb = cct_to_rgb(max(2000.0, min(15000.0, float(cct))))
+        r, g, b = [float(c) for c in base_rgb]
+        sky_col = (min(2.0, r * 0.95), min(2.0, g * 1.02), min(2.0, b * 1.22))
+        zen_col = (sky_col[0] * 0.72, sky_col[1] * 0.80, sky_col[2] * 1.05)
+        hor_col = (r * 0.85, g * 0.85, b * 0.82)
+        gnd_col = (r * 0.24, g * 0.23, b * 0.21)
+        nad_col = (r * 0.14, g * 0.13, b * 0.12)
+        ev100 = float(np.log2(max(lum, 1e-4) / 0.18) + 8.0)
+
+        self._views = []
+        self._baked_canvas_hdri = None
+        self._bake_history.clear()
+        self._profile = LightingProfile(
+            source_path=self._macbeth_path or "Macbeth Reference",
+            overall_cct_kelvin=float(cct),
+            overall_tint_duv=float(duv),
+            key_cct_kelvin=float(cct),
+            sky_cct_kelvin=float(min(15000.0, cct * 1.12)),
+            ground_cct_kelvin=float(max(2000.0, cct * 0.88)),
+            mean_luminance=float(max(0.05, lum)),
+            median_luminance=float(max(0.05, lum)),
+            p10_luminance=float(max(0.01, lum * 0.2)),
+            p90_luminance=float(max(0.1, lum * 2.5)),
+            p99_luminance=float(max(0.5, lum * 5.0)),
+            max_luminance=float(max(1.5, lum * 8.0)),
+            dynamic_range_stops=8.0,
+            key_to_fill_ratio=3.5,
+            estimated_ev100=ev100,
+            overall_color=(r, g, b),
+            zenith_color=zen_col,
+            sky_color=sky_col,
+            horizon_color=hor_col,
+            ground_color=gnd_col,
+            nadir_color=nad_col,
+            azimuthal_strip=np.tile(np.array(hor_col, dtype=np.float32), (64, 1)),
+            hotspots=[],
+            spherical_plate_map=None,
+            spherical_coverage_mask=None,
+        )
+        self._suppress_auto_preview = True
+        try:
+            self.plate_blend_spin.setValue(0.0)
+            self.sky_fill_slider.setValue(0.45)
+            self.wrap_spin.setValue(0.70)
+            self._wb_gains = (1.0, 1.0, 1.0)
+            if abs(ev_delta) > 1e-4:
+                self.ev_spin.setValue(float(np.clip(self.ev_spin.value() + ev_delta, -10.0, 10.0)))
+        finally:
+            self._suppress_auto_preview = False
+        self._populate_analysis_ui(self._profile, 1)
+        self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
+        self.status_label.setText(
+            f"Synthesized clean 32-bit Dome HDRI from Macbeth ({cct:.0f} K, Duv {duv:+.4f}, EV100 {ev100:.1f})."
+        )
+
+    def _on_quick_single_photo_preset(self) -> None:
+        """One-click preset to extrapolate a single quick on-set photo into a seamless 360° dome."""
+        if not self.plate_path_edit.text().strip() and self.multiview_table.rowCount() == 0:
+            self.status_label.setText("Load a single plate path first to run Quick 1-Photo Dome.")
+            return
+        self._push_undo_snapshot("Quick 1-Photo Dome")
+        self._suppress_auto_preview = True
+        try:
+            self.inpaint_chk.setChecked(True)
+            self.sky_fill_slider.setValue(0.65)
+            self.wrap_spin.setValue(0.70)
+            self.sky_blur_slider.setValue(0.25)
+            self.gnd_blur_slider.setValue(0.35)
+            self.highlight_recovery_slider.setValue(0.50)
+            self.sun_reconstruct_slider.setValue(0.45)
+        finally:
+            self._suppress_auto_preview = False
+        self._on_analyze_clicked()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
+        self.status_label.setText(
+            "Applied Quick 1-Photo Dome preset (Physical Sky Fill, Inpaint, Wrap, Sun Reconstruct)."
+        )
 
     def apply_wb_gains(
         self,
