@@ -131,6 +131,18 @@ UI_THEMES: Dict[str, Dict[str, str]] = {
         "input_bg": "#111420",
         "status_fg": "#93c5fd",
     },
+    "Nuke Compositor (Neutral Gray)": {
+        "bg": "#323232",
+        "panel_bg": "#3a3a3a",
+        "fg": "#e2e2e2",
+        "btn_bg": "#484848",
+        "btn_border": "#626262",
+        "btn_hover": "#555555",
+        "accent": "#f7931e",
+        "accent_fg": "#181818",
+        "input_bg": "#262626",
+        "status_fg": "#ffaa33",
+    },
     "Daylight Studio (Light)": {
         "bg": "#e5e7eb",
         "panel_bg": "#f3f4f6",
@@ -2760,6 +2772,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         res_row.addWidget(self.out_cs_combo)
         self.diffuse_split_chk = QtWidgets.QCheckBox(
             "Also Export Diffuse/GI EXR (_diffuse.exr — firefly-free)"
+        )
+        self.diffuse_split_chk.setStyleSheet(
+            "QCheckBox { color: #f59e0b; font-weight: bold; }"
+            "QCheckBox:hover { color: #fbbf24; }"
+            "QCheckBox:checked { color: #fbbf24; }"
         )
         self.diffuse_split_chk.setToolTip(
             "Write a second soft-clamped & blurred 32-bit EXR (*_diffuse.exr) alongside your main HDRI.\n"
