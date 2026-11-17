@@ -232,6 +232,7 @@ class CollapsibleGroupBox(QtWidgets.QWidget):
         super().__init__(parent)
         self._title = title
         self._collapsed = bool(collapsed)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
@@ -2634,6 +2635,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(grp)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignTop)
 
         self.lookdev_chk = QtWidgets.QCheckBox(
             "Create Lookdev Tripod (Chrome/18% Gray/ACEScg Macbeth) + Circular Ground Projection (/stage)"
@@ -2772,6 +2774,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         out_row.addWidget(self.out_path_edit)
         out_row.addWidget(out_browse)
         layout.addLayout(out_row)
+        layout.addStretch(1)
 
         return grp
 
