@@ -1395,9 +1395,10 @@ class MacbethWBDialog(QtWidgets.QDialog):
         self.apply_btn = QtWidgets.QPushButton("Apply WB to HDRI")
         self.apply_btn.setProperty("accent", "true")
         self.apply_btn.clicked.connect(self._on_apply)
-        self.synth_dome_btn = QtWidgets.QPushButton("Synthesize Clean Dome (Macbeth Only)")
+        self.synth_dome_btn = QtWidgets.QPushButton("New Dome from Macbeth (Replaces Plates)")
         self.synth_dome_btn.setToolTip(
-            "No 360° plate needed: create a clean, chart-free procedural 32-bit Dome HDRI matched to this Macbeth shot's WB, CCT, and EV"
+            "Use ONLY when you have no 360°/plate images: replaces current plates with a clean procedural 32-bit Dome HDRI matched to this Macbeth shot.\n"
+            "To calibrate your existing HDRI instead, click 'Apply WB to HDRI'."
         )
         self.synth_dome_btn.clicked.connect(self._on_synth_dome)
         reset_btn = QtWidgets.QPushButton("Reset WB (1, 1, 1)")
@@ -3942,7 +3943,20 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_delta: float = 0.0,
     ) -> None:
         """Synthesize a clean, chart-free procedural 32-bit Dome HDRI matched to an on-set Macbeth shot."""
-        from .lighting_analyzer import LightingProfile, cct_to_rgb
+        from .lighting_analyzer import HotspotLight, LightingProfile, cct_to_rgb
+
+        if self._views or self._hdri_pixels is not None or self._baked_canvas_hdri is not None:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Replace Current HDRI / Plates?",
+                "Synthesizing a new procedural dome from Macbeth will replace your currently loaded plates/HDRI.\n\n"
+                "Click 'Yes' to replace with a procedural Macbeth dome, or 'No' to cancel "
+                "(use 'Apply WB to HDRI' instead to keep your current HDRI).",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
 
         self._push_undo_snapshot("Synthesize Dome from Macbeth")
         base_rgb = cct_to_rgb(max(2000.0, min(15000.0, float(cct))))
@@ -3953,6 +3967,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         gnd_col = (r * 0.24, g * 0.23, b * 0.21)
         nad_col = (r * 0.14, g * 0.13, b * 0.12)
         ev100 = float(np.log2(max(lum, 1e-4) / 0.18) + 8.0)
+        key_peak = float(max(4.5, lum * 25.0))
+        key_hs = HotspotLight(
+            index=0,
+            plate_u=0.5 + 35.0 / 360.0,
+            plate_v=0.5 - 42.0 / 180.0,
+            azimuth_deg=35.0,
+            elevation_deg=42.0,
+            radius_deg=14.0,
+            peak_intensity=key_peak,
+            mean_intensity=key_peak * 0.5,
+            color_rgb=(r, g, b),
+            cct_kelvin=float(cct),
+        )
 
         self._views = []
         self._baked_canvas_hdri = None
@@ -3969,9 +3996,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             p10_luminance=float(max(0.01, lum * 0.2)),
             p90_luminance=float(max(0.1, lum * 2.5)),
             p99_luminance=float(max(0.5, lum * 5.0)),
-            max_luminance=float(max(1.5, lum * 8.0)),
+            max_luminance=key_peak,
             dynamic_range_stops=8.0,
-            key_to_fill_ratio=3.5,
+            key_to_fill_ratio=4.5,
             estimated_ev100=ev100,
             overall_color=(r, g, b),
             zenith_color=zen_col,
@@ -3980,7 +4007,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             ground_color=gnd_col,
             nadir_color=nad_col,
             azimuthal_strip=np.tile(np.array(hor_col, dtype=np.float32), (64, 1)),
-            hotspots=[],
+            hotspots=[key_hs],
             spherical_plate_map=None,
             spherical_coverage_mask=None,
         )
@@ -3989,6 +4016,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.plate_blend_spin.setValue(0.0)
             self.sky_fill_slider.setValue(0.45)
             self.wrap_spin.setValue(0.70)
+            self.hs_boost_spin.setValue(1.0)
             self._wb_gains = (1.0, 1.0, 1.0)
             if abs(ev_delta) > 1e-4:
                 self.ev_spin.setValue(float(np.clip(self.ev_spin.value() + ev_delta, -10.0, 10.0)))
