@@ -71,7 +71,6 @@ from .solaris_stage import (
     export_solaris_rig_usd,
     list_scene_cameras,
     read_scene_camera_params,
-    sync_solaris_dome_live,
 )
 
 try:
@@ -2676,11 +2675,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.diffuse_split_chk = QtWidgets.QCheckBox("Export Companion Diffuse EXR (_diffuse.exr)")
         self.diffuse_split_chk.setToolTip("Write a firefly-free clamped & smoothed diffuse/irradiance EXR alongside the full-range specular EXR")
         self.diffuse_split_chk.setChecked(False)
-        self.live_sync_solaris_chk = QtWidgets.QCheckBox("Live Sync Dome (/stage)")
-        self.live_sync_solaris_chk.setToolTip("Push HDRI Yaw° and Exposure (EV) changes live onto /stage/hdri_maker_domelight")
-        self.live_sync_solaris_chk.setChecked(False)
         lookdev_form.addRow("", self.diffuse_split_chk)
-        lookdev_form.addRow("", self.live_sync_solaris_chk)
         layout.addLayout(lookdev_form)
 
         btn_row = FlowLayout(margin=2, spacing=6)
@@ -5299,12 +5294,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._update_preview_pixmap()
             if not fast:
                 self._log_debug("Preview pixmap updated.")
-            if hasattr(self, "live_sync_solaris_chk") and self.live_sync_solaris_chk.isChecked():
-                sync_solaris_dome_live(
-                    dome_node=self._last_dome_node,
-                    yaw_deg=self.yaw_spin.value(),
-                    exposure_ev=self.ev_spin.value(),
-                )
         except Exception as exc:
             self._log_debug(f"Preview generation error: {exc}\n{traceback.format_exc()}")
             self.status_label.setText(f"Preview error: {exc}")
