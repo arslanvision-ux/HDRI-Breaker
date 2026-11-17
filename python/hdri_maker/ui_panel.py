@@ -2367,9 +2367,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row.addWidget(zoom_out_btn)
         ev_row.addWidget(self.zoom_reset_btn)
         ev_row.addWidget(zoom_in_btn)
-        self.expand_viewport_btn = QtWidgets.QPushButton("⤢")
+        self.expand_viewport_btn = QtWidgets.QPushButton("⤢ Fullscreen")
         self.expand_viewport_btn.setCheckable(True)
-        self.expand_viewport_btn.setMaximumWidth(28)
         self.expand_viewport_btn.setToolTip("Expand / Restore Viewport (collapse or restore Solaris & side panels)")
         self.expand_viewport_btn.toggled.connect(self._on_toggle_expand_viewport)
         ev_row.addWidget(self.expand_viewport_btn)
@@ -4206,7 +4205,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             )
             self._main_splitter.setSizes([0, max(600, self.width())])
             self._right_splitter.setSizes([max(400, self.height()), 0])
-            self.status_label.setText("Expanded HDRI viewport (click ⤢ again to restore panels).")
+            self.expand_viewport_btn.setText("⤢ Restore")
+            self.status_label.setText("Expanded HDRI viewport (click '⤢ Restore' to restore panels).")
         else:
             saved = getattr(self, "_saved_splitter_sizes", None)
             if saved:
@@ -4215,6 +4215,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             else:
                 self._main_splitter.setSizes([500, 820])
                 self._right_splitter.setSizes([540, 230])
+            self.expand_viewport_btn.setText("⤢ Fullscreen")
             self.status_label.setText("Restored side and Solaris panels.")
         self._update_preview_pixmap()
 
