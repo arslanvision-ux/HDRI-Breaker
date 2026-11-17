@@ -2496,9 +2496,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.filesDropped.connect(self._on_preview_files_dropped)
 
         self.plate_transform_bar = QtWidgets.QWidget()
-        pt_layout = QtWidgets.QHBoxLayout(self.plate_transform_bar)
-        pt_layout.setContentsMargins(2, 2, 2, 2)
-        pt_layout.setSpacing(6)
+        pt_layout = FlowLayout(self.plate_transform_bar, margin=2, spacing=6)
         self.plate_sel_combo = QtWidgets.QComboBox()
         self.plate_sel_combo.setMinimumWidth(110)
         self.plate_sel_combo.currentIndexChanged.connect(self._on_plate_combo_changed)
@@ -2559,7 +2557,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         pt_layout.addWidget(self.pt_mask_btn)
         pt_layout.addWidget(self.pt_clear_mask_btn)
         pt_layout.addWidget(self.pt_reset_btn)
-        pt_layout.addStretch(1)
         self.plate_transform_bar.setVisible(False)
         layout.addWidget(self.plate_transform_bar)
 
@@ -2601,12 +2598,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         return grp
 
     def _refresh_light_toolbar_visibility(self) -> None:
-        """Show light controls only when Pick Light Area is active or light regions exist."""
+        """Show light controls only when Pick Light Area is active."""
         if hasattr(self, "light_toolbar_widget"):
-            active = (
-                (hasattr(self, "pick_light_btn") and self.pick_light_btn.isChecked())
-                or bool(getattr(self, "_light_regions", None))
-            )
+            active = hasattr(self, "pick_light_btn") and self.pick_light_btn.isChecked()
             self.light_toolbar_widget.setVisible(active)
 
     def _build_solaris_group(self) -> QtWidgets.QGroupBox:
@@ -3481,6 +3475,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if checked:
             if hasattr(self, "edit_plates_btn") and self.edit_plates_btn.isChecked():
                 self.edit_plates_btn.setChecked(False)
+            if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
+                self.brush_btn.setChecked(False)
             if mode != "sky":
                 self.pick_sky_btn.setChecked(False)
             if mode != "ground":
@@ -3514,6 +3510,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 btn.setChecked(False)
             if hasattr(self, "pick_wb_btn"):
                 self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
+                self.brush_btn.setChecked(False)
             if hasattr(self, "pt_mask_btn"):
                 self.pt_mask_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
@@ -3859,6 +3857,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         elif mode == "wb":
             if hasattr(self, "pick_wb_btn"):
                 self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
+                self.brush_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
             self._apply_neutral_wb_patch(rect)
             return
