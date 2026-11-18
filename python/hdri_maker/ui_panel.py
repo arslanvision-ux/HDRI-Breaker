@@ -2780,8 +2780,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         )
         self.diffuse_split_chk.setToolTip(
             "Write a second soft-clamped & blurred 32-bit EXR (*_diffuse.exr) alongside your main HDRI.\n"
-            "Use it on a separate Diffuse/GI Dome Light (visibleToDiffuse=1, visibleToGlossy=0) to eliminate\n"
-            "path-tracer fireflies & GI noise while keeping the main EXR sharp for specular reflections."
+            "When checked, Create / Update Solaris Dome Light automatically builds two domes:\n"
+            "• Primary Dome (/lights/hdri_maker_dome): Specular/Reflection + Camera only\n"
+            "• Diffuse/GI Dome (/lights/hdri_maker_dome_diffuse): Diffuse/GI/SSS/Volume only (Karma & Redshift)\n"
+            "Eliminates path-tracer fireflies & GI noise while keeping reflections sharp."
         )
         self.diffuse_split_chk.setChecked(False)
         res_row.addWidget(self.diffuse_split_chk)
@@ -5680,7 +5682,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     diff_out = f"{stem_d}_diffuse{ext_d or '.exr'}"
                     diff_hdri = generate_diffuse_irradiance_hdri(hdri)
                     write_exr_32f(diff_out, diff_hdri, output_colorspace=out_cs, metadata=meta)
+                    self._last_diffuse_exr_path = diff_out
                     light_msg += " + Diffuse EXR"
+                else:
+                    self._last_diffuse_exr_path = None
                 self._last_exr_path = p_written
                 self._last_hdri_full = self._downsample_for_lookdev(hdri)
                 lookdev_msg = ""
@@ -5752,15 +5757,31 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if not exr_path:
             return
 
+        diff_exr = None
+        if self.diffuse_split_chk.isChecked():
+            diff_cand = getattr(self, "_last_diffuse_exr_path", None)
+            if not diff_cand or not os.path.isfile(diff_cand):
+                exr_path = self._on_export_exr()
+                if not exr_path:
+                    return
+                diff_cand = getattr(self, "_last_diffuse_exr_path", None)
+            diff_exr = diff_cand
+
         try:
             dome = create_or_update_domelight(
                 hdri_exr_path=exr_path,
                 profile=self._profile,
+                diffuse_exr_path=diff_exr,
             )
             self._last_dome_node = dome
-            self.status_label.setText(
-                f"Solaris Dome Light ready at {dome.path()} -> {exr_path}"
-            )
+            if diff_exr:
+                self.status_label.setText(
+                    f"Solaris Dual Dome ready: {dome.path()} (Specular/Cam) + {dome.path()}_diffuse (Diffuse/GI)"
+                )
+            else:
+                self.status_label.setText(
+                    f"Solaris Dome Light ready at {dome.path()} -> {exr_path}"
+                )
         except Exception as exc:
             self.status_label.setText(f"Solaris Dome Light error: {exc}")
 
@@ -5810,10 +5831,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
             prev_node = self._last_dome_node
             if self._last_exr_path:
+                diff_exr = getattr(self, "_last_diffuse_exr_path", None) if self.diffuse_split_chk.isChecked() else None
                 prev_node = create_or_update_domelight(
                     hdri_exr_path=self._last_exr_path,
                     profile=self._profile,
                     set_display_flag=False,
+                    diffuse_exr_path=diff_exr,
                 )
                 self._last_dome_node = prev_node
             created = []
@@ -5852,10 +5875,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             hs = self._profile.hotspots[0]
             parent = self._last_dome_node
             if parent is None and self._last_exr_path:
+                diff_exr = getattr(self, "_last_diffuse_exr_path", None) if self.diffuse_split_chk.isChecked() else None
                 parent = create_or_update_domelight(
                     hdri_exr_path=self._last_exr_path,
                     profile=self._profile,
                     set_display_flag=False,
+                    diffuse_exr_path=diff_exr,
                 )
                 self._last_dome_node = parent
             sun = create_or_update_distant_sun_from_hotspot(hs, parent_node=parent)

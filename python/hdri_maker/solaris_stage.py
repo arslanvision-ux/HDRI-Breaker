@@ -182,29 +182,81 @@ def _create_lop(stage, type_candidates: Tuple[str, ...], name: str):
     raise RuntimeError(f"Could not create any of LOP types {type_candidates} in {stage.path()}")
 
 
-def create_or_update_domelight(
+def _configure_domelight_contributions(dome, mode: str) -> None:
+    """
+    Configure USD, Karma, and Redshift contribution/visibility parms on a
+    `domelight::2.0` LOP.
+
+    `mode`:
+      - "all": single dome light (full diffuse, specular, GI, and camera).
+      - "specular": sharp specular/reflection + camera background only.
+      - "diffuse": firefly-free diffuse/GI/SSS/volume only (hidden from camera).
+    """
+    is_single = mode == "all"
+    is_spec = mode == "specular"
+    is_diff = mode == "diffuse"
+
+    # Standard UsdLuxLightAPI multipliers (Base Properties)
+    diff_mult = 0.0 if is_spec else 1.0
+    spec_mult = 0.0 if is_diff else 1.0
+    _set_parm_control(dome, ("xn__inputsdiffuse_control_99a", "xn__inputsdiffuse_control_e5a"), "set" if not is_single else "none")
+    _set_first_parm(dome, ("xn__inputsdiffuse_8wa", "xn__inputsdiffuse_e5a", "inputs:diffuse", "diffuse"), diff_mult)
+    _set_parm_control(dome, ("xn__inputsspecular_control_wcb", "xn__inputsspecular_control_e5a"), "set" if not is_single else "none")
+    _set_first_parm(dome, ("xn__inputsspecular_vya", "xn__inputsspecular_e5a", "inputs:specular", "specular"), spec_mult)
+
+    # Karma (KarmaLightAPI_Light): Contributions + Render Light Geometry
+    if is_single:
+        _set_parm_control(dome, ("xn__inputskarmalightcontribs_control_6sbff",), "none")
+        _set_first_parm(dome, ("xn__inputskarmalightcontribs_5fbff",), "*")
+        _set_parm_control(dome, ("xn__inputskarmalightrenderlightgeo_control_y2bff",), "none")
+        _set_first_parm(dome, ("xn__inputskarmalightrenderlightgeo_xpbff",), 1)
+    elif is_spec:
+        _set_parm_control(dome, ("xn__inputskarmalightcontribs_control_6sbff",), "set")
+        _set_first_parm(dome, ("xn__inputskarmalightcontribs_5fbff",), "-diffuse & -volume & -sss")
+        _set_parm_control(dome, ("xn__inputskarmalightrenderlightgeo_control_y2bff",), "set")
+        _set_first_parm(dome, ("xn__inputskarmalightrenderlightgeo_xpbff",), 1)
+    else:
+        _set_parm_control(dome, ("xn__inputskarmalightcontribs_control_6sbff",), "set")
+        _set_first_parm(dome, ("xn__inputskarmalightcontribs_5fbff",), "diffuse|volume|sss")
+        _set_parm_control(dome, ("xn__inputskarmalightrenderlightgeo_control_y2bff",), "set")
+        _set_first_parm(dome, ("xn__inputskarmalightrenderlightgeo_xpbff",), 0)
+
+    # Redshift (Redshift/Contribution): Camera, GI, Transmission, SSS, Volume
+    rs_ctrl = "set" if not is_single else "none"
+    rs_cam = 0.0 if is_diff else 1.0
+    rs_gi = 0.0 if is_spec else 1.0
+    rs_trans = 0.0 if is_diff else 1.0
+    rs_sss_vol = 0.0 if is_spec else 1.0
+
+    for ctrl, parm, val in (
+        ("xn__redshiftlightRSL_cameraScaleDome_control_95bf", "xn__redshiftlightRSL_cameraScaleDome_8sbf", rs_cam),
+        ("xn__redshiftlightRSL_cameraScale_control_rzbf", "xn__redshiftlightRSL_cameraScale_qmbf", rs_cam),
+        ("xn__redshiftlightRSL_indirectScale_control_02bf", "xn__redshiftlightRSL_indirectScale_zpbf", rs_gi),
+        ("xn__redshiftlightRSL_transmissionScale_control_j9bf", "xn__redshiftlightRSL_transmissionScale_iwbf", rs_trans),
+        ("xn__redshiftlightRSL_sssScale_control_vubf", "xn__redshiftlightRSL_sssScale_uhbf", rs_sss_vol),
+        ("xn__redshiftlightRSL_multisssScale_control_02bf", "xn__redshiftlightRSL_multisssScale_zpbf", rs_sss_vol),
+        ("xn__redshiftlightRSL_volumeScale_control_rzbf", "xn__redshiftlightRSL_volumeScale_qmbf", rs_sss_vol),
+    ):
+        _set_parm_control(dome, (ctrl,), rs_ctrl)
+        _set_first_parm(dome, (parm,), val)
+
+
+def _populate_domelight_node(
+    stage,
+    node_name: str,
+    prim_path: str,
     hdri_exr_path: str,
-    profile: Optional[LightingProfile] = None,
-    node_name: str = "hdri_maker_domelight",
-    prim_path: str = "/lights/hdri_maker_dome",
-    exposure: float = 0.0,
-    intensity: float = 1.0,
-    rotation_y_deg: float = 0.0,
-    enable_color_temp: bool = False,
-    set_display_flag: bool = True,
+    profile: Optional[LightingProfile],
+    exposure: float,
+    intensity: float,
+    rotation_y_deg: float,
+    enable_color_temp: bool,
+    contrib_mode: str,
 ):
-    """
-    Create or update a Solaris Dome Light LOP on /stage pointing to the 32-bit EXR.
-
-    Compatible with Houdini 20.0, 20.5, and 21.0+ (Karma & Redshift Solaris).
-    """
-    stage = _ensure_stage_context()
+    """Create or update a single `domelight::2.0` LOP with common EXR & contribution parms."""
     dome = _create_lop(stage, ("domelight::2.0", "domelight"), node_name)
-
-    # Set USD primitive path
     _set_first_parm(dome, ("primpath",), prim_path)
 
-    # Set texture file & latlong format
     _set_parm_control(dome, ("xn__inputstexturefile_control_shbh", "xn__inputstexturefile_control_r3a"))
     _set_first_parm(
         dome,
@@ -219,7 +271,6 @@ def create_or_update_domelight(
         "latlong",
     )
 
-    # Intensity & Exposure
     _set_parm_control(dome, ("xn__inputsintensity_control_jeb", "xn__inputsintensity_control_i5a"))
     _set_first_parm(
         dome,
@@ -234,10 +285,8 @@ def create_or_update_domelight(
         float(exposure),
     )
 
-    # Azimuth orientation
     _set_first_parm(dome, ("ry",), float(rotation_y_deg))
 
-    # Optional Color Temperature metadata on dome light
     if profile is not None and enable_color_temp:
         _set_parm_control(dome, ("xn__inputsenableColorTemperature_control_pzb", "xn__inputsenableColorTemperature_control_r6a"))
         _set_first_parm(
@@ -252,17 +301,85 @@ def create_or_update_domelight(
             float(profile.overall_cct_kelvin),
         )
 
+    _configure_domelight_contributions(dome, contrib_mode)
     dome.moveToGoodPosition()
+    return dome
+
+
+def create_or_update_domelight(
+    hdri_exr_path: str,
+    profile: Optional[LightingProfile] = None,
+    node_name: str = "hdri_maker_domelight",
+    prim_path: str = "/lights/hdri_maker_dome",
+    exposure: float = 0.0,
+    intensity: float = 1.0,
+    rotation_y_deg: float = 0.0,
+    enable_color_temp: bool = False,
+    set_display_flag: bool = True,
+    diffuse_exr_path: Optional[str] = None,
+):
+    """
+    Create or update a Solaris Dome Light LOP on /stage pointing to the 32-bit EXR.
+
+    When `diffuse_exr_path` is provided, automatically configures a dual-dome
+    setup for Karma and Redshift:
+      - `node_name` (`/lights/hdri_maker_dome`): Specular/Reflection + Camera only
+      - `<node_name>_diffuse` (`/lights/hdri_maker_dome_diffuse`): Diffuse/GI/SSS/Volume only
+    """
+    stage = _ensure_stage_context()
+    has_diff = bool(diffuse_exr_path)
+    dome = _populate_domelight_node(
+        stage=stage,
+        node_name=node_name,
+        prim_path=prim_path,
+        hdri_exr_path=hdri_exr_path,
+        profile=profile,
+        exposure=exposure,
+        intensity=intensity,
+        rotation_y_deg=rotation_y_deg,
+        enable_color_temp=enable_color_temp,
+        contrib_mode="specular" if has_diff else "all",
+    )
+
+    diff_node_name = f"{node_name}_diffuse"
+    tail_dome = dome
+    if has_diff:
+        diff_dome = _populate_domelight_node(
+            stage=stage,
+            node_name=diff_node_name,
+            prim_path=f"{prim_path}_diffuse",
+            hdri_exr_path=diffuse_exr_path,
+            profile=profile,
+            exposure=exposure,
+            intensity=intensity,
+            rotation_y_deg=rotation_y_deg,
+            enable_color_temp=enable_color_temp,
+            contrib_mode="diffuse",
+        )
+        try:
+            diff_dome.setInput(0, dome)
+            diff_dome.moveToGoodPosition()
+        except Exception:
+            pass
+        tail_dome = diff_dome
+    else:
+        try:
+            stale_diff = stage.node(diff_node_name)
+            if stale_diff is not None:
+                stale_diff.destroy()
+        except Exception:
+            pass
+
     try:
         first_area = stage.node("hdri_maker_area_1") or stage.node("hdri_maker_key_area") or stage.node("hdri_maker_key_1")
-        if first_area is not None and not first_area.inputs():
-            first_area.setInput(0, dome)
+        if first_area is not None and (not first_area.inputs() or first_area.inputs()[0] == dome):
+            first_area.setInput(0, tail_dome)
     except Exception:
         pass
-    if not _rewire_lookdev_to_tail(stage, dome, set_display_flag=set_display_flag):
+    if not _rewire_lookdev_to_tail(stage, tail_dome, set_display_flag=set_display_flag):
         if set_display_flag:
             try:
-                dome.setDisplayFlag(True)
+                tail_dome.setDisplayFlag(True)
             except Exception:
                 pass
 
@@ -289,20 +406,30 @@ def sync_solaris_dome_live(
     if dome is None:
         return False
     try:
-        if hdri_exr_path:
-            _set_parm_control(dome, ("xn__inputstexturefile_control_shbh", "xn__inputstexturefile_control_r3a"))
+        targets = [dome]
+        try:
+            stage = dome.parent()
+            if stage is not None:
+                diff_dome = stage.node(f"{dome.name()}_diffuse")
+                if diff_dome is not None:
+                    targets.append(diff_dome)
+        except Exception:
+            pass
+        for idx, target in enumerate(targets):
+            if idx == 0 and hdri_exr_path:
+                _set_parm_control(target, ("xn__inputstexturefile_control_shbh", "xn__inputstexturefile_control_r3a"))
+                _set_first_parm(
+                    target,
+                    ("xn__inputstexturefile_r3ah", "xn__inputstexturefile_r3a", "inputs:texture:file", "texturefile"),
+                    hdri_exr_path,
+                )
+            _set_parm_control(target, ("xn__inputsexposure_control_wcb", "xn__inputsexposure_control_e5a"))
             _set_first_parm(
-                dome,
-                ("xn__inputstexturefile_r3ah", "xn__inputstexturefile_r3a", "inputs:texture:file", "texturefile"),
-                hdri_exr_path,
+                target,
+                ("xn__inputsexposure_vya", "xn__inputsexposure_e5a", "inputs:exposure", "exposure"),
+                float(exposure_ev),
             )
-        _set_parm_control(dome, ("xn__inputsexposure_control_wcb", "xn__inputsexposure_control_e5a"))
-        _set_first_parm(
-            dome,
-            ("xn__inputsexposure_vya", "xn__inputsexposure_e5a", "inputs:exposure", "exposure"),
-            float(exposure_ev),
-        )
-        _set_first_parm(dome, ("ry",), float(yaw_deg))
+            _set_first_parm(target, ("ry",), float(yaw_deg))
         return True
     except Exception:
         return False
