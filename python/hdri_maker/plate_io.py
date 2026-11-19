@@ -771,6 +771,31 @@ def write_exr_32f(
     return resolved
 
 
+def is_equirectangular_image(path: str, width: int, height: int) -> bool:
+    """
+    Detect whether an input plate is already an unwrapped 360° Lat/Long
+    (equirectangular, 2:1 aspect ratio) environment map.
+    """
+    if height > 0 and width > 0:
+        aspect = float(width) / float(height)
+        if 1.95 <= aspect <= 2.05:
+            return True
+    if path and os.path.isfile(path) and _HAS_OIIO:
+        try:
+            inp = oiio.ImageInput.open(path)
+            if inp is not None:
+                spec = inp.spec()
+                tex_fmt = str(spec.get_string_attribute("textureformat", "") or "").lower()
+                env_attr = str(spec.get_string_attribute("hdri_maker:envmap", "") or "").lower()
+                proj_attr = str(spec.get_string_attribute("GPano:ProjectionType", "") or "").lower()
+                inp.close()
+                if "latlong" in tex_fmt or "latlong" in env_attr or "equirectangular" in proj_attr:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 def merge_ldr_brackets_to_hdr(
     paths: List[str],
     ev_offsets: Optional[List[float]] = None,
@@ -781,8 +806,9 @@ def merge_ldr_brackets_to_hdr(
     single unclamped 32-bit float Linear Rec.709 HDR image using hat-weighted
     Debevec/Robertson irradiance weighting.
 
-    If `ev_offsets` is None, relative EV stops are automatically estimated from
-    log-median midtone luminance ratios (or fallback 2.0 EV spacing).
+    If `ev_offsets` is None, relative EV stops are read from EXIF (shutter/f-stop/ISO)
+    when available, or automatically estimated from matched overlapping midtone pixels
+    between adjacent exposures (robust for both daylight and night/low-key 360° scenes).
     """
     if not paths:
         raise ValueError("At least one image path is required to merge brackets.")
@@ -792,7 +818,8 @@ def merge_ldr_brackets_to_hdr(
 
     target_h, target_w = frames[0].pixels.shape[:2]
     imgs: List[np.ndarray] = []
-    med_lums: List[float] = []
+    lums: List[np.ndarray] = []
+    sort_scores: List[float] = []
     for f in frames:
         px = f.pixels
         if px.shape[0] != target_h or px.shape[1] != target_w:
@@ -800,14 +827,16 @@ def merge_ldr_brackets_to_hdr(
             x_idx = np.linspace(0, px.shape[1] - 1, target_w).astype(np.int32)
             px = px[np.ix_(y_idx, x_idx)]
         imgs.append(px)
-        lum = 0.2126 * px[..., 0] + 0.7152 * px[..., 1] + 0.0722 * px[..., 2]
-        mid = lum[(lum > 0.005) & (lum < 0.92)]
-        med_lums.append(float(np.median(mid)) if mid.size > 32 else float(np.mean(lum) + 1e-4))
+        lum = (0.2126 * px[..., 0] + 0.7152 * px[..., 1] + 0.0722 * px[..., 2]).astype(np.float32)
+        lums.append(lum)
+        # Mean luminance across the whole frame is strictly monotonic with exposure
+        # (even in night/low-key scenes where most pixels are near black).
+        sort_scores.append(float(np.mean(lum)))
 
     # Sort exposures from darkest (shortest shutter) to brightest (longest shutter)
-    order = np.argsort(med_lums)
-    imgs = [imgs[i] for i in order]
-    med_lums = [med_lums[i] for i in order]
+    order = np.argsort(sort_scores)
+    imgs = [imgs[int(i)] for i in order]
+    lums = [lums[int(i)] for i in order]
 
     if ev_offsets is not None and len(ev_offsets) == len(imgs):
         evs = sorted(float(v) for v in ev_offsets)
@@ -817,15 +846,24 @@ def merge_ldr_brackets_to_hdr(
             med_ev = float(np.median([float(e) for e in exif_evs]))
             evs = [med_ev - float(e) for e in exif_evs]
         else:
-            mid_idx = len(imgs) // 2
-            ref_lum = max(med_lums[mid_idx], 1e-4)
-            evs = []
-            for idx, ml in enumerate(med_lums):
-                ratio = max(ml, 1e-5) / ref_lum
-                est_ev = float(np.log2(ratio))
-                if abs(est_ev) < 0.15 and idx != mid_idx:
-                    est_ev = float((idx - mid_idx) * 2.0)
-                evs.append(est_ev)
+            # Pairwise matched-pixel EV estimation between adjacent sorted exposures:
+            # avoids night-scene bias where unclipped midtone pixel sets differ per exposure.
+            cum_evs = [0.0]
+            for idx in range(len(lums) - 1):
+                la = lums[idx]
+                lb = lums[idx + 1]
+                overlap = (la > 0.015) & (la < 0.75) & (lb > 0.015) & (lb < 0.75)
+                if int(np.count_nonzero(overlap)) >= 64:
+                    ratios = lb[overlap] / np.maximum(la[overlap], 1e-6)
+                    delta_ev = float(np.median(np.log2(np.maximum(ratios, 1e-4))))
+                    if not math.isfinite(delta_ev) or delta_ev < 0.15:
+                        delta_ev = 2.0
+                    delta_ev = float(np.clip(delta_ev, 0.25, 6.0))
+                else:
+                    delta_ev = 2.0
+                cum_evs.append(cum_evs[-1] + delta_ev)
+            mid_ev = cum_evs[len(cum_evs) // 2]
+            evs = [e - mid_ev for e in cum_evs]
 
     accum_hdr = np.zeros((target_h, target_w, 3), dtype=np.float32)
     accum_w = np.zeros((target_h, target_w, 1), dtype=np.float32)

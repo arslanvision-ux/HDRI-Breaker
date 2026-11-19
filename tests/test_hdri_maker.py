@@ -787,6 +787,70 @@ class TestHDRIMaker(unittest.TestCase):
         res = sync_solaris_dome_live(None, yaw_deg=45.0, exposure_ev=0.5)
         self.assertIsInstance(res, bool)
 
+    def test_equirectangular_360_brackets_passthrough(self) -> None:
+        from hdri_maker.hdri_generator import HDRISynthesisParams, generate_latlong_hdri
+        from hdri_maker.lighting_analyzer import (
+            PlateViewInput,
+            analyze_plate,
+            project_multiview_plates_to_latlong,
+        )
+        from hdri_maker.plate_io import (
+            is_equirectangular_image,
+            linear_to_srgb,
+            merge_ldr_brackets_to_hdr,
+        )
+
+        # 1. Aspect-ratio detection for 2:1 360° Lat/Long vs 16:9 plate
+        self.assertTrue(is_equirectangular_image("", 2048, 1024))
+        self.assertFalse(is_equirectangular_image("", 1920, 1080))
+
+        # 2. Build a synthetic night/HDR 2:1 360° scene with distinct left/right/top/bottom colors
+        h, w = 64, 128
+        true_hdr = np.full((h, w, 3), 0.02, dtype=np.float32)
+        true_hdr[:16, :, :] = [0.05, 0.08, 0.20]          # zenith: deep blue
+        true_hdr[48:, :, :] = [0.12, 0.09, 0.06]          # nadir: warm ground
+        true_hdr[24:40, 16:32, :] = [0.10, 0.40, 1.80]    # left quadrant: bright blue sign
+        true_hdr[24:40, 88:104, :] = [3.50, 1.20, 0.20]   # right quadrant: bright warm lamp
+
+        # Simulate 3 LDR JPG brackets (-2 EV, 0 EV, +2 EV) without EXIF
+        from PIL import Image
+
+        bracket_paths = []
+        for idx, ev in enumerate((-2.0, 0.0, 2.0)):
+            exposed = np.clip(true_hdr * (2.0 ** ev), 0.0, 1.0)
+            srgb_u8 = np.clip(np.round(linear_to_srgb(exposed) * 255.0), 0, 255).astype(np.uint8)
+            p = os.path.join(self.tmpdir.name, f"pano_360_ev{idx}.jpg")
+            Image.fromarray(srgb_u8, mode="RGB").save(p, quality=98)
+            bracket_paths.append(p)
+
+        merged = merge_ldr_brackets_to_hdr(bracket_paths, colorspace="sRGB")
+        self.assertEqual(merged.shape, (h, w, 3))
+        self.assertGreater(float(np.max(merged)), 1.5)
+
+        # 3. Equirectangular pass-through projection: full coverage, no 3x mirroring
+        view = PlateViewInput(
+            pixels=merged,
+            is_hdr=True,
+            source_path=bracket_paths[1],
+            lens_type="equirectangular",
+        )
+        proj, cov = project_multiview_plates_to_latlong([view], out_width=w, out_height=h)
+        self.assertAlmostEqual(float(np.min(cov)), 1.0, places=5)
+        self.assertLess(float(np.max(np.abs(proj - merged))), 0.05)
+
+        # 4. generate_latlong_hdri preserves left/right asymmetry without mirroring/tiling
+        prof = analyze_plate(merged, is_hdr=True)
+        out_hdri = generate_latlong_hdri(
+            prof,
+            HDRISynthesisParams(width=w, height=h, plate_projection_blend=1.0),
+            views=[view],
+        )
+        left_patch = out_hdri[28:36, 20:28]
+        right_patch = out_hdri[28:36, 92:100]
+        # Left patch must remain blue-dominant, right patch red/warm-dominant (not mirrored!)
+        self.assertGreater(float(np.mean(left_patch[..., 2])), float(np.mean(left_patch[..., 0])) * 2.0)
+        self.assertGreater(float(np.mean(right_patch[..., 0])), float(np.mean(right_patch[..., 2])) * 2.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

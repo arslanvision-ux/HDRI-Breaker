@@ -642,18 +642,27 @@ def generate_latlong_hdri(
                     proj_rgb = np.roll(proj_rgb, shift_px, axis=1)
                     cov_w = np.roll(cov_w, shift_px, axis=1)
 
-            stitched = _mirror_extend_rows(
-                proj_rgb,
-                cov_w,
-                hdri,
-                enable_inpaint=p.enable_inpaint,
-                sky_rect=p.sky_rect,
-                ground_rect=p.ground_rect,
-                sky_blend=p.sky_blend,
-                ground_blend=p.ground_blend,
-                sky_blur=p.sky_blur,
-                ground_blur=p.ground_blur,
+            has_equirect = bool(views) and any(
+                getattr(v, "enabled", True) and (getattr(v, "lens_type", "rectilinear") == "equirectangular")
+                for v in views
             )
+            if has_equirect and float(np.min(cov_w)) >= 0.999:
+                # Already-unwrapped 360° Lat/Long input with full spherical coverage:
+                # preserve directly without mirroring or synthetic sky/ground unwrapping.
+                stitched = proj_rgb
+            else:
+                stitched = _mirror_extend_rows(
+                    proj_rgb,
+                    cov_w,
+                    hdri,
+                    enable_inpaint=p.enable_inpaint,
+                    sky_rect=p.sky_rect,
+                    ground_rect=p.ground_rect,
+                    sky_blend=p.sky_blend,
+                    ground_blend=p.ground_blend,
+                    sky_blur=p.sky_blur,
+                    ground_blur=p.ground_blur,
+                )
             # Apply Sky Gain, Ground Gain, and subtle Ambient Wrap to stitched HDRI too
             # so these sliders always have a clear, physical effect even at Plate Proj Blend = 1.0
             if abs(p.sky_gain - 1.0) > 1e-4:

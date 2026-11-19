@@ -739,6 +739,66 @@ def project_multiview_plates_to_latlong(
         k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
 
         lens = getattr(view, "lens_type", "rectilinear") or "rectilinear"
+        if lens == "equirectangular":
+            # Already-unwrapped 360° Lat/Long environment map: direct spherical
+            # sampling with full 360°x180° coverage (no pinhole crop or mirroring)
+            # and horizontal wrap-around bilinear interpolation.
+            cam_z = dx * fwd[0] + dy * fwd[1] + dz * fwd[2]
+            cam_x = dx * right[0] + dy * right[1] + dz * right[2]
+            cam_y = dx * up[0] + dy * up[1] + dz * up[2]
+
+            phi_c = np.arctan2(cam_x, cam_z)
+            theta_c = np.arcsin(np.clip(cam_y, -1.0, 1.0))
+            u_src = (phi_c / (2.0 * math.pi) + 0.5) % 1.0
+            v_src = np.clip(0.5 - theta_c / math.pi, 0.0, 1.0)
+
+            px_f = u_src * float(iw) - 0.5
+            py_f = np.clip(v_src * float(ih) - 0.5, 0.0, max(0.0, float(ih - 1)))
+            x0 = np.floor(px_f).astype(np.int32)
+            y0 = np.floor(py_f).astype(np.int32)
+            fx = (px_f - x0)[..., None].astype(np.float32)
+            fy = (py_f - y0)[..., None].astype(np.float32)
+            x0 = x0 % iw
+            x1 = (x0 + 1) % iw
+            y0 = np.clip(y0, 0, ih - 1)
+            y1 = np.minimum(y0 + 1, ih - 1)
+
+            sampled = (
+                img[y0, x0] * (1.0 - fx) * (1.0 - fy)
+                + img[y0, x1] * fx * (1.0 - fy)
+                + img[y1, x0] * (1.0 - fx) * fy
+                + img[y1, x1] * fx * fy
+            )
+
+            ev_off = float(getattr(view, "exposure_ev", 0.0))
+            if abs(ev_off) > 1e-5:
+                sampled = sampled * float(2.0 ** ev_off)
+
+            if (not view.is_hdr) and ldr_highlight_boost > 1.0:
+                lum_in = (
+                    0.2126729 * sampled[..., 0]
+                    + 0.7151522 * sampled[..., 1]
+                    + 0.0721750 * sampled[..., 2]
+                )
+                hi = np.clip((lum_in - 0.72) / 0.28, 0.0, 1.0)
+                boost = 1.0 + (float(ldr_highlight_boost) - 1.0) * np.power(hi, 1.8)
+                sampled = sampled * boost[..., None]
+
+            feather = np.ones((out_height, out_width), dtype=np.float32)
+            ex_rects = getattr(view, "exclude_rects", None)
+            if ex_rects:
+                for rx0, ry0, rx1, ry1 in ex_rects:
+                    lo_x, hi_x = min(rx0, rx1), max(rx0, rx1)
+                    lo_y, hi_y = min(ry0, ry1), max(ry0, ry1)
+                    in_ex = (u_src >= lo_x) & (u_src <= hi_x) & (v_src >= lo_y) & (v_src <= hi_y)
+                    feather = np.where(in_ex, 0.0, feather)
+
+            w_in = feather * float(max(view.weight, 0.01))
+            accum_rgb += sampled * w_in[..., None]
+            accum_w += w_in
+            max_cov = np.maximum(max_cov, feather)
+            continue
+
         # Restrict evaluation to the latitude row band covered by this view (+margin for roll/warp)
         diag_half_deg = math.degrees(math.atan(math.hypot(tan_half_fov_x, tan_half_fov_y))) * (1.25 if abs(k1) > 1e-4 else 1.0) + 12.0
         el_hi = el_deg + diag_half_deg
@@ -896,6 +956,18 @@ def equirect_rect_to_plate_rect(
 ) -> Optional[Tuple[float, float, float, float]]:
     """Map an equirectangular (u0, v0, u1, v1) selection box into normalized plate image coords."""
     u0, v0, u1, v1 = rect_uv
+    if (getattr(view, "lens_type", "rectilinear") or "rectilinear") == "equirectangular":
+        az_shift = (float(azimuth_offset_deg) - float(view.cam_azimuth_deg)) / 360.0
+        pu0 = (min(u0, u1) - az_shift) % 1.0
+        pu1 = (max(u0, u1) - az_shift) % 1.0
+        if pu1 < pu0:
+            pu0, pu1 = pu1, pu0
+        return (
+            float(np.clip(pu0, 0.0, 1.0)),
+            float(np.clip(min(v0, v1), 0.0, 1.0)),
+            float(np.clip(pu1, 0.0, 1.0)),
+            float(np.clip(max(v0, v1), 0.0, 1.0)),
+        )
     fwd, right, up, thx, thy, _ = _camera_basis(view, vertical_shift_deg=vertical_shift_deg)
     k1 = float(np.clip(view.warp_k1, -0.45, 0.45))
     pts_u, pts_v = [], []

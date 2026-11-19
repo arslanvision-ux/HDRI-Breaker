@@ -54,6 +54,7 @@ from .plate_io import (
     batch_merge_bracket_groups,
     detect_circular_fisheye,
     group_bracket_sequences,
+    is_equirectangular_image,
     linear_to_srgb,
     merge_ldr_brackets_to_hdr,
     read_plate,
@@ -1824,7 +1825,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         path_row.addWidget(batch_hdr_btn)
         form.addRow("Plate Path:", path_row)
 
-        # Colorspace & Sequence mode
+        # Colorspace, Sequence mode & Input Projection
         mode_row = QtWidgets.QHBoxLayout()
         self.colorspace_combo = QtWidgets.QComboBox()
         self.colorspace_combo.addItems(["Auto", "sRGB", "Linear Rec.709", "ACEScg"])
@@ -1834,10 +1835,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "Sequence Master (Stabilized)",
             "Per-Frame Sequence",
         ])
+        self.input_projection_combo = QtWidgets.QComboBox()
+        self.input_projection_combo.addItems([
+            "Auto (Detect 360°)",
+            "Perspective Plate",
+            "360° Equirectangular (Lat/Long)",
+        ])
+        self.input_projection_combo.setToolTip(
+            "Auto (Detect 360°): automatically preserves already-unwrapped 2:1 Lat/Long 360° images/brackets without re-projecting or mirroring.\n"
+            "Perspective Plate: unwrap a standard camera plate onto the HDRI sphere.\n"
+            "360° Equirectangular (Lat/Long): force direct 360° pass-through (no unwrapping)."
+        )
+        self.input_projection_combo.currentIndexChanged.connect(self._on_input_projection_changed)
         mode_row.addWidget(QtWidgets.QLabel("Color:"))
         mode_row.addWidget(self.colorspace_combo)
         mode_row.addWidget(QtWidgets.QLabel("Mode:"))
         mode_row.addWidget(self.seq_mode_combo)
+        mode_row.addWidget(QtWidgets.QLabel("Input:"))
+        mode_row.addWidget(self.input_projection_combo)
         form.addRow("Input Mode:", mode_row)
 
         # Frame range (shown dynamically only when Sequence mode is active)
@@ -2562,7 +2577,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.pt_ev_spin = _mk_spin(-4.0, 4.0, 0.0, 0.05, 2)
         self.pt_vig_spin = _mk_spin(-0.5, 1.5, 0.0, 0.05, 2)
         self.pt_lens_combo = QtWidgets.QComboBox()
-        self.pt_lens_combo.addItems(["rectilinear", "fisheye_equidistant", "fisheye_equisolid", "chrome_ball"])
+        self.pt_lens_combo.addItems(["rectilinear", "fisheye_equidistant", "fisheye_equisolid", "chrome_ball", "equirectangular"])
         self.pt_lens_combo.currentIndexChanged.connect(self._on_plate_spin_changed)
         self.pt_auto_vig_btn = QtWidgets.QPushButton("Auto Vig")
         self.pt_auto_vig_btn.setToolTip("Estimate radial corner vignetting for the selected plate")
@@ -4979,6 +4994,37 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             f"Restored previous state ({len(self._bake_history)} remaining in history)."
         )
 
+    def _resolve_single_plate_lens_type(self, fpath: str, width: int, height: int) -> str:
+        """Resolve lens_type for single-plate / merged-bracket input."""
+        proj_txt = (
+            self.input_projection_combo.currentText()
+            if hasattr(self, "input_projection_combo")
+            else "Auto (Detect 360°)"
+        )
+        if "Equirectangular" in proj_txt:
+            return "equirectangular"
+        if "Perspective" in proj_txt:
+            return "rectilinear"
+        if is_equirectangular_image(fpath, width, height):
+            return "equirectangular"
+        return "rectilinear"
+
+    def _on_input_projection_changed(self, *_args) -> None:
+        """Live-update single-plate views when Input Projection mode is switched."""
+        if not self._views or self.multiview_table.rowCount() > 0:
+            return
+        changed = False
+        for v in self._views:
+            ih, iw = v.pixels.shape[:2]
+            new_lens = self._resolve_single_plate_lens_type(v.source_path, iw, ih)
+            if v.lens_type != new_lens:
+                v.lens_type = new_lens
+                changed = True
+        if changed:
+            self._refresh_plate_transform_bar()
+            self._regenerate_preview()
+            self._auto_save_session()
+
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
@@ -4996,12 +5042,22 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             stem, _ = os.path.splitext(paths[0])
             merged_out = f"{stem}_merged_hdr.exr"
             written = write_exr_32f(merged_out, merged_hdr, output_colorspace="Linear Rec.709")
+            # Clear stale multi-view rows so _on_analyze_clicked loads the merged bracket EXR
+            if hasattr(self, "multiview_table") and self.multiview_table.rowCount() > 0:
+                self.multiview_table.setRowCount(0)
             self.plate_path_edit.setText(written)
             self._maybe_update_default_output_path(written)
             self._on_analyze_clicked()
-            self.status_label.setText(
-                f"Merged {len(paths)} brackets into 32-bit float HDR: {written}"
-            )
+            mh, mw = merged_hdr.shape[:2]
+            lens = self._resolve_single_plate_lens_type(written, mw, mh)
+            if lens == "equirectangular":
+                self.status_label.setText(
+                    f"Merged {len(paths)} brackets into 32-bit float 360° Equirectangular HDRI (direct Lat/Long, no unwrapping): {written}"
+                )
+            else:
+                self.status_label.setText(
+                    f"Merged {len(paths)} brackets into 32-bit float HDR: {written}"
+                )
         except Exception as exc:
             self.status_label.setText(f"Bracket merge error: {exc}")
 
@@ -5215,6 +5271,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             load_max_dim = 4096 if len(frames) <= 8 else 2048
             for fnum, fpath in frames:
                 plate = read_plate(fpath, colorspace=cs, frame=fnum, max_dim=load_max_dim)
+                ph, pw = plate.pixels.shape[:2]
+                lens_type = self._resolve_single_plate_lens_type(fpath, pw, ph)
                 view = PlateViewInput(
                     pixels=plate.pixels,
                     is_hdr=plate.is_hdr,
@@ -5222,6 +5280,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     fov_h_deg=fov,
                     cam_azimuth_deg=az,
                     cam_elevation_deg=el,
+                    lens_type=lens_type,
                 )
                 self._views.append(view)
                 prof = analyze_plate(
@@ -5247,8 +5306,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._populate_analysis_ui(self._profile, len(self._frame_profiles))
             self._regenerate_preview()
             self._auto_save_session()
+            eq_tag = (
+                " [360° Equirectangular Direct]"
+                if self._views and self._views[0].lens_type == "equirectangular"
+                else ""
+            )
             self.status_label.setText(
-                f"Analyzed {len(self._frame_profiles)} frame(s). "
+                f"Analyzed {len(self._frame_profiles)} frame(s){eq_tag}. "
                 f"Overall CCT: {self._profile.overall_cct_kelvin:.0f} K, "
                 f"Hotspots: {len(self._profile.hotspots)}."
             )
