@@ -2089,6 +2089,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.sky_fill_slider.setToolTip("Synthesize a physical Rayleigh/Mie sky gradient & HDR sun disc in uncovered upper-hemisphere gaps")
         self.highlight_recovery_slider = SliderResetControl(0.0, 10.0, 0.0, 0.25)
         self.highlight_recovery_slider.setToolTip("Reconstruct smooth physical HDR peak energy inside clipped LDR highlight cores (sun/softboxes)")
+        self.peak_white_target_spin = SliderResetControl(0.0, 100000.0, 0.0, 500.0, decimals=0)
+        self.peak_white_target_spin.setToolTip(
+            "Target linear peak value for clipped highlight cores (0 = Off; e.g. 5000 lifts bulb/floodlight cores to 5,000 while keeping midtones & shadows untouched)"
+        )
+        self.peak_white_knee_slider = SliderResetControl(0.1, 0.95, 0.5, 0.05, decimals=2)
+        self.peak_white_knee_slider.setToolTip(
+            "White Lift Knee: fraction of current peak below which pixels stay 100% untouched (higher = tightest lamp cores only)"
+        )
         self.sun_reconstruct_slider = SliderResetControl(0.0, 2.0, 0.0, 0.05, decimals=2)
         self.sun_reconstruct_slider.setToolTip("Synthesize a physically scaled limb-darkened HDR solar disk + aureole at the brightest sky peak")
         self.nadir_cleanup_slider = SliderResetControl(0.0, 1.0, 0.0, 0.02)
@@ -2119,6 +2127,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_form.addRow("Hotspot Boost:", self.hs_boost_spin)
         ev_form.addRow("Hotspot Soft:", self.hs_soft_spin)
         ev_form.addRow("Highlight Recovery:", self.highlight_recovery_slider)
+        ev_form.addRow("Peak White Target:", self.peak_white_target_spin)
+        ev_form.addRow("White Lift Knee:", self.peak_white_knee_slider)
         ev_form.addRow("Ambient Wrap:", self.wrap_spin)
         ev_form.addRow("Saturation:", self.sat_spin)
         ev_form.addRow("Target CCT (K):", self.temp_k_spin)
@@ -2188,6 +2198,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.hdri_blur_slider,
             self.sky_fill_slider,
             self.highlight_recovery_slider,
+            self.peak_white_target_spin,
+            self.peak_white_knee_slider,
             self.sun_reconstruct_slider,
             self.nadir_cleanup_slider,
         ):
@@ -3528,6 +3540,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
             physical_sky_fill=self.sky_fill_slider.value(),
             highlight_recovery=self.highlight_recovery_slider.value(),
+            peak_white_target=self.peak_white_target_spin.value(),
+            peak_white_knee=self.peak_white_knee_slider.value(),
             sun_reconstruct=self.sun_reconstruct_slider.value(),
             nadir_cleanup=self.nadir_cleanup_slider.value(),
             neutralize_environment=self.neutralize_env_chk.isChecked(),
@@ -4345,6 +4359,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             (self.hdri_blur_slider, "HDRI Blur"),
             (self.sky_fill_slider, "Physical Sky Fill"),
             (self.highlight_recovery_slider, "Highlight Recovery"),
+            (self.peak_white_target_spin, "Peak White Target"),
+            (self.peak_white_knee_slider, "White Lift Knee"),
             (self.sun_reconstruct_slider, "Sun Reconstruct"),
             (self.nadir_cleanup_slider, "Nadir Cleanup"),
             (self.temporal_stab_slider, "Temporal Smooth"),
@@ -6184,6 +6200,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "hdri_blur": self.hdri_blur_slider.value(),
             "physical_sky_fill": self.sky_fill_slider.value(),
             "highlight_recovery": self.highlight_recovery_slider.value(),
+            "peak_white_target": self.peak_white_target_spin.value(),
+            "peak_white_knee": self.peak_white_knee_slider.value(),
             "sun_reconstruct": self.sun_reconstruct_slider.value(),
             "nadir_cleanup": self.nadir_cleanup_slider.value(),
             "temporal_stabilize": self.temporal_stab_slider.value(),
@@ -6301,6 +6319,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.hdri_blur_slider.setValue(float(data.get("hdri_blur", 0.0)))
         self.sky_fill_slider.setValue(float(data.get("physical_sky_fill", 0.0)))
         self.highlight_recovery_slider.setValue(float(data.get("highlight_recovery", 0.0)))
+        self.peak_white_target_spin.setValue(float(data.get("peak_white_target", 0.0)))
+        self.peak_white_knee_slider.setValue(float(data.get("peak_white_knee", 0.5)))
         self.sun_reconstruct_slider.setValue(float(data.get("sun_reconstruct", 0.0)))
         self.nadir_cleanup_slider.setValue(float(data.get("nadir_cleanup", 0.0)))
         self.temporal_stab_slider.setValue(float(data.get("temporal_stabilize", 0.0)))

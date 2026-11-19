@@ -62,6 +62,8 @@ class HDRISynthesisParams:
     neutralize_environment: bool = False
     temporal_stabilize: float = 0.0
     sun_reconstruct: float = 0.0
+    peak_white_target: float = 0.0  # 0 = Off; >0 smoothly lifts clipped highlight cores to this linear peak (e.g. 5000)
+    peak_white_knee: float = 0.5  # [0.05, 0.95] fraction of current peak below which pixels remain untouched
 
 
 @dataclass
@@ -787,7 +789,44 @@ def generate_latlong_hdri(
     if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
         hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
 
+    if getattr(p, "peak_white_target", 0.0) > 1e-4:
+        hdri = lift_peak_whites(
+            hdri,
+            target_peak=float(p.peak_white_target),
+            knee=float(getattr(p, "peak_white_knee", 0.5)),
+        )
+
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
+
+
+def lift_peak_whites(
+    hdri_pixels: np.ndarray,
+    target_peak: float = 0.0,
+    knee: float = 0.5,
+) -> np.ndarray:
+    """
+    Smoothly lift only the brightest highlight cores (e.g. clipped practical bulbs
+    or floodlights from JPG exposure brackets) up to `target_peak` (e.g. 5000.0)
+    while leaving all pixels below `cur_peak * knee` 100% untouched and
+    preserving local highlight RGB chromaticity.
+    """
+    tgt = float(target_peak)
+    if tgt <= 1e-4:
+        return hdri_pixels
+    img = np.maximum(hdri_pixels.astype(np.float32, copy=False), 0.0)
+    max_ch = np.max(img, axis=-1)
+    cur_peak = float(np.max(max_ch))
+    if cur_peak <= 1e-5 or cur_peak >= tgt:
+        return np.ascontiguousarray(img, dtype=np.float32)
+
+    k = float(np.clip(knee, 0.05, 0.95))
+    thresh = cur_peak * k
+    span = max(cur_peak - thresh, 1e-5)
+    t = np.clip((max_ch - thresh) / span, 0.0, 1.0)
+    mask = t * t * (3.0 - 2.0 * t)
+    gain_ratio = tgt / cur_peak
+    mult = 1.0 + (gain_ratio - 1.0) * np.power(mask, 1.5)
+    return np.ascontiguousarray(img * mult[..., None], dtype=np.float32)
 
 
 def recover_clipped_highlights(
@@ -1516,6 +1555,13 @@ def apply_post_adjustments_to_hdri(
 
     if getattr(p, "sun_reconstruct", 0.0) > 1e-4:
         hdri = reconstruct_physical_sun_disk(hdri, strength=float(p.sun_reconstruct))
+
+    if getattr(p, "peak_white_target", 0.0) > 1e-4:
+        hdri = lift_peak_whites(
+            hdri,
+            target_peak=float(p.peak_white_target),
+            knee=float(getattr(p, "peak_white_knee", 0.5)),
+        )
 
     return np.ascontiguousarray(np.maximum(hdri, 0.0), dtype=np.float32)
 

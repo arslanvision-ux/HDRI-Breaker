@@ -851,6 +851,20 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertGreater(float(np.mean(left_patch[..., 2])), float(np.mean(left_patch[..., 0])) * 2.0)
         self.assertGreater(float(np.mean(right_patch[..., 0])), float(np.mean(right_patch[..., 2])) * 2.0)
 
+        # 5. Peak White Target lifts clipped highlight cores to exact target (e.g. 5000) without affecting midtones
+        from hdri_maker.hdri_generator import lift_peak_whites
+
+        night = np.full((32, 64, 3), 0.05, dtype=np.float32)
+        night[10:14, 10:14] = [0.6, 0.8, 1.0]        # mid-bright blue wall (untouched)
+        night[16:18, 30:32] = [21.0, 46.5, 41.9]     # clipped lamp core (~46.5 peak)
+        lifted = lift_peak_whites(night, target_peak=5000.0, knee=0.5)
+        self.assertAlmostEqual(float(np.max(lifted)), 5000.0, places=2)
+        # Midtones & walls below 46.5 * 0.5 = 23.25 remain 100% untouched
+        self.assertAlmostEqual(float(lifted[0, 0, 0]), 0.05, places=6)
+        self.assertAlmostEqual(float(lifted[12, 12, 2]), 1.0, places=6)
+        # Chromaticity ratio on peak pixel is preserved
+        self.assertAlmostEqual(float(lifted[16, 30, 0] / lifted[16, 30, 1]), 21.0 / 46.5, places=4)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
