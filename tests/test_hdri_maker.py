@@ -865,6 +865,97 @@ class TestHDRIMaker(unittest.TestCase):
         # Chromaticity ratio on peak pixel is preserved
         self.assertAlmostEqual(float(lifted[16, 30, 0] / lifted[16, 30, 1]), 21.0 / 46.5, places=4)
 
+    def test_pro_hdri_and_image_upgrades(self) -> None:
+        from PIL import Image
+        from hdri_maker.hdri_generator import (
+            apply_brush_dab,
+            apply_pole_rectilinear_patch,
+            compute_gray_ball_normalize_ev,
+            compute_hdri_stats,
+            extract_pole_rectilinear_patch,
+            render_preview_srgb,
+        )
+        from hdri_maker.plate_io import (
+            convert_colorspace_to_linear_rec709,
+            inspect_bracket_paths,
+            linear_to_srgb,
+            list_available_input_colorspaces,
+            merge_ldr_brackets_to_hdr,
+        )
+
+        # 1. Camera Log & OCIO input colorspaces
+        spaces = list_available_input_colorspaces()
+        for req in ("Auto", "sRGB", "ARRI LogC3", "ARRI LogC4", "Sony S-Log3", "RED Log3G10", "Canon Log 2", "ACEScct"):
+            self.assertIn(req, spaces)
+        mid_log = np.full((8, 8, 3), 0.391, dtype=np.float32)
+        for cs in ("ARRI LogC3", "ARRI LogC4", "Sony S-Log3", "RED Log3G10", "Canon Log 2", "ACEScct"):
+            lin, name = convert_colorspace_to_linear_rec709(mid_log, cs)
+            self.assertEqual(name, cs)
+            self.assertEqual(lin.shape, (8, 8, 3))
+            self.assertTrue(np.all(np.isfinite(lin)))
+
+        # 2. Pro Bracket Merge: inspect_bracket_paths + align + deghost + crf_calibrate
+        h, w = 64, 128
+        base = np.full((h, w, 3), 0.18, dtype=np.float32)
+        base[20:44, 50:78, :] = [0.6, 0.4, 0.2]
+        paths = []
+        for idx, ev in enumerate((-2.0, 0.0, 2.0)):
+            arr = base.copy()
+            if idx == 2:
+                # Inject a moving bright ghost object only in the +2 EV bracket
+                arr[8:16, 8:16, :] = [0.95, 0.95, 0.95]
+            exposed = np.clip(arr * (2.0 ** ev), 0.0, 1.0)
+            srgb_u8 = np.clip(np.round(linear_to_srgb(exposed) * 255.0), 0, 255).astype(np.uint8)
+            p = os.path.join(self.tmpdir.name, f"pro_b{idx}.jpg")
+            Image.fromarray(srgb_u8, mode="RGB").save(p, quality=98)
+            paths.append(p)
+
+        info_rows = inspect_bracket_paths(paths, colorspace="sRGB")
+        self.assertEqual(len(info_rows), 3)
+        merged_dg = merge_ldr_brackets_to_hdr(
+            paths,
+            ev_offsets=[-2.0, 0.0, 2.0],
+            colorspace="sRGB",
+            align=True,
+            deghost=True,
+            crf_calibrate=True,
+        )
+        self.assertEqual(merged_dg.shape, (h, w, 3))
+        # Deghosting should keep the ghosted patch close to base (0.18), not blown out by the moving object
+        self.assertLess(float(np.mean(merged_dg[10:14, 10:14])), 0.35)
+
+        # 3. Nuke-style Telemetry + 18% Gray Ball Normalize
+        dome = np.full((64, 128, 3), 0.25, dtype=np.float32)
+        dome[16, 64] = [5000.0, 5000.0, 5000.0]
+        stats = compute_hdri_stats(dome)
+        self.assertAlmostEqual(stats["max_lum"], 5000.0, places=1)
+        self.assertGreater(stats["dynamic_range_stops"], 10.0)
+        norm_ev = compute_gray_ball_normalize_ev(dome, target_gray=0.18)
+        norm_stats = compute_hdri_stats(dome * float(2.0 ** norm_ev))
+        self.assertAlmostEqual(norm_stats["gray_ball_lum"], 0.18, places=2)
+
+        # 4. Energy Heatmap (5k) preview: 5000+ renders crisp white
+        hm = render_preview_srgb(dome, tonemap="Energy Heatmap (5k)")
+        self.assertEqual(tuple(int(c) for c in hm[16, 64]), (255, 255, 255))
+
+        # 5. Selective Boost Light Core brush leaves dark surroundings untouched
+        canvas = np.full((64, 128, 3), 0.02, dtype=np.float32)
+        canvas[30:34, 62:66] = [5.0, 5.0, 5.0]
+        boosted = apply_brush_dab(canvas, 0.5, 0.5, mode="boost_light", radius_u=0.08, strength=1.0)
+        self.assertGreater(float(boosted[32, 64, 0]), 12.0)
+        self.assertAlmostEqual(float(boosted[32, 58, 0]), 0.02, places=3)
+
+        # 6. Nadir / Zenith rectilinear patch extraction & re-projection
+        nadir_hdri = np.full((64, 128, 3), 0.1, dtype=np.float32)
+        nadir_hdri[56:, :, :] = [0.8, 0.1, 0.1]  # red tripod at nadir
+        patch = extract_pole_rectilinear_patch(nadir_hdri, pole="nadir", patch_size=128, fov_deg=110.0)
+        self.assertEqual(patch.shape, (128, 128, 3))
+        self.assertGreater(float(patch[64, 64, 0]), 0.7)
+        cleaned_patch = np.full_like(patch, 0.25)
+        reproj = apply_pole_rectilinear_patch(nadir_hdri, cleaned_patch, pole="nadir", fov_deg=110.0)
+        self.assertAlmostEqual(float(reproj[63, 64, 0]), 0.25, places=2)
+        self.assertAlmostEqual(float(reproj[0, 64, 0]), 0.1, places=4)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

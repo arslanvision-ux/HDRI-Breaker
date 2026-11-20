@@ -932,6 +932,30 @@ def render_preview_srgb(
     img = src * float(2.0 ** preview_ev)
     tm = str(tonemap or "aces").strip().lower()
 
+    if "heat" in tm or "energy" in tm:
+        # Absolute linear HDR energy heatmap (independent of preview EV so 5k+ peaks are unmistakable)
+        peak_c = np.max(np.maximum(src, 0.0), axis=-1)
+        log_e = np.log10(np.maximum(peak_c, 1e-4))
+        # Knots: 0.001, 0.01, 0.18 (18% gray), 1.0, 10, 100, 1000, 5000+
+        knots = np.array([-3.0, -2.0, -0.745, 0.0, 1.0, 2.0, 3.0, 3.699], dtype=np.float32)
+        palette = np.array(
+            [
+                [0.03, 0.04, 0.14],  # <= 0.001: near-black navy
+                [0.07, 0.18, 0.55],  # 0.01: deep blue
+                [0.10, 0.68, 0.45],  # 0.18: green (18% gray)
+                [0.85, 0.90, 0.15],  # 1.0: yellow (diffuse white)
+                [0.98, 0.52, 0.08],  # 10: orange (bright practical)
+                [0.96, 0.14, 0.12],  # 100: red (hot lamp)
+                [0.92, 0.12, 0.85],  # 1000: magenta (super-hot)
+                [1.00, 1.00, 1.00],  # >= 5000: pure white (5k+ target zone)
+            ],
+            dtype=np.float32,
+        )
+        out_rgb = np.empty_like(src)
+        for ch in range(3):
+            out_rgb[..., ch] = np.interp(log_e, knots, palette[:, ch])
+        return np.ascontiguousarray((np.clip(out_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8))
+
     if "false" in tm:
         lum = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
         # Stops relative to 18% middle gray (0.18)
@@ -1427,6 +1451,19 @@ def apply_brush_dab(
     elif m == "dodge":
         mult = np.power(2.0, w_mask * 1.5)
         blended = patch * mult
+    elif m == "boost_light":
+        # Selective light-core boost: multiplies only bright pixels inside the brush
+        # while leaving dark surrounding background pixels untouched.
+        p_max = np.max(patch, axis=-1, keepdims=True)
+        local_hi = float(np.max(p_max))
+        if local_hi > 1e-5:
+            knee = local_hi * 0.30
+            core_t = np.clip((p_max - knee) / max(local_hi - knee, 1e-5), 0.0, 1.0)
+            core_w = core_t * core_t * (3.0 - 2.0 * core_t)
+            mult = np.power(2.0, w_mask * core_w * 2.5)
+            blended = patch * mult
+        else:
+            blended = patch
     elif m == "desat":
         lum = compute_luminance(patch)[..., None]
         blended = patch * (1.0 - w_mask) + lum * w_mask
@@ -1769,3 +1806,184 @@ def render_lookdev_sphere_preview_srgb(
         canvas[mask_g] = _sample_equirect(diff_src, nx_m, ny_m, nz_g) * 0.36
 
     return render_preview_srgb(canvas, preview_ev=exposure_ev, tonemap=tonemap)
+
+
+def compute_hdri_stats(hdri_pixels: np.ndarray) -> Dict[str, Any]:
+    """
+    Compute Nuke CurveTool-style HDRI telemetry:
+    min/mean/max RGB & luminance, dynamic range in stops, and virtual 18% gray ball luminance.
+    """
+    img = np.maximum(np.nan_to_num(hdri_pixels.astype(np.float32, copy=False), nan=0.0, posinf=65504.0, neginf=0.0), 0.0)
+    h = img.shape[0]
+    lum = compute_luminance(img)
+
+    # Solid-angle sin(theta) weights for accurate spherical average & virtual 18% gray ball
+    theta = (np.arange(h, dtype=np.float32) + 0.5) * (math.pi / float(max(h, 1)))
+    sin_w = np.sin(theta)[:, None]
+    w_sum = float(np.sum(sin_w)) * float(img.shape[1])
+    mean_lum = float(np.sum(lum * sin_w) / max(w_sum, 1e-6))
+    mean_rgb = tuple(float(np.sum(img[..., c] * sin_w) / max(w_sum, 1e-6)) for c in range(3))
+
+    # Virtual 18% diffuse gray sphere under uniform dome: L_ball ≈ 0.18 * E_avg = 0.18 * mean_lum
+    # (for Lambertian BRDF rho/pi integrated over hemisphere with radiance L, L_out = rho * L_avg)
+    gray_ball_lum = float(mean_lum * 0.18)
+
+    max_idx = int(np.argmax(lum))
+    max_y, max_x = np.unravel_index(max_idx, lum.shape)
+    max_rgb = tuple(float(v) for v in img[max_y, max_x])
+    peak_channel = float(np.max(img))
+    max_lum = float(lum[max_y, max_x])
+
+    pos = lum[lum > 1e-5]
+    p01 = float(np.percentile(pos, 1.0)) if pos.size > 0 else 1e-5
+    min_lum = float(np.min(lum))
+    dr_stops = float(np.log2(max(max_lum, 1e-5) / max(p01, 1e-5))) if max_lum > p01 else 0.0
+
+    return {
+        "min_rgb": tuple(float(np.min(img[..., c])) for c in range(3)),
+        "mean_rgb": mean_rgb,
+        "max_rgb": max_rgb,
+        "peak_channel": peak_channel,
+        "min_lum": min_lum,
+        "mean_lum": mean_lum,
+        "max_lum": max_lum,
+        "gray_ball_lum": gray_ball_lum,
+        "dynamic_range_stops": dr_stops,
+    }
+
+
+def compute_gray_ball_normalize_ev(hdri_pixels: np.ndarray, target_gray: float = 0.18) -> float:
+    """
+    Compute the EV exposure delta required so a virtual 18% diffuse gray ball
+    lit by this HDRI dome reads `target_gray` (0.18) at Dome Light Exposure = 0.
+    """
+    stats = compute_hdri_stats(hdri_pixels)
+    cur = max(float(stats["gray_ball_lum"]), 1e-5)
+    ev_delta = float(math.log2(max(float(target_gray), 1e-4) / cur))
+    return float(np.clip(ev_delta, -10.0, 10.0))
+
+
+def extract_pole_rectilinear_patch(
+    hdri_pixels: np.ndarray,
+    pole: str = "nadir",
+    patch_size: int = 512,
+    fov_deg: float = 110.0,
+) -> np.ndarray:
+    """
+    Unwrap the nadir (bottom tripod) or zenith (top sky) of a 2:1 Lat/Long HDRI
+    into a distortion-free square rectilinear gnomonic patch for clean painting/healing.
+    """
+    src = np.asarray(hdri_pixels, dtype=np.float32)
+    ih, iw = src.shape[:2]
+    n = int(max(64, patch_size))
+    half_tan = math.tan(math.radians(float(np.clip(fov_deg, 30.0, 150.0)) * 0.5))
+
+    coords = np.linspace(-half_tan, half_tan, n, dtype=np.float32)
+    gx, gy = np.meshgrid(coords, coords)
+    if str(pole).lower() == "zenith":
+        # Looking straight up (+Y): right=+X, down=+Z
+        vx, vy, vz = gx, np.ones_like(gx), gy
+    else:
+        # Looking straight down (-Y): right=+X, down=-Z
+        vx, vy, vz = gx, -np.ones_like(gx), -gy
+
+    norm = np.sqrt(vx * vx + vy * vy + vz * vz)
+    vx /= norm
+    vy /= norm
+    vz /= norm
+
+    phi = np.arctan2(vx, vz)
+    theta = np.arcsin(np.clip(vy, -1.0, 1.0))
+    u = (phi / (2.0 * math.pi) + 0.5) % 1.0
+    v = np.clip(0.5 - theta / math.pi, 0.0, 1.0)
+
+    px = u * float(iw) - 0.5
+    py = np.clip(v * float(ih) - 0.5, 0.0, max(0.0, float(ih - 1)))
+    x0 = np.floor(px).astype(np.int32)
+    y0 = np.floor(py).astype(np.int32)
+    fx = (px - x0)[..., None].astype(np.float32)
+    fy = (py - y0)[..., None].astype(np.float32)
+    x0 = x0 % iw
+    x1 = (x0 + 1) % iw
+    y0 = np.clip(y0, 0, ih - 1)
+    y1 = np.minimum(y0 + 1, ih - 1)
+
+    patch = (
+        src[y0, x0] * (1.0 - fx) * (1.0 - fy)
+        + src[y0, x1] * fx * (1.0 - fy)
+        + src[y1, x0] * (1.0 - fx) * fy
+        + src[y1, x1] * fx * fy
+    )
+    return np.ascontiguousarray(patch, dtype=np.float32)
+
+
+def apply_pole_rectilinear_patch(
+    hdri_pixels: np.ndarray,
+    patch: np.ndarray,
+    pole: str = "nadir",
+    fov_deg: float = 110.0,
+    feather: float = 0.20,
+) -> np.ndarray:
+    """
+    Re-project an edited rectilinear nadir/zenith square patch seamlessly back
+    onto a 2:1 Lat/Long HDRI with smooth radial edge feathering.
+    """
+    out = hdri_pixels.astype(np.float32, copy=True)
+    h, w = out.shape[:2]
+    ph, pw = patch.shape[:2]
+    half_tan = math.tan(math.radians(float(np.clip(fov_deg, 30.0, 150.0)) * 0.5))
+    is_zenith = str(pole).lower() == "zenith"
+
+    u = (np.arange(w, dtype=np.float32) + 0.5) / float(w)
+    v = (np.arange(h, dtype=np.float32) + 0.5) / float(h)
+    phi = (u - 0.5) * (2.0 * math.pi)
+    theta = (0.5 - v) * math.pi
+
+    cos_t = np.cos(theta)[:, None]
+    sin_t = np.sin(theta)[:, None]
+    dx = cos_t * np.sin(phi)[None, :]
+    dy = np.broadcast_to(sin_t, (h, w))
+    dz = cos_t * np.cos(phi)[None, :]
+
+    if is_zenith:
+        in_hemi = dy > 1e-4
+        safe_y = np.where(in_hemi, dy, 1.0)
+        ndc_x = (dx / safe_y) / half_tan
+        ndc_y = (dz / safe_y) / half_tan
+    else:
+        in_hemi = dy < -1e-4
+        safe_y = np.where(in_hemi, -dy, 1.0)
+        ndc_x = (dx / safe_y) / half_tan
+        ndc_y = (-dz / safe_y) / half_tan
+
+    r_rad = np.hypot(ndc_x, ndc_y)
+    inside = in_hemi & (r_rad <= 1.0) & (np.abs(ndc_x) <= 1.0) & (np.abs(ndc_y) <= 1.0)
+    iy, ix = np.where(inside)
+    if len(iy) == 0:
+        return out
+
+    nx_in = ndc_x[iy, ix]
+    ny_in = ndc_y[iy, ix]
+    r_in = r_rad[iy, ix]
+
+    f_w = max(0.05, float(feather))
+    alpha = np.clip((1.0 - r_in) / f_w, 0.0, 1.0)
+    alpha = (alpha * alpha * (3.0 - 2.0 * alpha))[:, None].astype(np.float32)
+
+    px = ((nx_in + 1.0) * 0.5) * float(pw - 1)
+    py = ((ny_in + 1.0) * 0.5) * float(ph - 1)
+    x0 = np.clip(np.floor(px).astype(np.int32), 0, pw - 1)
+    y0 = np.clip(np.floor(py).astype(np.int32), 0, ph - 1)
+    x1 = np.minimum(x0 + 1, pw - 1)
+    y1 = np.minimum(y0 + 1, ph - 1)
+    fx = (px - x0)[:, None].astype(np.float32)
+    fy = (py - y0)[:, None].astype(np.float32)
+
+    sampled = (
+        patch[y0, x0] * (1.0 - fx) * (1.0 - fy)
+        + patch[y0, x1] * fx * (1.0 - fy)
+        + patch[y1, x0] * (1.0 - fx) * fy
+        + patch[y1, x1] * fx * fy
+    )
+    out[iy, ix] = out[iy, ix] * (1.0 - alpha) + sampled * alpha
+    return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)

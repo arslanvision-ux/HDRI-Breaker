@@ -21,13 +21,17 @@ from .hdri_generator import (
     HDRISynthesisParams,
     apply_brush_dab,
     apply_brush_strokes,
+    apply_pole_rectilinear_patch,
     apply_post_adjustments_to_hdri,
     apply_sky_ground_inpaint_to_hdri,
     bake_planar_ground_texture,
+    compute_gray_ball_normalize_ev,
+    compute_hdri_stats,
     compute_neutral_wb_gains,
     export_hdri_sequence,
     extract_and_inpaint_hotspot,
     extract_and_inpaint_multiple_hotspots,
+    extract_pole_rectilinear_patch,
     generate_diffuse_irradiance_hdri,
     generate_latlong_hdri,
     render_lookdev_sphere_preview_srgb,
@@ -54,8 +58,10 @@ from .plate_io import (
     batch_merge_bracket_groups,
     detect_circular_fisheye,
     group_bracket_sequences,
+    inspect_bracket_paths,
     is_equirectangular_image,
     linear_to_srgb,
+    list_available_input_colorspaces,
     merge_ldr_brackets_to_hdr,
     read_plate,
     read_plate_metadata,
@@ -1605,6 +1611,310 @@ class DebugLogDialog(QtWidgets.QDialog):
             p._debug_lines.clear()
 
 
+class _FunctionWorker(QtCore.QThread):
+    """Background QThread worker so heavy bracket merges & 8K/16K EXR exports never freeze Houdini."""
+
+    finishedResult = Signal(object)
+    failedError = Signal(str)
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            res = self._fn(*self._args, **self._kwargs)
+            self.finishedResult.emit(res)
+        except Exception as exc:
+            self.failedError.emit(f"{exc}\n{traceback.format_exc()}")
+
+
+class BracketMergeDialog(QtWidgets.QDialog):
+    """Interactive Bracket Review Dialog: inspect EXIF, override EVs, toggle Align / Deghost / CRF."""
+
+    def __init__(self, bracket_rows: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merge Exposure Brackets — EV & Quality Review")
+        self.resize(700, 400)
+        self._rows = list(bracket_rows)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        info = QtWidgets.QLabel(
+            "Review detected EXIF / estimated EV stops (darkest to brightest). "
+            "Double-click any EV Offset cell to override manually if EXIF was stripped."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.table = QtWidgets.QTableWidget(len(self._rows), 6)
+        self.table.setHorizontalHeaderLabels(["File", "Shutter", "f-stop", "ISO", "EV Source", "EV Offset"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        for c in range(1, 6):
+            self.table.horizontalHeader().setSectionResizeMode(c, QtWidgets.QHeaderView.ResizeToContents)
+
+        for r, row in enumerate(self._rows):
+            et = row.get("exposure_time")
+            et_str = (f"1/{int(round(1.0 / et))}s" if (et and 0 < et < 0.5) else (f"{et:.2f}s" if et else "—"))
+            fn = row.get("f_number")
+            fn_str = f"f/{fn:.1f}" if fn else "—"
+            iso = row.get("iso")
+            iso_str = str(iso) if iso else "—"
+
+            for c, txt in enumerate((row["filename"], et_str, fn_str, iso_str, row["ev_source"])):
+                it = QtWidgets.QTableWidgetItem(str(txt))
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                if c > 0:
+                    it.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, c, it)
+
+            ev_it = QtWidgets.QTableWidgetItem(f"{float(row['ev_offset']):+.2f}")
+            ev_it.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(r, 5, ev_it)
+        layout.addWidget(self.table)
+
+        opt_row = QtWidgets.QHBoxLayout()
+        self.align_chk = QtWidgets.QCheckBox("Align Handheld (Anti-Shake)")
+        self.align_chk.setToolTip("Phase-correlation 2D shift alignment for handheld or slightly shifted tripod brackets")
+        self.align_chk.setChecked(False)
+        self.deghost_chk = QtWidgets.QCheckBox("Deghost Moving Objects")
+        self.deghost_chk.setToolTip("Suppress moving people, clouds, trees, or water ripples between brackets")
+        self.deghost_chk.setChecked(True)
+        self.crf_chk = QtWidgets.QCheckBox("CRF Calibration (JPG Curve)")
+        self.crf_chk.setToolTip("Calibrate camera response gamma across overlapping midtones to reduce color/contrast shifts")
+        self.crf_chk.setChecked(True)
+        opt_row.addWidget(self.align_chk)
+        opt_row.addWidget(self.deghost_chk)
+        opt_row.addWidget(self.crf_chk)
+        opt_row.addStretch(1)
+        layout.addLayout(opt_row)
+
+        step_row = QtWidgets.QHBoxLayout()
+        step_row.addWidget(QtWidgets.QLabel("Quick Uniform EV Step:"))
+        self.uniform_step_spin = QtWidgets.QDoubleSpinBox()
+        self.uniform_step_spin.setRange(0.33, 5.0)
+        self.uniform_step_spin.setSingleStep(0.5)
+        self.uniform_step_spin.setValue(2.0)
+        apply_step_btn = QtWidgets.QPushButton("Apply Uniform EVs")
+        apply_step_btn.clicked.connect(self._apply_uniform_step)
+        step_row.addWidget(self.uniform_step_spin)
+        step_row.addWidget(apply_step_btn)
+        step_row.addStretch(1)
+        layout.addLayout(step_row)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _apply_uniform_step(self) -> None:
+        step = float(self.uniform_step_spin.value())
+        n = len(self._rows)
+        mid = (n - 1) * 0.5
+        for r in range(n):
+            val = (r - mid) * step
+            it = self.table.item(r, 5)
+            if it is not None:
+                it.setText(f"{val:+.2f}")
+
+    def get_merge_config(self) -> Dict[str, Any]:
+        paths = [r["path"] for r in self._rows]
+        evs: List[float] = []
+        for r, row in enumerate(self._rows):
+            it = self.table.item(r, 5)
+            try:
+                evs.append(float(it.text()) if it is not None else float(row["ev_offset"]))
+            except ValueError:
+                evs.append(float(row["ev_offset"]))
+        return {
+            "paths": paths,
+            "ev_offsets": evs,
+            "align": self.align_chk.isChecked(),
+            "deghost": self.deghost_chk.isChecked(),
+            "crf_calibrate": self.crf_chk.isChecked(),
+        }
+
+
+class PolePatchEditorDialog(QtWidgets.QDialog):
+    """Distortion-free flat rectilinear editor for Nadir (tripod) and Zenith (sky pole) cleanup."""
+
+    def __init__(self, hdri_pixels: np.ndarray, preview_ev: float = 0.0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nadir / Zenith Flat Rectilinear Cleanup")
+        self.resize(620, 680)
+        self._source_hdri = hdri_pixels
+        self._preview_ev = float(preview_ev)
+        self._patch: Optional[np.ndarray] = None
+        self._undo_stack: List[np.ndarray] = []
+        self._painting = False
+        self._clone_src_uv: Optional[tuple] = None
+        self._clone_offset_uv: Optional[tuple] = None
+        self.result_hdri: Optional[np.ndarray] = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        self.pole_combo = QtWidgets.QComboBox()
+        self.pole_combo.addItems(["Nadir (Tripod / Ground)", "Zenith (Sky Pole)"])
+        self.pole_combo.currentIndexChanged.connect(self._extract_patch)
+        self.fov_spin = QtWidgets.QDoubleSpinBox()
+        self.fov_spin.setRange(60.0, 145.0)
+        self.fov_spin.setValue(110.0)
+        self.fov_spin.setSuffix("°")
+        self.fov_spin.valueChanged.connect(self._extract_patch)
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["Heal / Inpaint", "Clone Stamp (Ctrl+Click)", "Blur / Smooth", "Burn", "Dodge"])
+        self.size_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.size_slider.setRange(8, 120)
+        self.size_slider.setValue(35)
+        self.size_slider.setMaximumWidth(90)
+        self.ev_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.ev_slider.setRange(-40, 40)
+        self.ev_slider.setValue(int(round(np.clip(self._preview_ev * 10.0, -40, 40))))
+        self.ev_slider.setMaximumWidth(80)
+        self.ev_slider.valueChanged.connect(self._refresh_pixmap)
+
+        top.addWidget(QtWidgets.QLabel("Pole:"))
+        top.addWidget(self.pole_combo)
+        top.addWidget(QtWidgets.QLabel("FOV:"))
+        top.addWidget(self.fov_spin)
+        top.addWidget(QtWidgets.QLabel("Tool:"))
+        top.addWidget(self.mode_combo)
+        top.addWidget(QtWidgets.QLabel("Size:"))
+        top.addWidget(self.size_slider)
+        top.addWidget(QtWidgets.QLabel("EV:"))
+        top.addWidget(self.ev_slider)
+        layout.addLayout(top)
+
+        self.canvas_label = QtWidgets.QLabel()
+        self.canvas_label.setAlignment(Qt.AlignCenter)
+        self.canvas_label.setMinimumSize(512, 512)
+        self.canvas_label.setStyleSheet("background-color: #111; border: 1px solid #444;")
+        self.canvas_label.installEventFilter(self)
+        layout.addWidget(self.canvas_label, stretch=1)
+
+        bot = QtWidgets.QHBoxLayout()
+        undo_btn = QtWidgets.QPushButton("Undo")
+        undo_btn.clicked.connect(self._on_undo)
+        reset_btn = QtWidgets.QPushButton("Reset Patch")
+        reset_btn.clicked.connect(self._extract_patch)
+        apply_btn = QtWidgets.QPushButton("Apply Patch to 360° HDRI")
+        apply_btn.clicked.connect(self._on_apply)
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        bot.addWidget(undo_btn)
+        bot.addWidget(reset_btn)
+        bot.addStretch(1)
+        bot.addWidget(apply_btn)
+        bot.addWidget(cancel_btn)
+        layout.addLayout(bot)
+
+        self._extract_patch()
+
+    def _current_pole(self) -> str:
+        return "zenith" if "Zenith" in self.pole_combo.currentText() else "nadir"
+
+    def _extract_patch(self) -> None:
+        self._undo_stack.clear()
+        self._patch = extract_pole_rectilinear_patch(
+            self._source_hdri,
+            pole=self._current_pole(),
+            patch_size=512,
+            fov_deg=float(self.fov_spin.value()),
+        )
+        self._refresh_pixmap()
+
+    def _refresh_pixmap(self) -> None:
+        if self._patch is None:
+            return
+        srgb = render_preview_srgb(self._patch, preview_ev=self.ev_slider.value() / 10.0, tonemap="ACES")
+        h, w, _ = srgb.shape
+        qimg = QtGui.QImage(srgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg.copy())
+        self.canvas_label.setPixmap(pix.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _event_uv(self, ev) -> Optional[tuple]:
+        pt = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+        pm = self.canvas_label.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        ox = (self.canvas_label.width() - pm.width()) // 2
+        oy = (self.canvas_label.height() - pm.height()) // 2
+        u = (pt.x() - ox) / float(max(1, pm.width()))
+        v = (pt.y() - oy) / float(max(1, pm.height()))
+        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+            return (u, v)
+        return None
+
+    def _paint_dab(self, u: float, v: float) -> None:
+        if self._patch is None:
+            return
+        m_txt = self.mode_combo.currentText().lower()
+        mode = "heal"
+        if "clone" in m_txt:
+            mode = "clone"
+        elif "blur" in m_txt:
+            mode = "blur"
+        elif "burn" in m_txt:
+            mode = "burn"
+        elif "dodge" in m_txt:
+            mode = "dodge"
+        apply_brush_dab(
+            self._patch,
+            u,
+            v,
+            mode=mode,
+            radius_u=self.size_slider.value() / 1000.0,
+            softness=0.65,
+            strength=0.85,
+            src_offset_uv=self._clone_offset_uv if mode == "clone" else None,
+            inplace=True,
+        )
+        self._refresh_pixmap()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.canvas_label and self._patch is not None:
+            et = event.type()
+            if et == QtCore.QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                uv = self._event_uv(event)
+                if uv is not None:
+                    if event.modifiers() & Qt.ControlModifier:
+                        self._clone_src_uv = uv
+                        return True
+                    self._undo_stack.append(self._patch.copy())
+                    if len(self._undo_stack) > 15:
+                        self._undo_stack.pop(0)
+                    if self._clone_src_uv is not None:
+                        self._clone_offset_uv = (self._clone_src_uv[0] - uv[0], self._clone_src_uv[1] - uv[1])
+                    self._painting = True
+                    self._paint_dab(uv[0], uv[1])
+                    return True
+            elif et == QtCore.QEvent.MouseMove and self._painting:
+                uv = self._event_uv(event)
+                if uv is not None:
+                    self._paint_dab(uv[0], uv[1])
+                    return True
+            elif et == QtCore.QEvent.MouseButtonRelease and self._painting:
+                self._painting = False
+                return True
+        return super().eventFilter(obj, event)
+
+    def _on_undo(self) -> None:
+        if self._undo_stack:
+            self._patch = self._undo_stack.pop()
+            self._refresh_pixmap()
+
+    def _on_apply(self) -> None:
+        if self._patch is not None:
+            self.result_hdri = apply_pole_rectilinear_patch(
+                self._source_hdri,
+                self._patch,
+                pole=self._current_pole(),
+                fov_deg=float(self.fov_spin.value()),
+            )
+        self.accept()
+
+
 class HDRIMakerWidget(QtWidgets.QWidget):
     """Main HDRI Breaker widget for Houdini Solaris."""
 
@@ -1828,7 +2138,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         # Colorspace, Sequence mode & Input Projection
         mode_row = QtWidgets.QHBoxLayout()
         self.colorspace_combo = QtWidgets.QComboBox()
-        self.colorspace_combo.addItems(["Auto", "sRGB", "Linear Rec.709", "ACEScg"])
+        self.colorspace_combo.addItems(list_available_input_colorspaces())
+        self.colorspace_combo.setToolTip(
+            "Input plate color space (includes Camera Log curves & Houdini OCIO config spaces)"
+        )
         self.seq_mode_combo = QtWidgets.QComboBox()
         self.seq_mode_combo.addItems([
             "Single Frame",
@@ -2123,7 +2436,16 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_form = QtWidgets.QFormLayout(self.synth_ev_section.body)
         ev_form.setContentsMargins(4, 4, 4, 4)
         ev_form.setSpacing(4)
-        ev_form.addRow("Exposure (EV):", self.ev_spin)
+        ev_ctrl_row = QtWidgets.QHBoxLayout()
+        ev_ctrl_row.setContentsMargins(0, 0, 0, 0)
+        ev_ctrl_row.addWidget(self.ev_spin, stretch=1)
+        self.norm_gray_btn = QtWidgets.QPushButton("Norm 18%")
+        self.norm_gray_btn.setToolTip(
+            "Auto-normalize Exposure (EV) so a virtual 18% diffuse gray ball lit by this HDRI reads 0.18 at Dome Exposure 0"
+        )
+        self.norm_gray_btn.clicked.connect(self._on_normalize_18_gray)
+        ev_ctrl_row.addWidget(self.norm_gray_btn)
+        ev_form.addRow("Exposure (EV):", ev_ctrl_row)
         ev_form.addRow("Hotspot Boost:", self.hs_boost_spin)
         ev_form.addRow("Hotspot Soft:", self.hs_soft_spin)
         ev_form.addRow("Highlight Recovery:", self.highlight_recovery_slider)
@@ -2343,6 +2665,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._updating_plate_ui: bool = False
         layout.addWidget(self.preview_label, stretch=1)
 
+        self.telemetry_label = QtWidgets.QLabel(
+            "HDRI Telemetry: Peak RGB: — | Max Lum: — | Mean: — | 18% Ball: — | DR: —"
+        )
+        self.telemetry_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-weight: bold; color: #f59e0b; padding: 2px 4px;"
+        )
+        layout.addWidget(self.telemetry_label)
+
         self.inspector_label = QtWidgets.QLabel(
             "Inspector: Hover over preview to inspect Az°, El°, Linear RGB, and EV stops | Drag existing boxes to move/resize"
         )
@@ -2352,7 +2682,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ev_row = FlowLayout(margin=0, spacing=4)
         ev_row.addWidget(QtWidgets.QLabel("View:"))
         self.preview_tonemap_combo = QtWidgets.QComboBox()
-        self.preview_tonemap_combo.addItems(["ACES", "False Color (EV)", "Reinhard", "Linear", "Overlap Diff", "Lookdev Spheres"])
+        self.preview_tonemap_combo.addItems([
+            "ACES",
+            "Energy Heatmap (5k)",
+            "False Color (EV)",
+            "Reinhard",
+            "Linear",
+            "Overlap Diff",
+            "Lookdev Spheres",
+        ])
         self.preview_tonemap_combo.setToolTip(
             "Preview display transform (does not affect exported 32-bit float linear EXR)"
         )
@@ -2499,6 +2837,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.unbake_edits_btn.setToolTip("Return to live multi-plate synthesis pipeline")
         self.unbake_edits_btn.clicked.connect(self._on_unbake_edits)
 
+        self.pole_edit_btn = QtWidgets.QPushButton("Edit Nadir/Zenith...")
+        self.pole_edit_btn.setToolTip(
+            "Unwrap the bottom Nadir (tripod) or top Zenith (sky pole) to a flat distortion-free square for clean Heal/Clone painting"
+        )
+        self.pole_edit_btn.clicked.connect(self._on_open_pole_patch_editor)
+
         ctrl_row.addWidget(self.pick_sky_btn)
         ctrl_row.addWidget(self.pick_gnd_btn)
         ctrl_row.addWidget(self.pick_light_btn)
@@ -2507,6 +2851,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(self.reset_wb_btn)
         ctrl_row.addWidget(clear_area_btn)
         ctrl_row.addWidget(self.brush_btn)
+        ctrl_row.addWidget(self.pole_edit_btn)
         ctrl_row.addWidget(self.bake_edits_btn)
         ctrl_row.addWidget(self.unbake_edits_btn)
         layout.addLayout(ctrl_row)
@@ -2522,6 +2867,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "Blur / Smooth",
             "Burn (Dim HDR)",
             "Dodge (Boost HDR)",
+            "Boost Light Core",
             "Desaturate",
         ])
         self.brush_mode_combo.currentIndexChanged.connect(self._on_brush_config_changed)
@@ -2786,9 +3132,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         res_row = QtWidgets.QHBoxLayout()
         res_row.setSpacing(6)
         self.res_combo = QtWidgets.QComboBox()
-        self.res_combo.addItems(["1024 x 512", "2048 x 1024", "4096 x 2048", "8192 x 4096"])
+        self.res_combo.addItems(["1024 x 512", "2048 x 1024", "4096 x 2048", "8192 x 4096", "16384 x 8192"])
         self.res_combo.setCurrentIndex(1)
-        self.res_combo.setToolTip("Output resolution for the synthesized 32-bit float Lat/Long Dome HDRI (up to 8K)")
+        self.res_combo.setToolTip("Output resolution for the synthesized 32-bit float Lat/Long Dome HDRI (up to native 16K)")
         self.res_combo.currentIndexChanged.connect(self._schedule_preview_update)
         self.out_cs_combo = QtWidgets.QComboBox()
         self.out_cs_combo.addItems(["Linear Rec.709", "ACEScg"])
@@ -4680,6 +5026,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return "burn"
         if "dodge" in txt:
             return "dodge"
+        if "boost" in txt:
+            return "boost_light"
         if "desat" in txt:
             return "desat"
         return "heal"
@@ -5041,6 +5389,84 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._regenerate_preview()
             self._auto_save_session()
 
+    def _run_in_background(self, label: str, fn, *args, **kwargs):
+        """Run a heavy callable on a QThread with a non-freezing progress dialog."""
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return fn(*args, **kwargs)
+        prog = QtWidgets.QProgressDialog(label, None, 0, 0, self)
+        prog.setWindowTitle("HDRI Breaker — Working...")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setCancelButton(None)
+        prog.show()
+        app.processEvents()
+
+        result_box: Dict[str, Any] = {"done": False, "res": None, "err": None}
+        loop = QtCore.QEventLoop()
+        worker = _FunctionWorker(fn, *args, **kwargs)
+
+        def _on_ok(val):
+            result_box["res"] = val
+            result_box["done"] = True
+            loop.quit()
+
+        def _on_err(msg):
+            result_box["err"] = msg
+            result_box["done"] = True
+            loop.quit()
+
+        worker.finishedResult.connect(_on_ok)
+        worker.failedError.connect(_on_err)
+        worker.start()
+        loop.exec() if hasattr(loop, "exec") else loop.exec_()
+        worker.wait()
+        prog.close()
+        if result_box["err"] is not None:
+            raise RuntimeError(result_box["err"])
+        return result_box["res"]
+
+    def _on_normalize_18_gray(self) -> None:
+        if self._hdri_pixels is None:
+            self.status_label.setText("Analyze a plate first before normalizing to 18% gray.")
+            return
+        delta_ev = compute_gray_ball_normalize_ev(self._hdri_pixels, target_gray=0.18)
+        new_ev = float(np.clip(self.ev_spin.value() + delta_ev, -10.0, 10.0))
+        self._push_undo_snapshot("Normalize 18% Gray")
+        self.ev_spin.setValue(new_ev)
+        self._commit_undo_baseline()
+        self.status_label.setText(
+            f"Normalized Exposure to {new_ev:+.2f} EV (delta {delta_ev:+.2f} EV -> virtual 18% gray ball = 0.18)."
+        )
+
+    def _on_open_pole_patch_editor(self) -> None:
+        if self._hdri_pixels is None:
+            self.status_label.setText("Analyze a plate first before editing Nadir/Zenith.")
+            return
+        ev = self.preview_ev_slider.value() / 10.0
+        dlg = PolePatchEditorDialog(self._hdri_pixels, preview_ev=ev, parent=self)
+        ok = dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+        if not ok or dlg.result_hdri is None:
+            return
+        self._bake_history.append(
+            {
+                "baked_hdri": self._baked_canvas_hdri,
+                "baked_az": float(self._baked_azimuth_offset_deg),
+                "sky_rect": self._sky_rect,
+                "ground_rect": self._ground_rect,
+                "light_regions": [dict(r) for r in self._light_regions],
+                "brush_strokes": [dict(s) for s in self._brush_strokes],
+            }
+        )
+        if len(self._bake_history) > 5:
+            self._bake_history.pop(0)
+        self._baked_canvas_hdri = np.ascontiguousarray(dlg.result_hdri, dtype=np.float32)
+        self._baked_azimuth_offset_deg = float(self.yaw_spin.value())
+        self.unbake_edits_btn.setEnabled(True)
+        self.unbake_edits_btn.setText(f"Unbake ({len(self._bake_history)})")
+        self._regenerate_preview()
+        self.status_label.setText(f"Applied flat rectilinear {dlg._current_pole().title()} patch to 360° HDRI.")
+
     def _on_merge_brackets_clicked(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
@@ -5054,8 +5480,28 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return
         try:
             cs = self.colorspace_combo.currentText()
-            merged_hdr = merge_ldr_brackets_to_hdr(paths, colorspace=cs)
-            stem, _ = os.path.splitext(paths[0])
+            rows = self._run_in_background(
+                f"Inspecting EXIF & exposure order for {len(paths)} brackets...",
+                inspect_bracket_paths,
+                paths,
+                colorspace=cs,
+            )
+            dlg = BracketMergeDialog(rows, parent=self)
+            ok = dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+            if not ok:
+                return
+            cfg = dlg.get_merge_config()
+            merged_hdr = self._run_in_background(
+                f"Merging {len(cfg['paths'])} exposure brackets into 32-bit float HDR...",
+                merge_ldr_brackets_to_hdr,
+                cfg["paths"],
+                ev_offsets=cfg["ev_offsets"],
+                colorspace=cs,
+                align=cfg["align"],
+                deghost=cfg["deghost"],
+                crf_calibrate=cfg["crf_calibrate"],
+            )
+            stem, _ = os.path.splitext(cfg["paths"][0])
             merged_out = f"{stem}_merged_hdr.exr"
             written = write_exr_32f(merged_out, merged_hdr, output_colorspace="Linear Rec.709")
             # Clear stale multi-view rows so _on_analyze_clicked loads the merged bracket EXR
@@ -5068,11 +5514,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             lens = self._resolve_single_plate_lens_type(written, mw, mh)
             if lens == "equirectangular":
                 self.status_label.setText(
-                    f"Merged {len(paths)} brackets into 32-bit float 360° Equirectangular HDRI (direct Lat/Long, no unwrapping): {written}"
+                    f"Merged {len(cfg['paths'])} brackets into 32-bit float 360° Equirectangular HDRI (direct Lat/Long, no unwrapping): {written}"
                 )
             else:
                 self.status_label.setText(
-                    f"Merged {len(paths)} brackets into 32-bit float HDR: {written}"
+                    f"Merged {len(cfg['paths'])} brackets into 32-bit float HDR: {written}"
                 )
         except Exception as exc:
             self.status_label.setText(f"Bracket merge error: {exc}")
@@ -5478,6 +5924,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _update_preview_pixmap(self) -> None:
         if self._hdri_pixels is None:
             return
+        if hasattr(self, "telemetry_label"):
+            st = compute_hdri_stats(self._hdri_pixels)
+            pr, pg, pb = st["max_rgb"]
+            self.telemetry_label.setText(
+                f"HDRI Telemetry: Peak RGB ({pr:.1f}, {pg:.1f}, {pb:.1f}) | "
+                f"Max Lum: {st['max_lum']:.1f} | Mean: {st['mean_lum']:.3f} | "
+                f"18% Ball: {st['gray_ball_lum']:.3f} | DR: {st['dynamic_range_stops']:.1f} EV"
+            )
         ev = self.preview_ev_slider.value() / 10.0
         self.preview_ev_val.setText(f"{ev:+.1f} EV")
         tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
@@ -5710,11 +6164,52 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     hdri = self._render_from_baked_canvas(params, apply_regions=True)
                 else:
                     enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
-                    hdri = generate_latlong_hdri(
-                        self._profile,
-                        params,
-                        views=enabled_views if enabled_views else None,
-                    )
+                    cs_in = self.colorspace_combo.currentText()
+
+                    def _build_export_hdri():
+                        export_views = enabled_views
+                        # Native Full-Res Pass-Through: when exporting > 4K (8K/16K), reload full-res source plates
+                        if params.width > 4096 and enabled_views:
+                            reloaded = []
+                            for v in enabled_views:
+                                if v.source_path and os.path.isfile(v.source_path) and max(v.pixels.shape[0], v.pixels.shape[1]) <= 4096:
+                                    full_p = read_plate(v.source_path, colorspace=cs_in, max_dim=None)
+                                    reloaded.append(
+                                        PlateViewInput(
+                                            pixels=full_p.pixels,
+                                            is_hdr=full_p.is_hdr,
+                                            source_path=v.source_path,
+                                            fov_h_deg=v.fov_h_deg,
+                                            cam_azimuth_deg=v.cam_azimuth_deg,
+                                            cam_elevation_deg=v.cam_elevation_deg,
+                                            cam_roll_deg=v.cam_roll_deg,
+                                            scale_x=v.scale_x,
+                                            scale_y=v.scale_y,
+                                            warp_k1=v.warp_k1,
+                                            lens_type=v.lens_type,
+                                            exposure_ev=v.exposure_ev,
+                                            vignette_v1=v.vignette_v1,
+                                            weight=v.weight,
+                                            enabled=v.enabled,
+                                            exclude_rects=v.exclude_rects,
+                                        )
+                                    )
+                                else:
+                                    reloaded.append(v)
+                            export_views = reloaded
+                        return generate_latlong_hdri(
+                            self._profile,
+                            params,
+                            views=export_views if export_views else None,
+                        )
+
+                    if params.width >= 4096:
+                        hdri = self._run_in_background(
+                            f"Synthesizing full-resolution {params.width}x{params.height} 32-bit EXR...",
+                            _build_export_hdri,
+                        )
+                    else:
+                        hdri = _build_export_hdri()
                 light_msg = ""
                 self._last_light_exr_paths = []
                 if self._light_regions:

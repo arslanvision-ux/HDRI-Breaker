@@ -39,6 +39,13 @@ except ImportError:
     hou = None
     HAS_HOU = False
 
+try:
+    import PyOpenColorIO as OCIO
+    HAS_OCIO = True
+except ImportError:
+    OCIO = None
+    HAS_OCIO = False
+
 
 LDR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tga", ".tif", ".tiff"}
 HDR_EXTENSIONS = {".exr", ".hdr", ".pic", ".rat"}
@@ -536,6 +543,177 @@ def apply_color_matrix(rgb: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return np.einsum("ij,hwj->hwi", matrix, rgb).astype(np.float32)
 
 
+# Built-in pure-numpy camera log & cinema colorspace decoders (zero external deps)
+BUILTIN_INPUT_COLORSPACES: Tuple[str, ...] = (
+    "Auto",
+    "sRGB",
+    "Linear Rec.709",
+    "ACEScg",
+    "ARRI LogC3",
+    "ARRI LogC4",
+    "Sony S-Log3",
+    "RED Log3G10",
+    "Canon Log 2",
+    "ACEScct",
+)
+
+# Approximate wide-gamut -> Linear Rec.709 matrices (D65)
+MAT_AWG3_TO_REC709 = np.array(
+    [
+        [1.617523, -0.537287, -0.080237],
+        [-0.070573, 1.334613, -0.264040],
+        [-0.021102, -0.226954, 1.248056],
+    ],
+    dtype=np.float32,
+)
+MAT_AWG4_TO_REC709 = np.array(
+    [
+        [1.810412, -0.713163, -0.097249],
+        [-0.129269, 1.430117, -0.300848],
+        [0.015648, -0.273664, 1.258016],
+    ],
+    dtype=np.float32,
+)
+
+
+def list_available_input_colorspaces() -> List[str]:
+    """Return built-in input colorspaces plus any extra spaces from Houdini's active OCIO config."""
+    spaces = list(BUILTIN_INPUT_COLORSPACES)
+    if HAS_OCIO:
+        try:
+            cfg = OCIO.GetCurrentConfig()
+            for cs in cfg.getColorSpaces():
+                name = str(cs.getName())
+                if name and name not in spaces:
+                    spaces.append(f"OCIO: {name}")
+        except Exception:
+            pass
+    return spaces
+
+
+def _logc3_to_linear(x: np.ndarray) -> np.ndarray:
+    """ARRI LogC3 (EI 800) to Linear AWG3 -> Rec.709."""
+    arr = np.asarray(x, dtype=np.float32)
+    cut = 0.010591 * 5.367655 + 0.092809  # 0.1496582
+    lin = np.where(
+        arr > cut,
+        (np.power(10.0, (arr - 0.385537) / 0.247190) - 0.052272) / 5.555556,
+        (arr - 0.092809) / 5.367655,
+    )
+    return apply_color_matrix(lin.astype(np.float32), MAT_AWG3_TO_REC709)
+
+
+def _logc4_to_linear(x: np.ndarray) -> np.ndarray:
+    """ARRI LogC4 to Linear AWG4 -> Rec.709."""
+    arr = np.asarray(x, dtype=np.float32)
+    a = (2.0 ** 18 - 16.0) / 117.45
+    b = (1023.0 - 95.0) / 1023.0
+    c = 95.0 / 1023.0
+    s = (7.0 * math.log(2.0) * (2.0 ** (7.0 - 14.0 * c / b))) / (a * b)
+    t = (2.0 ** (14.0 * (-c / b) + 6.0) - 64.0) / a
+    lin = np.where(
+        arr >= 0.0,
+        (np.power(2.0, 14.0 * ((arr - c) / b) + 6.0) - 64.0) / a,
+        arr * s + t,
+    )
+    return apply_color_matrix(lin.astype(np.float32), MAT_AWG4_TO_REC709)
+
+
+def _slog3_to_linear(x: np.ndarray) -> np.ndarray:
+    """Sony S-Log3 to scene-linear."""
+    arr = np.asarray(x, dtype=np.float32)
+    cut = 171.2102946929 / 1023.0
+    lin = np.where(
+        arr >= cut,
+        np.power(10.0, (arr * 1023.0 - 420.0) / 261.5) * (0.18 + 0.01) - 0.01,
+        (arr * 1023.0 - 95.0) * 0.01125000 / (171.2102946929 - 95.0),
+    )
+    return lin.astype(np.float32)
+
+
+def _red_log3g10_to_linear(x: np.ndarray) -> np.ndarray:
+    """RED Log3G10 to scene-linear."""
+    arr = np.asarray(x, dtype=np.float32)
+    a = 0.224282
+    b = 155.975327
+    c = 0.01
+    g = 15.1927
+    lin = np.where(
+        arr < 0.0,
+        arr / g - c,
+        (np.power(10.0, arr / a) - 1.0) / b - c,
+    )
+    return lin.astype(np.float32)
+
+
+def _canon_log2_to_linear(x: np.ndarray) -> np.ndarray:
+    """Canon Log 2 to scene-linear."""
+    arr = np.asarray(x, dtype=np.float32)
+    c_off = 0.092864125
+    lin = np.where(
+        arr >= c_off,
+        (np.power(10.0, (arr - c_off) / 0.24136077) - 1.0) / 87.099375,
+        -(np.power(10.0, (c_off - arr) / 0.24136077) - 1.0) / 87.099375,
+    )
+    return lin.astype(np.float32)
+
+
+def _acescct_to_linear_rec709(x: np.ndarray) -> np.ndarray:
+    """ACEScct (AP1 log) to Linear Rec.709."""
+    arr = np.asarray(x, dtype=np.float32)
+    lin_ap1 = np.where(
+        arr <= 0.155251141552511,
+        (arr - 0.0729055341958355) / 10.5402377416545,
+        np.power(2.0, arr * 17.52 - 9.72),
+    )
+    return apply_color_matrix(lin_ap1.astype(np.float32), MAT_ACESCG_TO_REC709)
+
+
+def convert_colorspace_to_linear_rec709(pixels: np.ndarray, cs_name: str) -> Tuple[np.ndarray, str]:
+    """
+    Convert an (H, W, 3) float32 array from `cs_name` to Linear Rec.709.
+    Supports built-in camera log spaces and Houdini's active PyOpenColorIO config.
+    """
+    cs = (cs_name or "").strip()
+    if cs == "sRGB":
+        return srgb_to_linear(pixels), "sRGB"
+    if cs == "ACEScg":
+        return apply_color_matrix(pixels, MAT_ACESCG_TO_REC709), "ACEScg"
+    if cs == "ARRI LogC3":
+        return _logc3_to_linear(pixels), "ARRI LogC3"
+    if cs == "ARRI LogC4":
+        return _logc4_to_linear(pixels), "ARRI LogC4"
+    if cs == "Sony S-Log3":
+        return _slog3_to_linear(pixels), "Sony S-Log3"
+    if cs == "RED Log3G10":
+        return _red_log3g10_to_linear(pixels), "RED Log3G10"
+    if cs == "Canon Log 2":
+        return _canon_log2_to_linear(pixels), "Canon Log 2"
+    if cs == "ACEScct":
+        return _acescct_to_linear_rec709(pixels), "ACEScct"
+    if cs in ("Linear Rec.709", "Linear", "Raw"):
+        return pixels, "Linear Rec.709"
+
+    # Try PyOpenColorIO if available (handles "OCIO: <name>" or raw OCIO colorspace name)
+    ocio_name = cs[6:].strip() if cs.startswith("OCIO:") else cs
+    if HAS_OCIO and ocio_name:
+        try:
+            cfg = OCIO.GetCurrentConfig()
+            dst_name = "Linear Rec.709 (sRGB)"
+            avail = {str(c.getName()) for c in cfg.getColorSpaces()}
+            if dst_name not in avail:
+                dst_name = cfg.getCanonicalName(OCIO.ROLE_SCENE_LINEAR)
+            if ocio_name in avail and dst_name:
+                proc = cfg.getProcessor(ocio_name, dst_name)
+                cpu = proc.getDefaultCPUProcessor()
+                buf = np.ascontiguousarray(pixels, dtype=np.float32).copy()
+                cpu.applyRGB(buf)
+                return buf, ocio_name
+        except Exception:
+            pass
+    return pixels, "Linear Rec.709"
+
+
 def read_plate(
     path: str,
     colorspace: str = "Auto",
@@ -637,14 +815,8 @@ def read_plate(
             source_cs = "ACEScg"
         else:
             source_cs = "Linear Rec.709"
-    elif cs_mode == "sRGB":
-        pixels = srgb_to_linear(pixels)
-        source_cs = "sRGB"
-    elif cs_mode == "ACEScg":
-        pixels = apply_color_matrix(pixels, MAT_ACESCG_TO_REC709)
-        source_cs = "ACEScg"
     else:
-        source_cs = "Linear Rec.709"
+        pixels, source_cs = convert_colorspace_to_linear_rec709(pixels, cs_mode)
 
     # Sanitize NaNs/Infs while preserving >1.0 HDR values
     pixels = np.nan_to_num(pixels, nan=0.0, posinf=65504.0, neginf=0.0)
@@ -796,19 +968,141 @@ def is_equirectangular_image(path: str, width: int, height: int) -> bool:
     return False
 
 
+def _phase_correlate_shift(ref_gray: np.ndarray, mov_gray: np.ndarray, max_shift: int = 48) -> Tuple[int, int]:
+    """Estimate 2D integer pixel shift (dy, dx) to align `mov_gray` onto `ref_gray` via FFT phase correlation."""
+    h, w = ref_gray.shape[:2]
+    if h < 16 or w < 16:
+        return 0, 0
+    # Downsample to <= 512px for fast, noise-robust alignment
+    scale = 1
+    if max(h, w) > 512:
+        scale = max(1, max(h, w) // 512)
+        ref_s = ref_gray[::scale, ::scale]
+        mov_s = mov_gray[::scale, ::scale]
+    else:
+        ref_s = ref_gray
+        mov_s = mov_gray
+
+    # Normalize log-luminance so different exposures share identical edge structure
+    r_log = np.log1p(np.maximum(ref_s, 0.0) * 16.0)
+    m_log = np.log1p(np.maximum(mov_s, 0.0) * 16.0)
+    r_log = r_log - float(np.mean(r_log))
+    m_log = m_log - float(np.mean(m_log))
+
+    win = np.outer(np.hanning(r_log.shape[0]), np.hanning(r_log.shape[1])).astype(np.float32)
+    fr = np.fft.rfft2(r_log * win)
+    fm = np.fft.rfft2(m_log * win)
+    cross = fr * np.conj(fm)
+    mag = np.abs(cross)
+    corr = np.fft.irfft2(cross / np.maximum(mag, 1e-8), s=r_log.shape)
+
+    sh, sw = corr.shape
+    max_s = max(2, int(round(max_shift / float(scale))))
+    # Restrict search window around (0, 0) wrapped
+    iy, ix = np.unravel_index(int(np.argmax(corr)), corr.shape)
+    dy = int(iy if iy <= sh // 2 else iy - sh)
+    dx = int(ix if ix <= sw // 2 else ix - sw)
+    if abs(dy) > max_s or abs(dx) > max_s:
+        return 0, 0
+    return int(dy * scale), int(dx * scale)
+
+
+def _shift_image_clamp(img: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Shift an (H, W, 3) image by (dy, dx) pixels with edge clamping."""
+    if dy == 0 and dx == 0:
+        return img
+    h, w = img.shape[:2]
+    ys = np.clip(np.arange(h, dtype=np.int32) - dy, 0, h - 1)
+    xs = np.clip(np.arange(w, dtype=np.int32) - dx, 0, w - 1)
+    return np.ascontiguousarray(img[np.ix_(ys, xs)], dtype=np.float32)
+
+
+def inspect_bracket_paths(
+    paths: List[str],
+    colorspace: str = "Auto",
+) -> List[Dict[str, Any]]:
+    """
+    Inspect candidate bracket exposure files for the Interactive Bracket Merge Dialog.
+    Returns a list of dicts (darkest-to-brightest) with EXIF fields and estimated EV.
+    """
+    rows: List[Dict[str, Any]] = []
+    lums: List[np.ndarray] = []
+    for idx, p in enumerate(paths):
+        meta = read_plate_metadata(p)
+        frame = read_plate(p, colorspace=colorspace, max_dim=512)
+        px = frame.pixels
+        lum = (0.2126 * px[..., 0] + 0.7152 * px[..., 1] + 0.0722 * px[..., 2]).astype(np.float32)
+        lums.append(lum)
+        rows.append(
+            {
+                "orig_index": idx,
+                "path": p,
+                "filename": os.path.basename(p),
+                "exposure_time": meta.get("exposure_time"),
+                "f_number": meta.get("f_number"),
+                "iso": meta.get("iso"),
+                "ev100": meta.get("ev100"),
+                "mean_lum": float(np.mean(lum)),
+                "ev_offset": 0.0,
+                "ev_source": "Estimated",
+            }
+        )
+
+    order = np.argsort([r["mean_lum"] for r in rows])
+    rows = [rows[int(i)] for i in order]
+    lums = [lums[int(i)] for i in order]
+
+    exif_evs = [r["ev100"] for r in rows]
+    if rows and all(e is not None for e in exif_evs):
+        med_ev = float(np.median([float(e) for e in exif_evs]))
+        for r, e in zip(rows, exif_evs):
+            r["ev_offset"] = round(med_ev - float(e), 2)
+            r["ev_source"] = "EXIF"
+    elif len(rows) > 1:
+        cum_evs = [0.0]
+        for idx in range(len(lums) - 1):
+            la, lb = lums[idx], lums[idx + 1]
+            if la.shape != lb.shape:
+                y_i = np.linspace(0, lb.shape[0] - 1, la.shape[0]).astype(np.int32)
+                x_i = np.linspace(0, lb.shape[1] - 1, la.shape[1]).astype(np.int32)
+                lb = lb[np.ix_(y_i, x_i)]
+            overlap = (la > 0.015) & (la < 0.75) & (lb > 0.015) & (lb < 0.75)
+            if int(np.count_nonzero(overlap)) >= 64:
+                ratios = lb[overlap] / np.maximum(la[overlap], 1e-6)
+                delta_ev = float(np.median(np.log2(np.maximum(ratios, 1e-4))))
+                if not math.isfinite(delta_ev) or delta_ev < 0.15:
+                    delta_ev = 2.0
+                delta_ev = float(np.clip(delta_ev, 0.25, 6.0))
+            else:
+                delta_ev = 2.0
+            cum_evs.append(cum_evs[-1] + delta_ev)
+        mid_ev = cum_evs[len(cum_evs) // 2]
+        for r, e in zip(rows, cum_evs):
+            r["ev_offset"] = round(e - mid_ev, 2)
+            r["ev_source"] = "Estimated"
+    return rows
+
+
 def merge_ldr_brackets_to_hdr(
     paths: List[str],
     ev_offsets: Optional[List[float]] = None,
     colorspace: str = "Auto",
+    align: bool = False,
+    deghost: bool = False,
+    crf_calibrate: bool = False,
 ) -> np.ndarray:
     """
     Merge multiple bracketed LDR/HDR exposures of the same camera view into a
     single unclamped 32-bit float Linear Rec.709 HDR image using hat-weighted
     Debevec/Robertson irradiance weighting.
 
-    If `ev_offsets` is None, relative EV stops are read from EXIF (shutter/f-stop/ISO)
-    when available, or automatically estimated from matched overlapping midtone pixels
-    between adjacent exposures (robust for both daylight and night/low-key 360° scenes).
+    Args:
+        paths: List of bracketed exposure image paths.
+        ev_offsets: Optional explicit EV offset per path (same order as `paths`).
+        colorspace: Input colorspace ('Auto', 'sRGB', 'ARRI LogC3', etc.).
+        align: Align handheld/shifted brackets to the middle exposure via phase correlation.
+        deghost: Suppress moving objects (people, clouds, foliage, water) via irradiance consensus.
+        crf_calibrate: Estimate & refine camera response gamma from overlapping midtones.
     """
     if not paths:
         raise ValueError("At least one image path is required to merge brackets.")
@@ -838,8 +1132,24 @@ def merge_ldr_brackets_to_hdr(
     imgs = [imgs[int(i)] for i in order]
     lums = [lums[int(i)] for i in order]
 
+    # Optional handheld bracket alignment to middle reference frame
+    if align and len(imgs) >= 2:
+        ref_idx = len(imgs) // 2
+        ref_lum = lums[ref_idx]
+        for idx in range(len(imgs)):
+            if idx == ref_idx:
+                continue
+            dy, dx = _phase_correlate_shift(ref_lum, lums[idx])
+            if dy != 0 or dx != 0:
+                imgs[idx] = _shift_image_clamp(imgs[idx], dy, dx)
+                lums[idx] = (
+                    0.2126 * imgs[idx][..., 0]
+                    + 0.7152 * imgs[idx][..., 1]
+                    + 0.0722 * imgs[idx][..., 2]
+                ).astype(np.float32)
+
     if ev_offsets is not None and len(ev_offsets) == len(imgs):
-        evs = sorted(float(v) for v in ev_offsets)
+        evs = [float(ev_offsets[int(i)]) for i in order]
     else:
         exif_evs = [read_plate_metadata(paths[int(i)]).get("ev100") for i in order]
         if all(e is not None for e in exif_evs):
@@ -865,13 +1175,33 @@ def merge_ldr_brackets_to_hdr(
             mid_ev = cum_evs[len(cum_evs) // 2]
             evs = [e - mid_ev for e in cum_evs]
 
-    accum_hdr = np.zeros((target_h, target_w, 3), dtype=np.float32)
-    accum_w = np.zeros((target_h, target_w, 1), dtype=np.float32)
+    # Optional Camera Response Function (CRF) gamma refinement for LDR brackets:
+    # Fits residual power-law gamma exponent `g_corr` so log(L_b / L_a) == delta_ev * log(2)
+    if crf_calibrate and len(imgs) >= 2:
+        g_estimates = []
+        for idx in range(len(imgs) - 1):
+            dev = float(evs[idx + 1] - evs[idx])
+            if dev < 0.35:
+                continue
+            la, lb = lums[idx], lums[idx + 1]
+            overlap = (la > 0.02) & (la < 0.65) & (lb > 0.04) & (lb < 0.85)
+            if int(np.count_nonzero(overlap)) >= 128:
+                obs_ev = float(np.median(np.log2(np.maximum(lb[overlap], 1e-6) / np.maximum(la[overlap], 1e-6))))
+                if obs_ev > 0.15:
+                    g_estimates.append(dev / obs_ev)
+        if g_estimates:
+            g_corr = float(np.clip(np.median(g_estimates), 0.72, 1.38))
+            if abs(g_corr - 1.0) > 0.025:
+                imgs = [np.power(np.maximum(im, 0.0), g_corr).astype(np.float32) for im in imgs]
 
     n_exp = len(imgs)
+    scaled_imgs: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+
     for i, (img, ev) in enumerate(zip(imgs, evs)):
         # Exposure scale factor: brighter bracket (ev > 0) is divided by 2^ev
         scale = float(2.0 ** (-ev))
+        scaled_imgs.append(img * scale)
         srgb_approx = np.clip(np.power(np.clip(img, 0.0, 1.0), 1.0 / 2.2), 0.0, 1.0)
         peak_c = np.max(srgb_approx, axis=-1, keepdims=True)
         min_c = np.min(srgb_approx, axis=-1, keepdims=True)
@@ -893,8 +1223,31 @@ def merge_ldr_brackets_to_hdr(
         else:
             w *= np.clip((min_c - 0.01) / 0.08, 0.0, 1.0)
 
-        w = np.maximum(w, 1e-4)
-        accum_hdr += (img * scale) * w
+        weights.append(np.maximum(w, 1e-4).astype(np.float32))
+
+    # Optional deghosting: suppress brackets that strongly disagree with the middle reference
+    # exposure where the reference itself is well-exposed (neither clipped nor crushed).
+    if deghost and n_exp >= 3:
+        ref_idx = n_exp // 2
+        ref_rad = scaled_imgs[ref_idx]
+        ref_lum_raw = lums[ref_idx]
+        ref_valid = ((ref_lum_raw > 0.015) & (ref_lum_raw < 0.85))[..., None]
+        ref_rad_lum = (0.2126 * ref_rad[..., 0] + 0.7152 * ref_rad[..., 1] + 0.0722 * ref_rad[..., 2])[..., None]
+        for i in range(n_exp):
+            if i == ref_idx:
+                continue
+            cur_rad = scaled_imgs[i]
+            cur_rad_lum = (0.2126 * cur_rad[..., 0] + 0.7152 * cur_rad[..., 1] + 0.0722 * cur_rad[..., 2])[..., None]
+            # Log-ratio deviation in EV stops
+            ev_diff = np.abs(np.log2(np.maximum(cur_rad_lum, 1e-5) / np.maximum(ref_rad_lum, 1e-5)))
+            # Smoothly suppress weight where deviation exceeds 1.1 stops
+            ghost_suppress = np.exp(-0.5 * np.maximum(ev_diff - 0.9, 0.0) ** 2 / (0.65 ** 2)).astype(np.float32)
+            weights[i] = np.where(ref_valid, weights[i] * ghost_suppress, weights[i])
+
+    accum_hdr = np.zeros((target_h, target_w, 3), dtype=np.float32)
+    accum_w = np.zeros((target_h, target_w, 1), dtype=np.float32)
+    for sc, w in zip(scaled_imgs, weights):
+        accum_hdr += sc * w
         accum_w += w
 
     merged = accum_hdr / np.maximum(accum_w, 1e-5)

@@ -240,6 +240,42 @@ def _configure_domelight_contributions(dome, mode: str) -> None:
         _set_parm_control(dome, (ctrl,), rs_ctrl)
         _set_first_parm(dome, (parm,), val)
 
+    # Arnold (HtoA / Solaris domelight::2.0): camera, diffuse, specular, sss, volume
+    arnold_ctrl = "set" if not is_single else "none"
+    arnold_cam = 0.0 if is_diff else 1.0
+    arnold_diff = 0.0 if is_spec else 1.0
+    arnold_spec = 0.0 if is_diff else 1.0
+    arnold_vol_sss = 0.0 if is_spec else 1.0
+    for ctrl_names, parm_names, val in (
+        (
+            ("xn__primvarsarnoldcamera_control_6pb", "xn__inputsarnoldcamera_control_5hb", "arnold_camera_control"),
+            ("xn__primvarsarnoldcamera_5cb", "xn__inputsarnoldcamera_44a", "primvars:arnold:camera", "arnold:camera", "arnold_camera"),
+            arnold_cam,
+        ),
+        (
+            ("xn__primvarsarnolddiffuse_control_5qb", "xn__inputsarnolddiffuse_control_4ib"),
+            ("xn__primvarsarnolddiffuse_4db", "xn__inputsarnolddiffuse_35a", "primvars:arnold:diffuse", "arnold:diffuse"),
+            arnold_diff,
+        ),
+        (
+            ("xn__primvarsarnoldspecular_control_4rb", "xn__inputsarnoldspecular_control_3jb"),
+            ("xn__primvarsarnoldspecular_3eb", "xn__inputsarnoldspecular_26a", "primvars:arnold:specular", "arnold:specular"),
+            arnold_spec,
+        ),
+        (
+            ("xn__primvarsarnoldsss_control_wmb", "xn__inputsarnoldsss_control_veb"),
+            ("xn__primvarsarnoldsss_v9a", "xn__inputsarnoldsss_u1a", "primvars:arnold:sss", "arnold:sss"),
+            arnold_vol_sss,
+        ),
+        (
+            ("xn__primvarsarnoldvolume_control_6pb", "xn__inputsarnoldvolume_control_5hb"),
+            ("xn__primvarsarnoldvolume_5cb", "xn__inputsarnoldvolume_44a", "primvars:arnold:volume", "arnold:volume"),
+            arnold_vol_sss,
+        ),
+    ):
+        _set_parm_control(dome, ctrl_names, arnold_ctrl)
+        _set_first_parm(dome, parm_names, val)
+
 
 def _populate_domelight_node(
     stage,
