@@ -3830,7 +3830,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             target_fov = float(ref_item.text()) if ref_item is not None else self.fov_spin.value()
         except ValueError:
             target_fov = self.fov_spin.value()
-        target_fov = float(np.clip(target_fov, 10.0, 165.0))
+        target_fov = float(np.clip(target_fov, 10.0, 220.0))
         for r in range(n_rows):
             fov_item = self.multiview_table.item(r, 3)
             if fov_item is not None:

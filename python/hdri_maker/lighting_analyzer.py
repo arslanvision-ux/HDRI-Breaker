@@ -1182,13 +1182,14 @@ def auto_align_adjacent_plates(
                 best_score = score
                 best_roll = cand.cam_roll_deg
 
+        max_fov = 220.0 if getattr(curr, "lens_type", "rectilinear") in ("fisheye_equidistant", "fisheye_equisolid") else 165.0
         for d_fov in (-4.0, -2.0, 0.0, 2.0, 4.0):
             cand = replace(
                 curr,
                 cam_azimuth_deg=best_az,
                 cam_elevation_deg=best_el,
                 cam_roll_deg=best_roll,
-                fov_h_deg=float(np.clip(curr.fov_h_deg + d_fov, 10.0, 165.0)),
+                fov_h_deg=float(np.clip(curr.fov_h_deg + d_fov, 10.0, max_fov)),
             )
             score = _ncc_score(prev_lum, prev_cov, cand)
             if score > best_score:
