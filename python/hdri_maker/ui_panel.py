@@ -5543,12 +5543,23 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("Analyze a plate first before normalizing to 18% gray.")
             return
         delta_ev = compute_gray_ball_normalize_ev(self._hdri_pixels, target_gray=0.18)
+        if abs(delta_ev) < 0.02:
+            self.status_label.setText(
+                f"Exposure is already normalized to 18% gray ({self.ev_spin.value():+.2f} EV)."
+            )
+            return
         new_ev = float(np.clip(self.ev_spin.value() + delta_ev, -10.0, 10.0))
         self._push_undo_snapshot("Normalize 18% Gray")
-        self.ev_spin.setValue(new_ev)
+        self._suppress_auto_preview = True
+        try:
+            self.ev_spin.setValue(new_ev)
+        finally:
+            self._suppress_auto_preview = False
+        # Regenerate synchronously so repeated clicks are strictly idempotent (delta_ev == 0)
+        self._regenerate_preview()
         self._commit_undo_baseline()
         self.status_label.setText(
-            f"Normalized Exposure to {new_ev:+.2f} EV (delta {delta_ev:+.2f} EV -> virtual 18% gray ball = 0.18)."
+            f"Normalized Exposure to {new_ev:+.2f} EV (delta {delta_ev:+.2f} EV -> diffuse 18% gray ball = 0.18)."
         )
 
     def _on_open_pole_patch_editor(self) -> None:

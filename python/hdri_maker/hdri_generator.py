@@ -1856,9 +1856,24 @@ def compute_gray_ball_normalize_ev(hdri_pixels: np.ndarray, target_gray: float =
     """
     Compute the EV exposure delta required so a virtual 18% diffuse gray ball
     lit by this HDRI dome reads `target_gray` (0.18) at Dome Light Exposure = 0.
+
+    Clamps extreme specular spikes above the 98.5th luminance percentile so tiny
+    5,000+ bulb/sun cores (or a pinned Peak White Target) do not crush the
+    diffuse midtone exposure or cause incremental drift on repeated clicks.
     """
-    stats = compute_hdri_stats(hdri_pixels)
-    cur = max(float(stats["gray_ball_lum"]), 1e-5)
+    img = np.maximum(
+        np.nan_to_num(hdri_pixels.astype(np.float32, copy=False), nan=0.0, posinf=65504.0, neginf=0.0),
+        0.0,
+    )
+    h = img.shape[0]
+    lum = compute_luminance(img)
+    p_cap = float(np.percentile(lum, 98.5))
+    lum_diffuse = np.minimum(lum, max(p_cap, 1e-5))
+    theta = (np.arange(h, dtype=np.float32) + 0.5) * (math.pi / float(max(h, 1)))
+    sin_w = np.sin(theta)[:, None]
+    w_sum = float(np.sum(sin_w)) * float(img.shape[1])
+    diffuse_mean = float(np.sum(lum_diffuse * sin_w) / max(w_sum, 1e-6))
+    cur = max(diffuse_mean * 0.18, 1e-5)
     ev_delta = float(math.log2(max(float(target_gray), 1e-4) / cur))
     return float(np.clip(ev_delta, -10.0, 10.0))
 

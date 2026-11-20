@@ -936,8 +936,10 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertAlmostEqual(stats["max_lum"], 5000.0, places=1)
         self.assertGreater(stats["dynamic_range_stops"], 10.0)
         norm_ev = compute_gray_ball_normalize_ev(dome, target_gray=0.18)
-        norm_stats = compute_hdri_stats(dome * float(2.0 ** norm_ev))
-        self.assertAlmostEqual(norm_stats["gray_ball_lum"], 0.18, places=2)
+        self.assertAlmostEqual(norm_ev, 2.0, places=2)
+        # Strictly idempotent on repeated calls even with 5000.0 specular spikes
+        norm_ev_2 = compute_gray_ball_normalize_ev(dome * float(2.0 ** norm_ev), target_gray=0.18)
+        self.assertAlmostEqual(norm_ev_2, 0.0, places=3)
 
         # 4. Energy Heatmap (5k) preview: 5000+ renders crisp white
         hm = render_preview_srgb(dome, tonemap="Energy Heatmap (5k)")
