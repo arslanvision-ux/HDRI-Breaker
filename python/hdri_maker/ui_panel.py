@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import math
 import os
 import traceback
 from typing import Any, Dict, List, Optional
@@ -1742,18 +1743,18 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
     def __init__(self, hdri_pixels: np.ndarray, preview_ev: float = 0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nadir / Zenith Flat Rectilinear Cleanup")
-        self.resize(620, 680)
+        self.resize(740, 780)
         self._source_hdri = hdri_pixels
         self._preview_ev = float(preview_ev)
         self._patch: Optional[np.ndarray] = None
         self._undo_stack: List[np.ndarray] = []
-        self._painting = False
         self._clone_src_uv: Optional[tuple] = None
         self._clone_offset_uv: Optional[tuple] = None
+        self._last_dab_uv: Optional[tuple] = None
         self.result_hdri: Optional[np.ndarray] = None
 
         layout = QtWidgets.QVBoxLayout(self)
-        top = QtWidgets.QHBoxLayout()
+        top1 = QtWidgets.QHBoxLayout()
         self.pole_combo = QtWidgets.QComboBox()
         self.pole_combo.addItems(["Nadir (Tripod / Ground)", "Zenith (Sky Pole)"])
         self.pole_combo.currentIndexChanged.connect(self._extract_patch)
@@ -1762,60 +1763,147 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
         self.fov_spin.setValue(110.0)
         self.fov_spin.setSuffix("°")
         self.fov_spin.valueChanged.connect(self._extract_patch)
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["Heal / Inpaint", "Clone Stamp (Ctrl+Click)", "Blur / Smooth", "Burn", "Dodge"])
-        self.size_slider = QtWidgets.QSlider(Qt.Horizontal)
-        self.size_slider.setRange(8, 120)
-        self.size_slider.setValue(35)
-        self.size_slider.setMaximumWidth(90)
         self.ev_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.ev_slider.setRange(-40, 40)
         self.ev_slider.setValue(int(round(np.clip(self._preview_ev * 10.0, -40, 40))))
-        self.ev_slider.setMaximumWidth(80)
+        self.ev_slider.setMaximumWidth(100)
         self.ev_slider.valueChanged.connect(self._refresh_pixmap)
+        self.ev_val_lbl = QtWidgets.QLabel(f"{self.ev_slider.value() / 10.0:+.1f} EV")
 
-        top.addWidget(QtWidgets.QLabel("Pole:"))
-        top.addWidget(self.pole_combo)
-        top.addWidget(QtWidgets.QLabel("FOV:"))
-        top.addWidget(self.fov_spin)
-        top.addWidget(QtWidgets.QLabel("Tool:"))
-        top.addWidget(self.mode_combo)
-        top.addWidget(QtWidgets.QLabel("Size:"))
-        top.addWidget(self.size_slider)
-        top.addWidget(QtWidgets.QLabel("EV:"))
-        top.addWidget(self.ev_slider)
-        layout.addLayout(top)
+        top1.addWidget(QtWidgets.QLabel("Pole:"))
+        top1.addWidget(self.pole_combo)
+        top1.addWidget(QtWidgets.QLabel("FOV:"))
+        top1.addWidget(self.fov_spin)
+        top1.addStretch(1)
+        top1.addWidget(QtWidgets.QLabel("Preview EV:"))
+        top1.addWidget(self.ev_slider)
+        top1.addWidget(self.ev_val_lbl)
+        layout.addLayout(top1)
 
-        self.canvas_label = QtWidgets.QLabel()
-        self.canvas_label.setAlignment(Qt.AlignCenter)
-        self.canvas_label.setMinimumSize(512, 512)
-        self.canvas_label.setStyleSheet("background-color: #111; border: 1px solid #444;")
-        self.canvas_label.installEventFilter(self)
+        # Identical brush controls to the main 360° viewer
+        top2 = QtWidgets.QHBoxLayout()
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems([
+            "Heal / Inpaint",
+            "Clone Stamp",
+            "Blur / Smooth",
+            "Burn (Dim HDR)",
+            "Dodge (Boost HDR)",
+            "Boost Light Core",
+            "Desaturate",
+        ])
+        self.mode_combo.currentIndexChanged.connect(self._sync_brush_state)
+        self.size_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.size_slider.setRange(5, 120)
+        self.size_slider.setValue(35)
+        self.size_slider.setMaximumWidth(90)
+        self.size_slider.valueChanged.connect(self._sync_brush_state)
+        self.strength_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.strength_slider.setRange(10, 100)
+        self.strength_slider.setValue(85)
+        self.strength_slider.setMaximumWidth(80)
+        self.strength_slider.valueChanged.connect(self._sync_brush_state)
+        self.soft_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.soft_slider.setRange(10, 100)
+        self.soft_slider.setValue(65)
+        self.soft_slider.setMaximumWidth(80)
+        self.soft_slider.valueChanged.connect(self._sync_brush_state)
+
+        top2.addWidget(QtWidgets.QLabel("Mode:"))
+        top2.addWidget(self.mode_combo)
+        top2.addWidget(QtWidgets.QLabel("Size ([/]):"))
+        top2.addWidget(self.size_slider)
+        top2.addWidget(QtWidgets.QLabel("Strength:"))
+        top2.addWidget(self.strength_slider)
+        top2.addWidget(QtWidgets.QLabel("Soft:"))
+        top2.addWidget(self.soft_slider)
+        top2.addStretch(1)
+        layout.addLayout(top2)
+
+        # Reuse PreviewLabel for full circular brush cursor, clone crosshair, zoom/pan, and Shift-drag HUD
+        self.canvas_label = PreviewLabel()
+        self.canvas_label.setMinimumSize(560, 560)
+        self.canvas_label.brushCloneSourcePicked.connect(self._on_clone_source_picked)
+        self.canvas_label.brushStrokeStarted.connect(self._on_brush_stroke_started)
+        self.canvas_label.brushStrokeMoved.connect(self._on_brush_stroke_moved)
+        self.canvas_label.brushStrokeFinished.connect(self._on_brush_stroke_finished)
+        self.canvas_label.brushParamAdjusted.connect(self._on_brush_param_adjusted)
         layout.addWidget(self.canvas_label, stretch=1)
 
+        self.hint_label = QtWidgets.QLabel(
+            "Brush: Drag to paint in 32-bit float | Clone Stamp: Ctrl+Click to set source | "
+            "[/] Size | Wheel Zoom | Middle/Right Drag Pan | F: Fit | Ctrl+Z: Undo"
+        )
+        self.hint_label.setStyleSheet("color: #9ca3af; font-size: 11px;")
+        layout.addWidget(self.hint_label)
+
         bot = QtWidgets.QHBoxLayout()
-        undo_btn = QtWidgets.QPushButton("Undo")
+        undo_btn = QtWidgets.QPushButton("Undo (Ctrl+Z)")
         undo_btn.clicked.connect(self._on_undo)
         reset_btn = QtWidgets.QPushButton("Reset Patch")
         reset_btn.clicked.connect(self._extract_patch)
+        fit_btn = QtWidgets.QPushButton("Fit (F)")
+        fit_btn.clicked.connect(self.canvas_label.reset_zoom)
         apply_btn = QtWidgets.QPushButton("Apply Patch to 360° HDRI")
         apply_btn.clicked.connect(self._on_apply)
         cancel_btn = QtWidgets.QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         bot.addWidget(undo_btn)
         bot.addWidget(reset_btn)
+        bot.addWidget(fit_btn)
         bot.addStretch(1)
         bot.addWidget(apply_btn)
         bot.addWidget(cancel_btn)
         layout.addLayout(bot)
 
+        QShortcutCls = getattr(QtGui, "QShortcut", None) or getattr(QtWidgets, "QShortcut", None)
+        if QShortcutCls is not None:
+            self._shortcuts = [
+                QShortcutCls(QtGui.QKeySequence.Undo, self),
+                QShortcutCls(QtGui.QKeySequence("F"), self),
+                QShortcutCls(QtGui.QKeySequence("["), self),
+                QShortcutCls(QtGui.QKeySequence("]"), self),
+            ]
+            self._shortcuts[0].activated.connect(self._on_undo)
+            self._shortcuts[1].activated.connect(self.canvas_label.reset_zoom)
+            self._shortcuts[2].activated.connect(lambda: self.size_slider.setValue(max(5, self.size_slider.value() - 5)))
+            self._shortcuts[3].activated.connect(lambda: self.size_slider.setValue(min(120, self.size_slider.value() + 5)))
+
         self._extract_patch()
+        self._sync_brush_state()
 
     def _current_pole(self) -> str:
         return "zenith" if "Zenith" in self.pole_combo.currentText() else "nadir"
 
+    def _current_brush_mode(self) -> str:
+        txt = self.mode_combo.currentText().lower()
+        if "clone" in txt:
+            return "clone"
+        if "blur" in txt:
+            return "blur"
+        if "burn" in txt:
+            return "burn"
+        if "dodge" in txt:
+            return "dodge"
+        if "boost" in txt:
+            return "boost_light"
+        if "desat" in txt:
+            return "desat"
+        return "heal"
+
+    def _sync_brush_state(self, *_args) -> None:
+        self.canvas_label.set_brush_state(
+            enabled=True,
+            mode=self._current_brush_mode(),
+            radius_u=self.size_slider.value() / 1000.0,
+            softness=self.soft_slider.value() / 100.0,
+            clone_src_uv=self._clone_src_uv,
+        )
+
     def _extract_patch(self) -> None:
         self._undo_stack.clear()
+        self._clone_src_uv = None
+        self._clone_offset_uv = None
         self._patch = extract_pole_rectilinear_patch(
             self._source_hdri,
             pole=self._current_pole(),
@@ -1823,81 +1911,99 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
             fov_deg=float(self.fov_spin.value()),
         )
         self._refresh_pixmap()
+        self.canvas_label.reset_zoom()
+        self._sync_brush_state()
 
     def _refresh_pixmap(self) -> None:
         if self._patch is None:
             return
-        srgb = render_preview_srgb(self._patch, preview_ev=self.ev_slider.value() / 10.0, tonemap="ACES")
+        ev = self.ev_slider.value() / 10.0
+        self.ev_val_lbl.setText(f"{ev:+.1f} EV")
+        srgb = render_preview_srgb(self._patch, preview_ev=ev, tonemap="ACES")
         h, w, _ = srgb.shape
         qimg = QtGui.QImage(srgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg.copy())
-        self.canvas_label.setPixmap(pix.scaled(512, 512, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.canvas_label.set_source_pixmap(QtGui.QPixmap.fromImage(qimg.copy()))
 
-    def _event_uv(self, ev) -> Optional[tuple]:
-        pt = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
-        pm = self.canvas_label.pixmap()
-        if pm is None or pm.isNull():
-            return None
-        ox = (self.canvas_label.width() - pm.width()) // 2
-        oy = (self.canvas_label.height() - pm.height()) // 2
-        u = (pt.x() - ox) / float(max(1, pm.width()))
-        v = (pt.y() - oy) / float(max(1, pm.height()))
-        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
-            return (u, v)
-        return None
+    def _on_clone_source_picked(self, u: float, v: float) -> None:
+        self._clone_src_uv = (float(u), float(v))
+        self._sync_brush_state()
+
+    def _on_brush_param_adjusted(self, param: str, dx: float) -> None:
+        step = int(round(dx * 0.5))
+        if step == 0 and abs(dx) > 0.2:
+            step = 1 if dx > 0 else -1
+        hud = ""
+        if param == "size":
+            val = int(np.clip(self.size_slider.value() + step, self.size_slider.minimum(), self.size_slider.maximum()))
+            self.size_slider.setValue(val)
+            hud = f"Size: {val / 10.0:.1f}%"
+        elif param == "strength":
+            val = int(np.clip(self.strength_slider.value() + step, self.strength_slider.minimum(), self.strength_slider.maximum()))
+            self.strength_slider.setValue(val)
+            hud = f"Strength: {val}%"
+        elif param == "soft":
+            val = int(np.clip(self.soft_slider.value() + step, self.soft_slider.minimum(), self.soft_slider.maximum()))
+            self.soft_slider.setValue(val)
+            hud = f"Softness: {val}%"
+        if hud:
+            self.canvas_label.set_brush_hud_text(hud)
 
     def _paint_dab(self, u: float, v: float) -> None:
         if self._patch is None:
             return
-        m_txt = self.mode_combo.currentText().lower()
-        mode = "heal"
-        if "clone" in m_txt:
-            mode = "clone"
-        elif "blur" in m_txt:
-            mode = "blur"
-        elif "burn" in m_txt:
-            mode = "burn"
-        elif "dodge" in m_txt:
-            mode = "dodge"
+        mode = self._current_brush_mode()
         apply_brush_dab(
             self._patch,
             u,
             v,
             mode=mode,
             radius_u=self.size_slider.value() / 1000.0,
-            softness=0.65,
-            strength=0.85,
+            softness=self.soft_slider.value() / 100.0,
+            strength=self.strength_slider.value() / 100.0,
             src_offset_uv=self._clone_offset_uv if mode == "clone" else None,
             inplace=True,
         )
+
+    def _on_brush_stroke_started(self, u: float, v: float) -> None:
+        if self._patch is None:
+            return
+        mode = self._current_brush_mode()
+        if mode == "clone" and self._clone_src_uv is None:
+            self.hint_label.setText("Clone Stamp: Ctrl+Click on the patch first to set a Clone Source!")
+            return
+        self._undo_stack.append(self._patch.copy())
+        if len(self._undo_stack) > 20:
+            self._undo_stack.pop(0)
+        if mode == "clone" and self._clone_src_uv is not None:
+            self._clone_offset_uv = (self._clone_src_uv[0] - float(u), self._clone_src_uv[1] - float(v))
+        else:
+            self._clone_offset_uv = None
+        self._last_dab_uv = (float(u), float(v))
+        self._paint_dab(float(u), float(v))
         self._refresh_pixmap()
 
-    def eventFilter(self, obj, event) -> bool:
-        if obj is self.canvas_label and self._patch is not None:
-            et = event.type()
-            if et == QtCore.QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                uv = self._event_uv(event)
-                if uv is not None:
-                    if event.modifiers() & Qt.ControlModifier:
-                        self._clone_src_uv = uv
-                        return True
-                    self._undo_stack.append(self._patch.copy())
-                    if len(self._undo_stack) > 15:
-                        self._undo_stack.pop(0)
-                    if self._clone_src_uv is not None:
-                        self._clone_offset_uv = (self._clone_src_uv[0] - uv[0], self._clone_src_uv[1] - uv[1])
-                    self._painting = True
-                    self._paint_dab(uv[0], uv[1])
-                    return True
-            elif et == QtCore.QEvent.MouseMove and self._painting:
-                uv = self._event_uv(event)
-                if uv is not None:
-                    self._paint_dab(uv[0], uv[1])
-                    return True
-            elif et == QtCore.QEvent.MouseButtonRelease and self._painting:
-                self._painting = False
-                return True
-        return super().eventFilter(obj, event)
+    def _on_brush_stroke_moved(self, u: float, v: float) -> None:
+        if self._patch is None:
+            return
+        if self._current_brush_mode() == "clone" and self._clone_offset_uv is None:
+            return
+        # Interpolate dabs smoothly along fast drags
+        if self._last_dab_uv is not None:
+            du = float(u) - self._last_dab_uv[0]
+            dv = float(v) - self._last_dab_uv[1]
+            dist = math.hypot(du, dv)
+            step = max(0.004, (self.size_slider.value() / 1000.0) * 0.35)
+            n_steps = max(1, min(24, int(math.ceil(dist / step))))
+            for s in range(1, n_steps + 1):
+                t = s / float(n_steps)
+                self._paint_dab(self._last_dab_uv[0] + du * t, self._last_dab_uv[1] + dv * t)
+        else:
+            self._paint_dab(float(u), float(v))
+        self._last_dab_uv = (float(u), float(v))
+        self._refresh_pixmap()
+
+    def _on_brush_stroke_finished(self) -> None:
+        self._last_dab_uv = None
 
     def _on_undo(self) -> None:
         if self._undo_stack:
