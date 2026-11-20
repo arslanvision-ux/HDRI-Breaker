@@ -3241,9 +3241,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             az = ((start_idx + i) * (360.0 / max(total, 1)))
             if az > 180.0:
                 az -= 360.0
-            plate_fov = float(meta["fov_h_deg"]) if meta.get("fov_h_deg") is not None else batch_fallback_fov
+            is_fisheye = detect_circular_fisheye(p)
+            lens_t = "fisheye_equidistant" if is_fisheye else "rectilinear"
+            plate_fov = (
+                180.0
+                if is_fisheye
+                else (float(meta["fov_h_deg"]) if meta.get("fov_h_deg") is not None else batch_fallback_fov)
+            )
             plate_roll = float(meta.get("roll_deg", 0.0))
-            self._add_multiview_row(p, az, el, plate_fov, cs, roll=plate_roll)
+            self._add_multiview_row(p, az, el, plate_fov, cs, roll=plate_roll, lens_type=lens_t)
         self._maybe_update_default_output_path(paths[0])
         self.status_label.setText(f"Added {len(paths)} plate(s) to Multi-Position list.")
 
