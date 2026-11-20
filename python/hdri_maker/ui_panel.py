@@ -5510,16 +5510,17 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.plate_path_edit.setText(written)
             self._maybe_update_default_output_path(written)
             self._on_analyze_clicked()
-            mh, mw = merged_hdr.shape[:2]
-            lens = self._resolve_single_plate_lens_type(written, mw, mh)
-            if lens == "equirectangular":
-                self.status_label.setText(
-                    f"Merged {len(cfg['paths'])} brackets into 32-bit float 360° Equirectangular HDRI (direct Lat/Long, no unwrapping): {written}"
-                )
-            else:
-                self.status_label.setText(
-                    f"Merged {len(cfg['paths'])} brackets into 32-bit float HDR: {written}"
-                )
+            if self._hdri_pixels is not None:
+                mh, mw = merged_hdr.shape[:2]
+                lens = self._resolve_single_plate_lens_type(written, mw, mh)
+                if lens == "equirectangular":
+                    self.status_label.setText(
+                        f"Merged {len(cfg['paths'])} brackets into 32-bit float 360° Equirectangular HDRI (direct Lat/Long, no unwrapping): {written}"
+                    )
+                else:
+                    self.status_label.setText(
+                        f"Merged {len(cfg['paths'])} brackets into 32-bit float HDR: {written}"
+                    )
         except Exception as exc:
             self.status_label.setText(f"Bracket merge error: {exc}")
 

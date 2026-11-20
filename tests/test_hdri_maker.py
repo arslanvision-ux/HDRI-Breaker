@@ -800,9 +800,14 @@ class TestHDRIMaker(unittest.TestCase):
             merge_ldr_brackets_to_hdr,
         )
 
-        # 1. Aspect-ratio detection for 2:1 360° Lat/Long vs 16:9 plate
+        # 1. Aspect-ratio & OIIO metadata detection for 2:1 360° Lat/Long vs non-2:1 plate on disk
         self.assertTrue(is_equirectangular_image("", 2048, 1024))
         self.assertFalse(is_equirectangular_image("", 1920, 1080))
+        from PIL import Image as _PILImage
+
+        non_eq_path = os.path.join(self.tmpdir.name, "non_eq_plate.jpg")
+        _PILImage.fromarray(np.full((48, 64, 3), 128, dtype=np.uint8), mode="RGB").save(non_eq_path)
+        self.assertFalse(is_equirectangular_image(non_eq_path, 64, 48))
 
         # 2. Build a synthetic night/HDR 2:1 360° scene with distinct left/right/top/bottom colors
         h, w = 64, 128

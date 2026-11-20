@@ -952,7 +952,7 @@ def is_equirectangular_image(path: str, width: int, height: int) -> bool:
         aspect = float(width) / float(height)
         if 1.95 <= aspect <= 2.05:
             return True
-    if path and os.path.isfile(path) and _HAS_OIIO:
+    if path and os.path.isfile(path) and HAS_OIIO:
         try:
             inp = oiio.ImageInput.open(path)
             if inp is not None:
