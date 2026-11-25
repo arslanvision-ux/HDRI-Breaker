@@ -1158,6 +1158,80 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertIsNotNone(w2._hdri_pixels)
         w2.close()
 
+    def test_polygon_mask_grade_blur_feather_and_json(self):
+        import json
+        from hdri_maker.hdri_generator import apply_polygon_masks, rasterize_polygon_mask
+        from hdri_maker.plate_io import write_exr_32f
+        from hdri_maker.qt_compat import QtWidgets
+        from hdri_maker.ui_panel import HDRIMakerWidget
+
+        # 1. Pure-numpy polygon mask rasterizer + desaturate + feather + blur + exposure
+        img = np.zeros((64, 128, 3), dtype=np.float32)
+        img[:, :, 0] = 2.0  # saturated HDR red everywhere
+        img[:, :, 1] = 0.2
+        img[:, :, 2] = 0.2
+        pts = [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]
+
+        m_sharp = rasterize_polygon_mask(64, 128, pts, feather=0.0, invert=False)
+        self.assertAlmostEqual(float(m_sharp[32, 64, 0]), 1.0, places=4)
+        self.assertAlmostEqual(float(m_sharp[4, 4, 0]), 0.0, places=4)
+
+        m_feath = rasterize_polygon_mask(64, 128, pts, feather=0.5, invert=False)
+        self.assertGreater(float(m_feath[16, 64, 0]), 0.1)
+        self.assertLess(float(m_feath[16, 64, 0]), 0.95)
+
+        desat = apply_polygon_masks(
+            img,
+            [{"points": pts, "saturation": 0.0, "feather": 0.0, "blur": 0.0, "exposure_ev": 0.0}],
+        )
+        # Inside polygon: R == G == B (desaturated)
+        self.assertAlmostEqual(float(desat[32, 64, 0]), float(desat[32, 64, 1]), places=4)
+        # Outside polygon: untouched
+        self.assertAlmostEqual(float(desat[4, 4, 0]), 2.0, places=4)
+
+        # Blur test on an impulse inside the polygon
+        imp = np.full((64, 128, 3), 0.1, dtype=np.float32)
+        imp[32, 64, :] = 10.0
+        blurred = apply_polygon_masks(
+            imp,
+            [{"points": pts, "blur": 0.4, "feather": 0.0}],
+        )
+        self.assertLess(float(blurred[32, 64, 0]), 5.0)
+        self.assertGreater(float(blurred[32, 66, 0]), 0.12)
+
+        # 2. UI dynamic toolbar + JSON roundtrip
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication([])
+
+        plate_path = os.path.join(self.tmpdir.name, "poly_plate.exr")
+        write_exr_32f(plate_path, _make_synthetic_plate(128, 256))
+
+        w1 = HDRIMakerWidget(restore_session=False)
+        w1.plate_path_edit.setText(plate_path)
+        w1._on_analyze_clicked()
+        w1.poly_mask_btn.setChecked(True)
+        self.assertFalse(w1.poly_toolbar_widget.isHidden())
+        w1._on_poly_mask_finished(pts)
+        w1._on_desaturate_poly_mask()
+        w1.poly_ev_spin.setValue(-1.0)
+        w1.poly_feather_spin.setValue(0.25)
+        w1.poly_blur_spin.setValue(0.30)
+        w1._on_poly_param_changed()
+
+        state = json.loads(json.dumps(w1.get_state_dict()))
+        w1.close()
+
+        w2 = HDRIMakerWidget(restore_session=False)
+        w2.apply_state_dict(state, auto_analyze=True)
+        self.assertEqual(len(w2._poly_masks), 1)
+        self.assertAlmostEqual(float(w2._poly_masks[0]["saturation"]), 0.0, places=3)
+        self.assertAlmostEqual(float(w2._poly_masks[0]["exposure_ev"]), -1.0, places=3)
+        self.assertAlmostEqual(float(w2._poly_masks[0]["feather"]), 0.25, places=3)
+        self.assertAlmostEqual(float(w2._poly_masks[0]["blur"]), 0.30, places=3)
+        self.assertEqual(len(w2.preview_label._poly_masks), 1)
+        w2.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

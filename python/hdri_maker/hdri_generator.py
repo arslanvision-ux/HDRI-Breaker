@@ -2007,3 +2007,132 @@ def apply_pole_rectilinear_patch(
     )
     out[iy, ix] = out[iy, ix] * (1.0 - alpha) + sampled * alpha
     return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)
+
+
+def rasterize_polygon_mask(
+    height: int,
+    width: int,
+    points_uv: List[Tuple[float, float]],
+    feather: float = 0.0,
+    invert: bool = False,
+) -> np.ndarray:
+    """Rasterize a normalized UV polygon into a feathered (H, W, 1) float32 mask in [0, 1]."""
+    h = max(1, int(height))
+    w = max(1, int(width))
+    if not points_uv or len(points_uv) < 3:
+        return np.zeros((h, w, 1), dtype=np.float32)
+
+    pts = [(float(p[0]) * float(w), float(p[1]) * float(h)) for p in points_uv]
+    xs_p = [p[0] for p in pts]
+    ys_p = [p[1] for p in pts]
+    f_val = float(np.clip(feather, 0.0, 1.0))
+    r_px = max(1, int(round(f_val * 0.06 * min(w, h)))) if f_val > 1e-4 else 0
+
+    x0 = max(0, int(math.floor(min(xs_p))) - r_px - 2)
+    x1 = min(w, int(math.ceil(max(xs_p))) + r_px + 2)
+    y0 = max(0, int(math.floor(min(ys_p))) - r_px - 2)
+    y1 = min(h, int(math.ceil(max(ys_p))) + r_px + 2)
+
+    mask = np.zeros((h, w, 1), dtype=np.float32)
+    if x1 > x0 and y1 > y0:
+        gx = (np.arange(x0, x1, dtype=np.float32) + 0.5)[None, :]
+        gy = (np.arange(y0, y1, dtype=np.float32) + 0.5)[:, None]
+        inside = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        n = len(pts)
+        for i in range(n):
+            xi, yi = pts[i]
+            xj, yj = pts[(i + 1) % n]
+            dy = yj - yi
+            if abs(dy) < 1e-9:
+                continue
+            cond = ((yi > gy) != (yj > gy)) & (gx < ((xj - xi) * (gy - yi) / dy + xi))
+            inside ^= cond
+        mask[y0:y1, x0:x1, 0] = inside.astype(np.float32)
+
+    if r_px > 0:
+        mask = _separable_box_blur(mask, r_px, r_px, wrap_x=True)
+        mask = np.clip(mask, 0.0, 1.0)
+
+    if invert:
+        mask = 1.0 - mask
+    return np.ascontiguousarray(mask, dtype=np.float32)
+
+
+def apply_polygon_masks(
+    hdri_pixels: np.ndarray,
+    masks: List[Dict[str, Any]],
+) -> np.ndarray:
+    """Apply 32-bit float polygon-masked grading (Exposure, RGB Gain, Temp, Gamma, Saturation, Blur)."""
+    if hdri_pixels is None or not masks:
+        return hdri_pixels
+
+    out = hdri_pixels.astype(np.float32, copy=True)
+    h, w = out.shape[:2]
+
+    for m in masks:
+        if not isinstance(m, dict) or not m.get("enabled", True):
+            continue
+        pts = m.get("points") or []
+        if len(pts) < 3:
+            continue
+
+        blur_amt = float(np.clip(m.get("blur", 0.0), 0.0, 1.0))
+        ev = float(np.clip(m.get("exposure_ev", 0.0), -10.0, 10.0))
+        gain_r = float(np.clip(m.get("gain_r", 1.0), 0.0, 10.0))
+        gain_g = float(np.clip(m.get("gain_g", 1.0), 0.0, 10.0))
+        gain_b = float(np.clip(m.get("gain_b", 1.0), 0.0, 10.0))
+        temp_shift = float(np.clip(m.get("temp_shift", 0.0), -1.0, 1.0))
+        gamma = float(np.clip(m.get("gamma", 1.0), 0.05, 5.0))
+        sat = float(np.clip(m.get("saturation", 1.0), 0.0, 4.0))
+        feather = float(np.clip(m.get("feather", 0.15), 0.0, 1.0))
+        invert = bool(m.get("invert", False))
+
+        is_noop = (
+            blur_amt <= 1e-4
+            and abs(ev) <= 1e-4
+            and abs(gain_r - 1.0) <= 1e-4
+            and abs(gain_g - 1.0) <= 1e-4
+            and abs(gain_b - 1.0) <= 1e-4
+            and abs(temp_shift) <= 1e-4
+            and abs(gamma - 1.0) <= 1e-4
+            and abs(sat - 1.0) <= 1e-4
+        )
+        if is_noop:
+            continue
+
+        alpha = rasterize_polygon_mask(h, w, pts, feather=feather, invert=invert)
+        if float(np.max(alpha)) <= 1e-5:
+            continue
+
+        graded = out
+        if blur_amt > 1e-4:
+            rx = max(1, int(round(blur_amt * (w / 32.0))))
+            ry = max(1, int(round(blur_amt * (h / 32.0))))
+            graded = _separable_box_blur(graded, rx, ry, wrap_x=True)
+
+        scale_ev = float(2.0 ** ev) if abs(ev) > 1e-4 else 1.0
+        t_r = 1.0 + 0.35 * temp_shift
+        t_b = 1.0 - 0.35 * temp_shift
+        rgb_mult = np.array(
+            [gain_r * t_r * scale_ev, gain_g * scale_ev, gain_b * t_b * scale_ev],
+            dtype=np.float32,
+        )[None, None, :]
+        if blur_amt <= 1e-4:
+            graded = out * rgb_mult
+        else:
+            graded = graded * rgb_mult
+
+        if abs(gamma - 1.0) > 1e-4:
+            graded = np.power(np.maximum(graded, 0.0), np.float32(1.0 / max(gamma, 0.05)))
+
+        if abs(sat - 1.0) > 1e-4:
+            lum = (
+                0.2126 * graded[:, :, 0:1]
+                + 0.7152 * graded[:, :, 1:2]
+                + 0.0722 * graded[:, :, 2:3]
+            )
+            graded = np.maximum(lum + (graded - lum) * np.float32(sat), 0.0)
+
+        out = out * (1.0 - alpha) + graded * alpha
+
+    return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)

@@ -23,6 +23,7 @@ from .hdri_generator import (
     apply_brush_dab,
     apply_brush_strokes,
     apply_pole_rectilinear_patch,
+    apply_polygon_masks,
     apply_post_adjustments_to_hdri,
     apply_sky_ground_inpaint_to_hdri,
     bake_planar_ground_texture,
@@ -445,6 +446,8 @@ class PreviewLabel(QtWidgets.QLabel):
     brushStrokeFinished = Signal()
     brushCloneSourcePicked = Signal(float, float)
     brushParamAdjusted = Signal(str, float)
+    polyMaskFinished = Signal(list)
+    polyMaskSelected = Signal(int)
     filesDropped = Signal(list)
 
     def __init__(self, text: str = "", parent=None):
@@ -498,7 +501,52 @@ class PreviewLabel(QtWidgets.QLabel):
         self._brush_adjust_last_x: float = 0.0
         self._brush_adjust_moved: bool = False
         self._brush_hud_text: str = ""
+        # Interactive Polygon Mask state
+        self._poly_mode: bool = False
+        self._poly_masks: List[Dict[str, Any]] = []
+        self._selected_poly_idx: int = -1
+        self._active_poly_pts: List[Tuple[float, float]] = []
+        self._poly_hover_uv: Optional[Tuple[float, float]] = None
         self._cached_plate_outlines: Dict[int, tuple] = {}
+
+    def set_poly_mode(self, enabled: bool) -> None:
+        self._poly_mode = bool(enabled)
+        if not self._poly_mode:
+            self._active_poly_pts = []
+            self._poly_hover_uv = None
+        if self._poly_mode:
+            self.setCursor(Qt.CrossCursor)
+        elif not self._brush_enabled and self._pick_mode is None:
+            self.setCursor(Qt.OpenHandCursor if self._plate_edit_mode else Qt.ArrowCursor)
+        self.update()
+
+    def set_poly_masks(self, masks: list, selected_idx: int = -1) -> None:
+        self._poly_masks = list(masks or [])
+        self._selected_poly_idx = int(selected_idx)
+        self.update()
+
+    @staticmethod
+    def _point_in_poly_uv(u: float, v: float, pts: list) -> bool:
+        if len(pts) < 3:
+            return False
+        inside = False
+        n = len(pts)
+        for i in range(n):
+            xi, yi = float(pts[i][0]), float(pts[i][1])
+            xj, yj = float(pts[(i + 1) % n][0]), float(pts[(i + 1) % n][1])
+            dy = yj - yi
+            if abs(dy) < 1e-12:
+                continue
+            if ((yi > v) != (yj > v)) and (u < (xj - xi) * (v - yi) / dy + xi):
+                inside = not inside
+        return inside
+
+    def _hit_test_poly_mask(self, u: float, v: float) -> int:
+        for idx in range(len(self._poly_masks) - 1, -1, -1):
+            pts = self._poly_masks[idx].get("points") or []
+            if self._point_in_poly_uv(u, v, pts):
+                return idx
+        return -1
 
     def set_brush_state(
         self,
@@ -744,6 +792,14 @@ class PreviewLabel(QtWidgets.QLabel):
         super().wheelEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
+        if self._poly_mode and event.button() == Qt.LeftButton:
+            if len(self._active_poly_pts) >= 3:
+                pts = [[float(p[0]), float(p[1])] for p in self._active_poly_pts]
+                self._active_poly_pts = []
+                self.polyMaskFinished.emit(pts)
+                self.update()
+            event.accept()
+            return
         if self._pick_mode is None and event.button() == Qt.LeftButton and self._zoom > 1.001:
             self.reset_zoom()
             event.accept()
@@ -784,6 +840,47 @@ class PreviewLabel(QtWidgets.QLabel):
                 event.accept()
                 return
             if event.button() == Qt.RightButton and self._plate_edit_mode and self._pick_mode is None and not self._brush_enabled:
+                event.accept()
+                return
+        if self._poly_mode and not is_alt:
+            uv_p = self._pos_to_uv(pos)
+            if event.button() == Qt.RightButton:
+                if len(self._active_poly_pts) >= 3:
+                    pts = [[float(p[0]), float(p[1])] for p in self._active_poly_pts]
+                    self._active_poly_pts = []
+                    self.polyMaskFinished.emit(pts)
+                    self.update()
+                    event.accept()
+                    return
+                elif self._active_poly_pts:
+                    self._active_poly_pts = []
+                    self.update()
+                    event.accept()
+                    return
+            elif event.button() == Qt.LeftButton and uv_p is not None:
+                cu = float(np.clip(uv_p[0], 0.0, 1.0))
+                cv = float(np.clip(uv_p[1], 0.0, 1.0))
+                if not self._active_poly_pts:
+                    hit_poly = self._hit_test_poly_mask(cu, cv)
+                    if hit_poly >= 0:
+                        self._selected_poly_idx = hit_poly
+                        self.polyMaskSelected.emit(hit_poly)
+                        self.update()
+                        event.accept()
+                        return
+                elif len(self._active_poly_pts) >= 3:
+                    prect = self._pixmap_rect()
+                    sx = prect.x() + self._active_poly_pts[0][0] * prect.width()
+                    sy = prect.y() + self._active_poly_pts[0][1] * prect.height()
+                    if math.hypot(pos.x() - sx, pos.y() - sy) <= 10.0:
+                        pts = [[float(p[0]), float(p[1])] for p in self._active_poly_pts]
+                        self._active_poly_pts = []
+                        self.polyMaskFinished.emit(pts)
+                        self.update()
+                        event.accept()
+                        return
+                self._active_poly_pts.append((cu, cv))
+                self.update()
                 event.accept()
                 return
         if self._pick_mode and event.button() == Qt.LeftButton:
@@ -886,6 +983,9 @@ class PreviewLabel(QtWidgets.QLabel):
         uv = self._pos_to_uv(pos)
         if uv is not None and 0.0 <= uv[0] <= 1.0 and 0.0 <= uv[1] <= 1.0:
             self.pixelHovered.emit(float(uv[0]), float(uv[1]))
+            if self._poly_mode:
+                self._poly_hover_uv = (float(uv[0]), float(uv[1]))
+                self.update()
             if self._brush_enabled:
                 self._brush_hover_uv = (float(uv[0]), float(uv[1]))
                 if self._brush_painting:
@@ -1181,8 +1281,64 @@ class PreviewLabel(QtWidgets.QLabel):
                     if self._brush_adjust_mode is not None and self._brush_hud_text:
                         painter.setPen(QtGui.QPen(QtGui.QColor(255, 230, 100), 1))
                         painter.drawText(int(bx + rx + 8), int(by + 4), self._brush_hud_text)
+            if self._poly_masks or (self._poly_mode and self._active_poly_pts):
+                painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                for idx, pm in enumerate(self._poly_masks):
+                    pts_uv = pm.get("points") or []
+                    if len(pts_uv) < 3:
+                        continue
+                    is_sel = idx == self._selected_poly_idx
+                    poly_q = QtGui.QPolygonF(
+                        [
+                            QtCore.QPointF(target.x() + float(p[0]) * target.width(), target.y() + float(p[1]) * target.height())
+                            for p in pts_uv
+                        ]
+                    )
+                    col = QtGui.QColor(250, 204, 21) if is_sel else QtGui.QColor(232, 121, 249)
+                    painter.setPen(QtGui.QPen(col, 2.0 if is_sel else 1.4, Qt.SolidLine if is_sel else Qt.DashLine))
+                    painter.setBrush(QtGui.QColor(col.red(), col.green(), col.blue(), 28 if is_sel else 14))
+                    painter.drawPolygon(poly_q)
+                    painter.setBrush(Qt.NoBrush)
+                    if is_sel or self._poly_mode:
+                        painter.setBrush(col)
+                        for p in pts_uv:
+                            px_pt = QtCore.QPointF(target.x() + float(p[0]) * target.width(), target.y() + float(p[1]) * target.height())
+                            painter.drawEllipse(px_pt, 3.0 if is_sel else 2.2, 3.0 if is_sel else 2.2)
+                        painter.setBrush(Qt.NoBrush)
+                    p0 = pts_uv[0]
+                    painter.setPen(col)
+                    painter.drawText(
+                        int(target.x() + float(p0[0]) * target.width()) + 4,
+                        int(target.y() + float(p0[1]) * target.height()) - 4,
+                        f"Mask #{idx + 1}",
+                    )
+                if self._poly_mode and self._active_poly_pts:
+                    act_pts = [
+                        QtCore.QPointF(target.x() + float(p[0]) * target.width(), target.y() + float(p[1]) * target.height())
+                        for p in self._active_poly_pts
+                    ]
+                    if self._poly_hover_uv is not None:
+                        act_pts.append(
+                            QtCore.QPointF(
+                                target.x() + self._poly_hover_uv[0] * target.width(),
+                                target.y() + self._poly_hover_uv[1] * target.height(),
+                            )
+                        )
+                    painter.setPen(QtGui.QPen(QtGui.QColor(56, 189, 248), 2.0, Qt.SolidLine))
+                    painter.drawPolyline(QtGui.QPolygonF(act_pts))
+                    painter.setBrush(QtGui.QColor(56, 189, 248))
+                    for i, pt in enumerate(act_pts[: len(self._active_poly_pts)]):
+                        rad = 5.0 if (i == 0 and len(self._active_poly_pts) >= 3) else 3.0
+                        painter.drawEllipse(pt, rad, rad)
+                    painter.setBrush(Qt.NoBrush)
             # On-canvas active mode banner / shortcut hint pill
-            if self._brush_enabled:
+            if self._poly_mode:
+                hud_msg = (
+                    "Polygon Mask (M)  |  Click: Add Point  |  Double-Click / Click Start: Close  "
+                    "|  Right-Click: Finish/Cancel"
+                )
+                hud_accent = QtGui.QColor(232, 121, 249)
+            elif self._brush_enabled:
                 hud_msg = (
                     f"Brush ({self._brush_mode})  |  Drag: Paint  |  Ctrl+Click: Clone Src  "
                     "|  [ / ]: Size  |  Ctrl+Z: Undo"
@@ -2044,6 +2200,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._extracted_lights: List[tuple] = []
         self._baked_extracted_lights: List[tuple] = []
         self._brush_strokes: List[Dict[str, Any]] = []
+        self._poly_masks: List[Dict[str, Any]] = []
+        self._selected_poly_idx: int = -1
+        self._updating_poly_ui: bool = False
         self._brush_undo_stack: List[np.ndarray] = []
         self._pre_brush_hdri: Optional[np.ndarray] = None
         self._baked_canvas_hdri: Optional[np.ndarray] = None
@@ -2927,6 +3086,18 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         )
         self.brush_btn.toggled.connect(self._on_toggle_brush_mode)
 
+        self.poly_mask_btn = QtWidgets.QPushButton("Polygon Mask (M)")
+        self.poly_mask_btn.setCheckable(True)
+        self.poly_mask_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #7e22ce; color: #ffffff; font-weight: bold; }"
+        )
+        self.poly_mask_btn.setToolTip(
+            "Draw a polygon mask on the HDRI canvas (Shortcut: M) to Grade, Desaturate, Feather & Blur a region:\n"
+            "• Click to add vertices, Double-Click (or click start point) to close\n"
+            "• Click an existing polygon to select and tweak its live Exposure, Saturation, Gamma, Temp, RGB, Feather & Blur"
+        )
+        self.poly_mask_btn.toggled.connect(self._on_toggle_poly_mode)
+
         self.bake_edits_btn = QtWidgets.QPushButton("Apply / Collapse")
         self.bake_edits_btn.setCheckable(False)
         self.bake_edits_btn.setAutoDefault(False)
@@ -2959,6 +3130,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         ctrl_row.addWidget(self.reset_wb_btn)
         ctrl_row.addWidget(clear_area_btn)
         ctrl_row.addWidget(self.brush_btn)
+        ctrl_row.addWidget(self.poly_mask_btn)
         ctrl_row.addWidget(self.pole_edit_btn)
         ctrl_row.addWidget(self.bake_edits_btn)
         ctrl_row.addWidget(self.unbake_edits_btn)
@@ -3008,11 +3180,80 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         brush_row.addWidget(clear_brush_btn)
         layout.addWidget(self.brush_toolbar_widget)
 
+        # Contextual Polygon Mask Grading Toolbar (shown when Polygon Mask is active or selected)
+        self.poly_toolbar_widget = QtWidgets.QWidget()
+        self.poly_toolbar_widget.setVisible(False)
+        poly_row = FlowLayout(self.poly_toolbar_widget, margin=2, spacing=6)
+
+        self.poly_sel_combo = QtWidgets.QComboBox()
+        self.poly_sel_combo.setMinimumWidth(95)
+        self.poly_sel_combo.currentIndexChanged.connect(self._on_poly_combo_changed)
+        poly_del_btn = QtWidgets.QPushButton("Delete")
+        poly_del_btn.clicked.connect(self._on_delete_poly_mask)
+        poly_clear_btn = QtWidgets.QPushButton("Clear All")
+        poly_clear_btn.clicked.connect(self._on_clear_poly_masks)
+        poly_desat_btn = QtWidgets.QPushButton("Desaturate")
+        poly_desat_btn.setToolTip("Set Saturation = 0.0 for the selected polygon mask")
+        poly_desat_btn.clicked.connect(self._on_desaturate_poly_mask)
+        poly_reset_btn = QtWidgets.QPushButton("Reset Grade")
+        poly_reset_btn.clicked.connect(self._on_reset_poly_grade)
+        self.poly_invert_chk = QtWidgets.QCheckBox("Invert")
+        self.poly_invert_chk.toggled.connect(self._on_poly_param_changed)
+
+        def _mk_poly_spin(lo: float, hi: float, val: float, step: float, dec: int = 2) -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setValue(val)
+            sb.setSingleStep(step)
+            sb.setDecimals(dec)
+            sb.setMaximumWidth(64)
+            sb.valueChanged.connect(self._on_poly_param_changed)
+            return sb
+
+        self.poly_ev_spin = _mk_poly_spin(-6.0, 6.0, 0.0, 0.1)
+        self.poly_sat_spin = _mk_poly_spin(0.0, 2.5, 1.0, 0.05)
+        self.poly_gamma_spin = _mk_poly_spin(0.2, 3.0, 1.0, 0.05)
+        self.poly_temp_spin = _mk_poly_spin(-1.0, 1.0, 0.0, 0.05)
+        self.poly_r_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
+        self.poly_g_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
+        self.poly_b_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
+        self.poly_feather_spin = _mk_poly_spin(0.0, 1.0, 0.15, 0.02)
+        self.poly_blur_spin = _mk_poly_spin(0.0, 1.0, 0.0, 0.02)
+
+        poly_row.addWidget(QtWidgets.QLabel("Mask:"))
+        poly_row.addWidget(self.poly_sel_combo)
+        poly_row.addWidget(poly_del_btn)
+        poly_row.addWidget(poly_clear_btn)
+        poly_row.addWidget(poly_desat_btn)
+        poly_row.addWidget(poly_reset_btn)
+        poly_row.addWidget(self.poly_invert_chk)
+        poly_row.addWidget(QtWidgets.QLabel("EV:"))
+        poly_row.addWidget(self.poly_ev_spin)
+        poly_row.addWidget(QtWidgets.QLabel("Sat:"))
+        poly_row.addWidget(self.poly_sat_spin)
+        poly_row.addWidget(QtWidgets.QLabel("Gamma:"))
+        poly_row.addWidget(self.poly_gamma_spin)
+        poly_row.addWidget(QtWidgets.QLabel("Temp:"))
+        poly_row.addWidget(self.poly_temp_spin)
+        poly_row.addWidget(QtWidgets.QLabel("R:"))
+        poly_row.addWidget(self.poly_r_spin)
+        poly_row.addWidget(QtWidgets.QLabel("G:"))
+        poly_row.addWidget(self.poly_g_spin)
+        poly_row.addWidget(QtWidgets.QLabel("B:"))
+        poly_row.addWidget(self.poly_b_spin)
+        poly_row.addWidget(QtWidgets.QLabel("Feather:"))
+        poly_row.addWidget(self.poly_feather_spin)
+        poly_row.addWidget(QtWidgets.QLabel("Blur:"))
+        poly_row.addWidget(self.poly_blur_spin)
+        layout.addWidget(self.poly_toolbar_widget)
+
         self.preview_label.brushCloneSourcePicked.connect(self._on_brush_clone_src_picked)
         self.preview_label.brushStrokeStarted.connect(self._on_brush_stroke_started)
         self.preview_label.brushStrokeMoved.connect(self._on_brush_stroke_moved)
         self.preview_label.brushStrokeFinished.connect(self._on_brush_stroke_finished)
         self.preview_label.brushParamAdjusted.connect(self._on_brush_param_adjusted)
+        self.preview_label.polyMaskFinished.connect(self._on_poly_mask_finished)
+        self.preview_label.polyMaskSelected.connect(self._on_poly_mask_selected)
         self.preview_label.filesDropped.connect(self._on_preview_files_dropped)
 
         self.plate_transform_bar = QtWidgets.QWidget()
@@ -4028,6 +4269,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self.edit_plates_btn.setChecked(False)
             if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
                 self.brush_btn.setChecked(False)
+            if hasattr(self, "poly_mask_btn") and self.poly_mask_btn.isChecked():
+                self.poly_mask_btn.setChecked(False)
             if mode != "sky":
                 self.pick_sky_btn.setChecked(False)
             if mode != "ground":
@@ -4063,6 +4306,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self.pick_wb_btn.setChecked(False)
             if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
                 self.brush_btn.setChecked(False)
+            if hasattr(self, "poly_mask_btn") and self.poly_mask_btn.isChecked():
+                self.poly_mask_btn.setChecked(False)
             if hasattr(self, "pt_mask_btn"):
                 self.pt_mask_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
@@ -4410,6 +4655,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self.pick_wb_btn.setChecked(False)
             if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
                 self.brush_btn.setChecked(False)
+            if hasattr(self, "poly_mask_btn") and self.poly_mask_btn.isChecked():
+                self.poly_mask_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
             self._apply_neutral_wb_patch(rect)
             return
@@ -4743,6 +4990,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         _bind("[", lambda: self._nudge_brush_size(-5))
         _bind("]", lambda: self._nudge_brush_size(5))
         _bind("B", lambda: self.brush_btn.toggle())
+        _bind("M", lambda: self.poly_mask_btn.toggle())
         _bind("E", lambda: self.edit_plates_btn.toggle())
         _bind("Ctrl+Return", self._on_bake_edits_to_canvas)
         _bind("Ctrl+Enter", self._on_bake_edits_to_canvas)
@@ -5149,12 +5397,151 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             return "desat"
         return "heal"
 
+    def _on_toggle_poly_mode(self, checked: bool) -> None:
+        if checked:
+            for btn in (self.pick_sky_btn, self.pick_gnd_btn, self.pick_light_btn):
+                btn.setChecked(False)
+            if hasattr(self, "pick_wb_btn"):
+                self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "brush_btn") and self.brush_btn.isChecked():
+                self.brush_btn.setChecked(False)
+            if hasattr(self, "edit_plates_btn") and self.edit_plates_btn.isChecked():
+                self.edit_plates_btn.setChecked(False)
+            self.preview_label.set_pick_mode(None)
+            self.status_label.setText(
+                "Polygon Mask: Click to add points, Double-Click (or click start point) to close; click existing mask to select."
+            )
+        self.preview_label.set_poly_mode(checked)
+        self._refresh_poly_mask_ui()
+
+    def _on_poly_mask_finished(self, pts: list) -> None:
+        if len(pts) < 3:
+            return
+        new_mask = {
+            "points": [[float(p[0]), float(p[1])] for p in pts],
+            "enabled": True,
+            "invert": self.poly_invert_chk.isChecked(),
+            "feather": float(self.poly_feather_spin.value()),
+            "blur": float(self.poly_blur_spin.value()),
+            "exposure_ev": float(self.poly_ev_spin.value()),
+            "saturation": float(self.poly_sat_spin.value()),
+            "gamma": float(self.poly_gamma_spin.value()),
+            "temp_shift": float(self.poly_temp_spin.value()),
+            "gain_r": float(self.poly_r_spin.value()),
+            "gain_g": float(self.poly_g_spin.value()),
+            "gain_b": float(self.poly_b_spin.value()),
+        }
+        self._poly_masks.append(new_mask)
+        self._selected_poly_idx = len(self._poly_masks) - 1
+        self._refresh_poly_mask_ui()
+        self._regenerate_preview()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
+        self.status_label.setText(f"Created Polygon Mask #{self._selected_poly_idx + 1} ({len(pts)} vertices).")
+
+    def _on_poly_mask_selected(self, idx: int) -> None:
+        if 0 <= idx < len(self._poly_masks):
+            self._selected_poly_idx = idx
+            self._refresh_poly_mask_ui()
+            self.status_label.setText(f"Selected Polygon Mask #{idx + 1}.")
+
+    def _on_poly_combo_changed(self, idx: int) -> None:
+        if self._updating_poly_ui:
+            return
+        if 0 <= idx < len(self._poly_masks):
+            self._selected_poly_idx = idx
+            self._refresh_poly_mask_ui()
+
+    def _refresh_poly_mask_ui(self) -> None:
+        self._updating_poly_ui = True
+        try:
+            if hasattr(self, "poly_sel_combo"):
+                self.poly_sel_combo.clear()
+                for i in range(len(self._poly_masks)):
+                    self.poly_sel_combo.addItem(f"Mask #{i + 1}")
+                if 0 <= self._selected_poly_idx < len(self._poly_masks):
+                    self.poly_sel_combo.setCurrentIndex(self._selected_poly_idx)
+                    m = self._poly_masks[self._selected_poly_idx]
+                    self.poly_invert_chk.setChecked(bool(m.get("invert", False)))
+                    self.poly_ev_spin.setValue(float(m.get("exposure_ev", 0.0)))
+                    self.poly_sat_spin.setValue(float(m.get("saturation", 1.0)))
+                    self.poly_gamma_spin.setValue(float(m.get("gamma", 1.0)))
+                    self.poly_temp_spin.setValue(float(m.get("temp_shift", 0.0)))
+                    self.poly_r_spin.setValue(float(m.get("gain_r", 1.0)))
+                    self.poly_g_spin.setValue(float(m.get("gain_g", 1.0)))
+                    self.poly_b_spin.setValue(float(m.get("gain_b", 1.0)))
+                    self.poly_feather_spin.setValue(float(m.get("feather", 0.15)))
+                    self.poly_blur_spin.setValue(float(m.get("blur", 0.0)))
+            if hasattr(self, "poly_toolbar_widget"):
+                show_tb = self.poly_mask_btn.isChecked() or bool(self._poly_masks)
+                self.poly_toolbar_widget.setVisible(show_tb)
+            if hasattr(self, "preview_label"):
+                self.preview_label.set_poly_masks(self._poly_masks, self._selected_poly_idx)
+        finally:
+            self._updating_poly_ui = False
+
+    def _on_poly_param_changed(self, *_args) -> None:
+        if self._updating_poly_ui:
+            return
+        if 0 <= self._selected_poly_idx < len(self._poly_masks):
+            m = self._poly_masks[self._selected_poly_idx]
+            m["invert"] = bool(self.poly_invert_chk.isChecked())
+            m["exposure_ev"] = float(self.poly_ev_spin.value())
+            m["saturation"] = float(self.poly_sat_spin.value())
+            m["gamma"] = float(self.poly_gamma_spin.value())
+            m["temp_shift"] = float(self.poly_temp_spin.value())
+            m["gain_r"] = float(self.poly_r_spin.value())
+            m["gain_g"] = float(self.poly_g_spin.value())
+            m["gain_b"] = float(self.poly_b_spin.value())
+            m["feather"] = float(self.poly_feather_spin.value())
+            m["blur"] = float(self.poly_blur_spin.value())
+            self._schedule_preview_update()
+
+    def _on_desaturate_poly_mask(self) -> None:
+        self.poly_sat_spin.setValue(0.0)
+        self._on_poly_param_changed()
+
+    def _on_reset_poly_grade(self) -> None:
+        self._updating_poly_ui = True
+        try:
+            self.poly_invert_chk.setChecked(False)
+            self.poly_ev_spin.setValue(0.0)
+            self.poly_sat_spin.setValue(1.0)
+            self.poly_gamma_spin.setValue(1.0)
+            self.poly_temp_spin.setValue(0.0)
+            self.poly_r_spin.setValue(1.0)
+            self.poly_g_spin.setValue(1.0)
+            self.poly_b_spin.setValue(1.0)
+            self.poly_feather_spin.setValue(0.15)
+            self.poly_blur_spin.setValue(0.0)
+        finally:
+            self._updating_poly_ui = False
+        self._on_poly_param_changed()
+
+    def _on_delete_poly_mask(self) -> None:
+        if not (0 <= self._selected_poly_idx < len(self._poly_masks)):
+            return
+        self._poly_masks.pop(self._selected_poly_idx)
+        self._selected_poly_idx = min(self._selected_poly_idx, len(self._poly_masks) - 1)
+        self._refresh_poly_mask_ui()
+        self._regenerate_preview()
+
+    def _on_clear_poly_masks(self) -> None:
+        if not self._poly_masks:
+            return
+        self._poly_masks.clear()
+        self._selected_poly_idx = -1
+        self._refresh_poly_mask_ui()
+        self._regenerate_preview()
+
     def _on_toggle_brush_mode(self, checked: bool) -> None:
         if checked:
             for btn in (self.pick_sky_btn, self.pick_gnd_btn, self.pick_light_btn):
                 btn.setChecked(False)
             if hasattr(self, "pick_wb_btn"):
                 self.pick_wb_btn.setChecked(False)
+            if hasattr(self, "poly_mask_btn") and self.poly_mask_btn.isChecked():
+                self.poly_mask_btn.setChecked(False)
             if hasattr(self, "edit_plates_btn") and self.edit_plates_btn.isChecked():
                 self.edit_plates_btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
@@ -5402,6 +5789,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                     region_blur=self.light_blur_slider.value(),
                 )
+            if self._poly_masks:
+                baked = apply_polygon_masks(baked, self._poly_masks)
             if self._brush_strokes:
                 baked = apply_brush_strokes(baked, self._brush_strokes)
 
@@ -5414,6 +5803,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "ground_rect": self._ground_rect,
                     "light_regions": [dict(r) for r in self._light_regions],
                     "baked_extracted_lights": list(self._baked_extracted_lights),
+                    "poly_masks": json.loads(json.dumps(self._poly_masks)),
                     "brush_strokes": [dict(s) for s in self._brush_strokes],
                     "baked_ops": [dict(op) for op in self._baked_ops],
                 }
@@ -5431,6 +5821,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         {"rect": list(r["rect"]), "shape": r.get("shape", "rect")}
                         for r in self._light_regions
                     ],
+                    "poly_masks": json.loads(json.dumps(self._poly_masks)),
                     "brush_strokes": json.loads(json.dumps(self._brush_strokes)),
                     "remove_hotspot": bool(self.remove_hotspot_chk.isChecked()),
                     "light_region_blur": float(self.light_blur_slider.value()),
@@ -5450,10 +5841,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._sky_rect = None
             self._ground_rect = None
             self._light_regions.clear()
+            self._poly_masks.clear()
+            self._selected_poly_idx = -1
             self._brush_strokes.clear()
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
             self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
+            self._refresh_poly_mask_ui()
             self.unbake_edits_btn.setEnabled(True)
             self.unbake_edits_btn.setText(f"Unbake ({len(self._bake_history)})")
             self.unbake_edits_btn.setToolTip(
@@ -5483,6 +5877,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._ground_rect = prev.get("ground_rect")
             self._light_regions = [dict(r) for r in prev.get("light_regions", [])]
             self._baked_extracted_lights = list(prev.get("baked_extracted_lights", []))
+            self._poly_masks = json.loads(json.dumps(prev.get("poly_masks", [])))
+            self._selected_poly_idx = len(self._poly_masks) - 1
             self._brush_strokes = [dict(s) for s in prev.get("brush_strokes", [])]
             self._baked_ops = [dict(op) for op in prev.get("baked_ops", [])]
         else:
@@ -5491,6 +5887,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._baked_extracted_lights.clear()
             self._baked_ops.clear()
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
+        self._refresh_poly_mask_ui()
         has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
         self.unbake_edits_btn.setEnabled(has_more)
         self.unbake_edits_btn.setText(
@@ -6053,8 +6450,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             elif not self._light_regions:
                 self._extracted_lights = list(self._baked_extracted_lights)
             if not fast:
+                if self._poly_masks:
+                    hdri = apply_polygon_masks(hdri, self._poly_masks)
                 self._pre_brush_hdri = hdri.copy()
                 self._brush_undo_stack.clear()
+                if self._poly_masks:
+                    hdri = apply_polygon_masks(hdri, self._poly_masks)
                 if self._brush_strokes:
                     hdri = apply_brush_strokes(hdri, self._brush_strokes)
             self._hdri_pixels = hdri
@@ -6408,6 +6809,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         )
                         self._last_light_exr_paths.append(written_l)
                     light_msg = f" + {len(self._last_light_exr_paths)} Light EXR(s)"
+                if self._poly_masks:
+                    hdri = apply_polygon_masks(hdri, self._poly_masks)
                 if self._brush_strokes:
                     hdri = apply_brush_strokes(hdri, self._brush_strokes)
 
@@ -6749,6 +7152,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._extracted_lights.clear()
             self._baked_extracted_lights.clear()
             self._last_light_exr_paths.clear()
+            self._poly_masks.clear()
+            self._selected_poly_idx = -1
             self._brush_strokes.clear()
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
@@ -6777,6 +7182,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 "pick_light_btn",
                 "pick_wb_btn",
                 "brush_btn",
+                "poly_mask_btn",
                 "edit_plates_btn",
                 "ab_split_btn",
             ):
@@ -6784,6 +7190,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 if btn is not None:
                     btn.setChecked(False)
             self.preview_label.set_pick_mode(None)
+            self.preview_label.set_poly_mode(False)
+            self._refresh_poly_mask_ui()
             self.preview_label.set_plate_edit_mode(False)
             self.preview_label.set_ab_split(False)
             self.preview_label.set_regions(None, None, [])
@@ -6884,6 +7292,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "preview_roughness": self.preview_roughness_slider.value(),
             "ab_split": self.ab_split_btn.isChecked(),
             "brush_strokes": self._brush_strokes,
+            "poly_masks": json.loads(json.dumps(self._poly_masks)),
+            "selected_poly_idx": int(self._selected_poly_idx),
             "brush_mode": self.brush_mode_combo.currentText(),
             "brush_size": self.brush_size_slider.value(),
             "brush_strength": self.brush_strength_slider.value(),
@@ -7012,6 +7422,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     )
                     if newly_extracted:
                         baked_lights.extend(newly_extracted)
+                op_polys = op.get("poly_masks") or []
+                if op_polys:
+                    baked = apply_polygon_masks(baked, op_polys)
                 op_strokes = op.get("brush_strokes") or []
                 if op_strokes:
                     baked = apply_brush_strokes(baked, op_strokes)
@@ -7121,6 +7534,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_roughness_slider.setValue(int(data.get("preview_roughness", 0)))
         self.ab_split_btn.setChecked(bool(data.get("ab_split", False)))
         self._brush_strokes = list(data.get("brush_strokes") or [])
+        self._poly_masks = [dict(pm) for pm in (data.get("poly_masks") or []) if isinstance(pm, dict)]
+        sel_poly = int(data.get("selected_poly_idx", len(self._poly_masks) - 1))
+        self._selected_poly_idx = sel_poly if (0 <= sel_poly < len(self._poly_masks)) else (len(self._poly_masks) - 1)
+        self._refresh_poly_mask_ui()
         if "brush_mode" in data:
             self.brush_mode_combo.setCurrentText(str(data["brush_mode"]))
         else:
