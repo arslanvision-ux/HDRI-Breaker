@@ -1263,6 +1263,18 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertIsNotNone(w2._brush_strokes[-1].get("poly_mask"))
         # Verify outside-near-edge (which is inside brush radius around (0.62,0.62) but outside poly mask) wasn't boosted like inside
         self.assertLess(float(np.mean(outside_near_edge)), float(np.mean(post_inside)))
+
+        # 4. Move polygon vertex, deselect mask, and start a new mask
+        w2.poly_mask_btn.setChecked(True)
+        moved_pts = [[0.35, 0.35], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]]
+        w2._on_poly_mask_points_changed(0, moved_pts)
+        self.assertAlmostEqual(float(w2._poly_masks[0]["points"][0][0]), 0.35, places=4)
+        w2._on_poly_mask_selected(-1)
+        self.assertEqual(w2._selected_poly_idx, -1)
+        self.assertEqual(w2.poly_sel_combo.currentIndex(), -1)
+        w2._on_new_poly_mask()
+        self.assertTrue(w2.preview_label._poly_force_new)
+        self.assertEqual(w2.preview_label._selected_poly_idx, -1)
         w2.close()
 
 

@@ -449,6 +449,7 @@ class PreviewLabel(QtWidgets.QLabel):
     brushParamAdjusted = Signal(str, float)
     polyMaskFinished = Signal(list)
     polyMaskSelected = Signal(int)
+    polyMaskPointsChanged = Signal(int, list)
     filesDropped = Signal(list)
 
     def __init__(self, text: str = "", parent=None):
@@ -506,6 +507,9 @@ class PreviewLabel(QtWidgets.QLabel):
         self._poly_mode: bool = False
         self._poly_masks: List[Dict[str, Any]] = []
         self._selected_poly_idx: int = -1
+        self._selected_poly_vertex: Optional[Tuple[int, int]] = None
+        self._dragging_poly_vertex: Optional[Tuple[int, int]] = None
+        self._poly_force_new: bool = False
         self._active_poly_pts: List[Tuple[float, float]] = []
         self._poly_hover_uv: Optional[Tuple[float, float]] = None
         self._cached_plate_outlines: Dict[int, tuple] = {}
@@ -515,6 +519,8 @@ class PreviewLabel(QtWidgets.QLabel):
         if not self._poly_mode:
             self._active_poly_pts = []
             self._poly_hover_uv = None
+            self._dragging_poly_vertex = None
+            self._poly_force_new = False
         if self._poly_mode:
             self.setCursor(Qt.CrossCursor)
         elif not self._brush_enabled and self._pick_mode is None:
@@ -524,7 +530,44 @@ class PreviewLabel(QtWidgets.QLabel):
     def set_poly_masks(self, masks: list, selected_idx: int = -1) -> None:
         self._poly_masks = list(masks or [])
         self._selected_poly_idx = int(selected_idx)
+        if self._selected_poly_vertex is not None:
+            mi, vi = self._selected_poly_vertex
+            if (
+                mi != self._selected_poly_idx
+                or not (0 <= mi < len(self._poly_masks))
+                or not (0 <= vi < len(self._poly_masks[mi].get("points") or []))
+            ):
+                self._selected_poly_vertex = None
         self.update()
+
+    def start_new_poly_mask(self) -> None:
+        self._selected_poly_idx = -1
+        self._selected_poly_vertex = None
+        self._dragging_poly_vertex = None
+        self._active_poly_pts = []
+        self._poly_force_new = True
+        self.update()
+
+    def _hit_test_poly_vertex(self, pos: QtCore.QPoint, radius_px: float = 9.0) -> Optional[Tuple[int, int]]:
+        prect = self._pixmap_rect()
+        if prect.width() <= 2 or prect.height() <= 2:
+            return None
+        order = []
+        if 0 <= self._selected_poly_idx < len(self._poly_masks):
+            order.append(self._selected_poly_idx)
+        for idx in range(len(self._poly_masks) - 1, -1, -1):
+            if idx != self._selected_poly_idx:
+                order.append(idx)
+        for idx in order:
+            pts = self._poly_masks[idx].get("points") or []
+            for vi, pt in enumerate(pts):
+                if len(pt) < 2:
+                    continue
+                px = prect.x() + float(pt[0]) * prect.width()
+                py = prect.y() + float(pt[1]) * prect.height()
+                if math.hypot(pos.x() - px, pos.y() - py) <= radius_px:
+                    return (idx, vi)
+        return None
 
     @staticmethod
     def _point_in_poly_uv(u: float, v: float, pts: list) -> bool:
@@ -849,12 +892,21 @@ class PreviewLabel(QtWidgets.QLabel):
                 if len(self._active_poly_pts) >= 3:
                     pts = [[float(p[0]), float(p[1])] for p in self._active_poly_pts]
                     self._active_poly_pts = []
+                    self._poly_force_new = False
                     self.polyMaskFinished.emit(pts)
                     self.update()
                     event.accept()
                     return
                 elif self._active_poly_pts:
                     self._active_poly_pts = []
+                    self._poly_force_new = False
+                    self.update()
+                    event.accept()
+                    return
+                elif self._selected_poly_idx >= 0 or self._selected_poly_vertex is not None:
+                    self._selected_poly_idx = -1
+                    self._selected_poly_vertex = None
+                    self.polyMaskSelected.emit(-1)
                     self.update()
                     event.accept()
                     return
@@ -862,13 +914,26 @@ class PreviewLabel(QtWidgets.QLabel):
                 cu = float(np.clip(uv_p[0], 0.0, 1.0))
                 cv = float(np.clip(uv_p[1], 0.0, 1.0))
                 if not self._active_poly_pts:
-                    hit_poly = self._hit_test_poly_mask(cu, cv)
-                    if hit_poly >= 0:
-                        self._selected_poly_idx = hit_poly
-                        self.polyMaskSelected.emit(hit_poly)
-                        self.update()
-                        event.accept()
-                        return
+                    if not self._poly_force_new:
+                        hit_v = self._hit_test_poly_vertex(pos)
+                        if hit_v is not None:
+                            if hit_v[0] != self._selected_poly_idx:
+                                self._selected_poly_idx = hit_v[0]
+                                self.polyMaskSelected.emit(hit_v[0])
+                            self._selected_poly_vertex = hit_v
+                            self._dragging_poly_vertex = hit_v
+                            self.setCursor(Qt.SizeAllCursor)
+                            self.update()
+                            event.accept()
+                            return
+                        hit_poly = self._hit_test_poly_mask(cu, cv)
+                        if hit_poly >= 0:
+                            self._selected_poly_idx = hit_poly
+                            self._selected_poly_vertex = None
+                            self.polyMaskSelected.emit(hit_poly)
+                            self.update()
+                            event.accept()
+                            return
                 elif len(self._active_poly_pts) >= 3:
                     prect = self._pixmap_rect()
                     sx = prect.x() + self._active_poly_pts[0][0] * prect.width()
@@ -876,10 +941,13 @@ class PreviewLabel(QtWidgets.QLabel):
                     if math.hypot(pos.x() - sx, pos.y() - sy) <= 10.0:
                         pts = [[float(p[0]), float(p[1])] for p in self._active_poly_pts]
                         self._active_poly_pts = []
+                        self._poly_force_new = False
                         self.polyMaskFinished.emit(pts)
                         self.update()
                         event.accept()
                         return
+                self._poly_force_new = False
+                self._selected_poly_vertex = None
                 self._active_poly_pts.append((cu, cv))
                 self.update()
                 event.accept()
@@ -982,6 +1050,17 @@ class PreviewLabel(QtWidgets.QLabel):
             return
 
         uv = self._pos_to_uv(pos)
+        if self._dragging_poly_vertex is not None and uv is not None:
+            m_idx, v_idx = self._dragging_poly_vertex
+            if 0 <= m_idx < len(self._poly_masks):
+                pts = self._poly_masks[m_idx].get("points") or []
+                if 0 <= v_idx < len(pts):
+                    pts[v_idx] = [
+                        float(np.clip(uv[0], 0.0, 1.0)),
+                        float(np.clip(uv[1], 0.0, 1.0)),
+                    ]
+                    self.update()
+            return
         if uv is not None and 0.0 <= uv[0] <= 1.0 and 0.0 <= uv[1] <= 1.0:
             self.pixelHovered.emit(float(uv[0]), float(uv[1]))
             if self._poly_mode:
@@ -1066,6 +1145,15 @@ class PreviewLabel(QtWidgets.QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._dragging_poly_vertex is not None:
+            m_idx, _v_idx = self._dragging_poly_vertex
+            self._dragging_poly_vertex = None
+            self.setCursor(Qt.CrossCursor if self._poly_mode else Qt.ArrowCursor)
+            if 0 <= m_idx < len(self._poly_masks):
+                pts = [[float(p[0]), float(p[1])] for p in (self._poly_masks[m_idx].get("points") or [])]
+                self.polyMaskPointsChanged.emit(m_idx, pts)
+            self.update()
+            return
         if self._brush_adjust_mode is not None:
             mode_done = self._brush_adjust_mode
             moved = self._brush_adjust_moved
@@ -1301,10 +1389,17 @@ class PreviewLabel(QtWidgets.QLabel):
                     painter.drawPolygon(poly_q)
                     painter.setBrush(Qt.NoBrush)
                     if is_sel or self._poly_mode:
-                        painter.setBrush(col)
-                        for p in pts_uv:
+                        for vi, p in enumerate(pts_uv):
                             px_pt = QtCore.QPointF(target.x() + float(p[0]) * target.width(), target.y() + float(p[1]) * target.height())
-                            painter.drawEllipse(px_pt, 3.0 if is_sel else 2.2, 3.0 if is_sel else 2.2)
+                            is_v_sel = self._selected_poly_vertex == (idx, vi)
+                            if is_v_sel:
+                                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1.8))
+                                painter.setBrush(QtGui.QColor(56, 189, 248))
+                                painter.drawEllipse(px_pt, 5.5, 5.5)
+                            else:
+                                painter.setPen(Qt.NoPen)
+                                painter.setBrush(col)
+                                painter.drawEllipse(px_pt, 3.2 if is_sel else 2.2, 3.2 if is_sel else 2.2)
                         painter.setBrush(Qt.NoBrush)
                     p0 = pts_uv[0]
                     painter.setPen(col)
@@ -1335,8 +1430,8 @@ class PreviewLabel(QtWidgets.QLabel):
             # On-canvas active mode banner / shortcut hint pill
             if self._poly_mode:
                 hud_msg = (
-                    "Polygon Mask (M)  |  Click: Add Point  |  Double-Click / Click Start: Close  "
-                    "|  Right-Click: Finish/Cancel"
+                    "Polygon Mask (M)  |  Drag Point: Move  |  Click: Add/Select  "
+                    "|  Double-Click: Close  |  Right-Click: Deselect"
                 )
                 hud_accent = QtGui.QColor(232, 121, 249)
             elif self._brush_enabled:
@@ -3200,6 +3295,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.poly_sel_combo = QtWidgets.QComboBox()
         self.poly_sel_combo.setMinimumWidth(95)
         self.poly_sel_combo.currentIndexChanged.connect(self._on_poly_combo_changed)
+        poly_new_btn = QtWidgets.QPushButton("New Mask")
+        poly_new_btn.setToolTip("Deselect current mask and start drawing a new Polygon Mask anywhere")
+        poly_new_btn.clicked.connect(self._on_new_poly_mask)
+        poly_desel_btn = QtWidgets.QPushButton("Deselect")
+        poly_desel_btn.setToolTip("Deselect the current Polygon Mask and points")
+        poly_desel_btn.clicked.connect(lambda: self._on_poly_mask_selected(-1))
         poly_del_btn = QtWidgets.QPushButton("Delete")
         poly_del_btn.clicked.connect(self._on_delete_poly_mask)
         poly_clear_btn = QtWidgets.QPushButton("Clear All")
@@ -3230,6 +3331,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
         poly_row.addWidget(QtWidgets.QLabel("Mask:"))
         poly_row.addWidget(self.poly_sel_combo)
+        poly_row.addWidget(poly_new_btn)
+        poly_row.addWidget(poly_desel_btn)
         poly_row.addWidget(poly_del_btn)
         poly_row.addWidget(poly_clear_btn)
         poly_row.addWidget(poly_desat_btn)
@@ -3266,6 +3369,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_label.brushParamAdjusted.connect(self._on_brush_param_adjusted)
         self.preview_label.polyMaskFinished.connect(self._on_poly_mask_finished)
         self.preview_label.polyMaskSelected.connect(self._on_poly_mask_selected)
+        self.preview_label.polyMaskPointsChanged.connect(self._on_poly_mask_points_changed)
         self.preview_label.filesDropped.connect(self._on_preview_files_dropped)
 
         self.plate_transform_bar = QtWidgets.QWidget()
@@ -5456,6 +5560,29 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._selected_poly_idx = idx
             self._refresh_poly_mask_ui()
             self.status_label.setText(f"Selected Polygon Mask #{idx + 1}.")
+        else:
+            self._selected_poly_idx = -1
+            if hasattr(self, "preview_label"):
+                self.preview_label._selected_poly_vertex = None
+            self._refresh_poly_mask_ui()
+            self.status_label.setText("Deselected Polygon Mask. Click canvas to start a new mask or click a mask to select it.")
+
+    def _on_new_poly_mask(self) -> None:
+        if hasattr(self, "poly_mask_btn") and not self.poly_mask_btn.isChecked():
+            self.poly_mask_btn.setChecked(True)
+        self._selected_poly_idx = -1
+        self._refresh_poly_mask_ui()
+        if hasattr(self, "preview_label"):
+            self.preview_label.start_new_poly_mask()
+        self.status_label.setText("New Polygon Mask: Click anywhere on canvas to place points.")
+
+    def _on_poly_mask_points_changed(self, idx: int, pts: list) -> None:
+        if 0 <= idx < len(self._poly_masks) and len(pts) >= 3:
+            self._poly_masks[idx]["points"] = [[float(p[0]), float(p[1])] for p in pts if len(p) >= 2]
+            self._regenerate_preview()
+            self._commit_undo_baseline()
+            self._refresh_undo_ui()
+            self.status_label.setText(f"Updated Polygon Mask #{idx + 1} vertex positions.")
 
     def _on_poly_combo_changed(self, idx: int) -> None:
         if self._updating_poly_ui:
@@ -5484,6 +5611,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     self.poly_b_spin.setValue(float(m.get("gain_b", 1.0)))
                     self.poly_feather_spin.setValue(float(m.get("feather", 0.15)))
                     self.poly_blur_spin.setValue(float(m.get("blur", 0.0)))
+                else:
+                    self.poly_sel_combo.setCurrentIndex(-1)
             if hasattr(self, "poly_toolbar_widget"):
                 show_tb = self.poly_mask_btn.isChecked() or bool(self._poly_masks)
                 self.poly_toolbar_widget.setVisible(show_tb)
