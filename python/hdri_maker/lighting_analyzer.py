@@ -757,6 +757,22 @@ def project_multiview_plates_to_latlong(
             # Already-unwrapped 360° Lat/Long environment map: direct spherical
             # sampling with full 360°x180° coverage (no pinhole crop or mirroring)
             # and horizontal wrap-around bilinear interpolation.
+            # Area-prefilter when downsampling >= 2x so compact sun/practical peaks conserve radiant flux.
+            bin_x = iw // max(1, out_width)
+            bin_y = ih // max(1, out_height)
+            if bin_x >= 2 and bin_y >= 2:
+                if bin_x == 2 and bin_y == 2 and (iw % 2 == 0) and (ih % 2 == 0):
+                    img = (
+                        img[0::2, 0::2] + img[0::2, 1::2] + img[1::2, 0::2] + img[1::2, 1::2]
+                    ) * np.float32(0.25)
+                else:
+                    bh = (ih // bin_y) * bin_y
+                    bw = (iw // bin_x) * bin_x
+                    img = img[:bh, :bw].reshape(bh // bin_y, bin_y, bw // bin_x, bin_x, img.shape[2]).mean(
+                        axis=(1, 3), dtype=np.float32
+                    )
+                ih, iw = img.shape[:2]
+
             cam_z = dx * fwd[0] + dy * fwd[1] + dz * fwd[2]
             cam_x = dx * right[0] + dy * right[1] + dz * right[2]
             cam_y = dx * up[0] + dy * up[1] + dz * up[2]

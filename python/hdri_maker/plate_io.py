@@ -877,13 +877,22 @@ def downsample_image(pixels: np.ndarray, max_dim: int = 512) -> np.ndarray:
     if scale <= 1.0:
         return pixels
     work = pixels.astype(np.float32, copy=False)
-    # Integer block-averaging when downsampling >= 2x so high-frequency edges don't alias
+    # Integer block-averaging in float32 (no float64 promotion) when downsampling >= 2x
     bin_f = int(scale)
-    if bin_f >= 2:
+    if bin_f == 2:
+        bh = (h // 2) * 2
+        bw = (w // 2) * 2
+        if bh >= 2 and bw >= 2:
+            w_crop = work[:bh, :bw]
+            work = (
+                w_crop[0::2, 0::2] + w_crop[0::2, 1::2] + w_crop[1::2, 0::2] + w_crop[1::2, 1::2]
+            ) * np.float32(0.25)
+            h, w = work.shape[:2]
+    elif bin_f >= 3:
         bh = (h // bin_f) * bin_f
         bw = (w // bin_f) * bin_f
         if bh >= bin_f and bw >= bin_f:
-            work = work[:bh, :bw].reshape(bh // bin_f, bin_f, bw // bin_f, bin_f, -1).mean(axis=(1, 3))
+            work = work[:bh, :bw].reshape(bh // bin_f, bin_f, bw // bin_f, bin_f, -1).mean(axis=(1, 3), dtype=np.float32)
             h, w = work.shape[:2]
     new_h = max(1, int(round(h / (max(h, w) / float(max_dim)) if max(h, w) > max_dim else h)))
     new_w = max(1, int(round(w / (max(h, w) / float(max_dim)) if max(h, w) > max_dim else w)))

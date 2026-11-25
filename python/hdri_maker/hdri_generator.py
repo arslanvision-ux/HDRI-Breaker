@@ -21,7 +21,7 @@ from .lighting_analyzer import (
     project_multiview_plates_to_latlong,
     rgb_to_cct_kelvin,
 )
-from .plate_io import linear_to_srgb
+from .plate_io import downsample_image, linear_to_srgb
 
 
 @dataclass
@@ -517,11 +517,11 @@ def generate_latlong_hdri(
     cos_phi = np.cos(phi)[None, :]      # (1, W)
 
     # 1. Vertical hemispherical gradient (Zenith -> Sky -> Horizon -> Ground -> Nadir)
-    zenith = np.array(profile.zenith_color, dtype=np.float32) * p.sky_gain
-    sky = np.array(profile.sky_color, dtype=np.float32) * p.sky_gain
+    zenith = np.array(profile.zenith_color, dtype=np.float32)
+    sky = np.array(profile.sky_color, dtype=np.float32)
     horizon = np.array(profile.horizon_color, dtype=np.float32)
-    ground = np.array(profile.ground_color, dtype=np.float32) * p.ground_gain
-    nadir = np.array(profile.nadir_color, dtype=np.float32) * p.ground_gain
+    ground = np.array(profile.ground_color, dtype=np.float32)
+    nadir = np.array(profile.nadir_color, dtype=np.float32)
 
     elev = theta[:, None] / (0.5 * math.pi)  # +1 zenith, 0 horizon, -1 nadir
     soft = max(0.05, float(p.horizon_softness))
@@ -665,14 +665,6 @@ def generate_latlong_hdri(
                     sky_blur=p.sky_blur,
                     ground_blur=p.ground_blur,
                 )
-            # Apply Sky Gain, Ground Gain, and subtle Ambient Wrap to stitched HDRI too
-            # so these sliders always have a clear, physical effect even at Plate Proj Blend = 1.0
-            if abs(p.sky_gain - 1.0) > 1e-4:
-                sky_mask = _smoothstep(0.0, 0.25, elev)[..., None]
-                stitched = stitched * (1.0 + (float(p.sky_gain) - 1.0) * sky_mask)
-            if abs(p.ground_gain - 1.0) > 1e-4:
-                gnd_mask = _smoothstep(0.0, 0.25, -elev)[..., None]
-                stitched = stitched * (1.0 + (float(p.ground_gain) - 1.0) * gnd_mask)
             if abs(p.ambient_wrap - 0.55) > 1e-4 and profile.azimuthal_strip is not None and len(profile.azimuthal_strip) > 0:
                 wrap_delta = float(np.clip(p.ambient_wrap, 0.0, 1.0)) - 0.55
                 band_mask = np.exp(-0.5 * (elev / 0.55) ** 2)[..., None]
@@ -740,6 +732,15 @@ def generate_latlong_hdri(
             energy = float(hs.peak_intensity) * float(p.hotspot_boost)
             hs_rgb = np.array(hs.color_rgb, dtype=np.float32) * energy
             hdri += (core + halo)[..., None] * hs_rgb[None, None, :]
+
+    # 3b. Unified Hemispherical Sky / Ground Gain (matches apply_post_adjustments_to_hdri)
+    if abs(p.sky_gain - 1.0) > 1e-4 or abs(p.ground_gain - 1.0) > 1e-4:
+        if abs(p.sky_gain - 1.0) > 1e-4:
+            sky_mask = _smoothstep(0.0, 0.25, theta)[:, None, None]
+            hdri = hdri * (1.0 + (float(p.sky_gain) - 1.0) * sky_mask)
+        if abs(p.ground_gain - 1.0) > 1e-4:
+            gnd_mask = _smoothstep(0.0, 0.25, -theta)[:, None, None]
+            hdri = hdri * (1.0 + (float(p.ground_gain) - 1.0) * gnd_mask)
 
     # 4. Temperature shift / white-balance adjustment
     if p.temperature_kelvin > 0.0 and p.temperature_blend > 0.0:
@@ -1551,21 +1552,31 @@ def apply_post_adjustments_to_hdri(
     w = max(128, int(p.width))
     src = np.asarray(base_hdri, dtype=np.float32)
     sh, sw = src.shape[:2]
-    if (sh, sw) != (h, w):
-        ys = np.linspace(0.0, sh - 1.0, h, dtype=np.float32)
-        xs = np.linspace(0.0, sw - 1.0, w, dtype=np.float32)
-        y0 = np.floor(ys).astype(np.int32)
-        x0 = np.floor(xs).astype(np.int32)
-        y1 = np.minimum(y0 + 1, sh - 1)
-        x1 = (x0 + 1) % sw
-        fy = (ys - y0)[:, None, None]
-        fx = (xs - x0)[None, :, None]
-        hdri = (
-            (src[np.ix_(y0, x0)] * (1.0 - fx) + src[np.ix_(y0, x1)] * fx) * (1.0 - fy)
-            + (src[np.ix_(y1, x0)] * (1.0 - fx) + src[np.ix_(y1, x1)] * fx) * fy
-        ).astype(np.float32)
-    else:
+    if (sh, sw) == (h, w):
         hdri = src.copy()
+    elif sh == 2 * h and sw == 2 * w:
+        hdri = np.ascontiguousarray(
+            (src[0::2, 0::2] + src[0::2, 1::2] + src[1::2, 0::2] + src[1::2, 1::2]) * np.float32(0.25),
+            dtype=np.float32,
+        )
+    else:
+        ds_done = False
+        if sh > h and sw > w and (h * sw == sh * w):
+            ds_arr = downsample_image(src, max_dim=max(h, w))
+            if ds_arr.shape[:2] == (h, w):
+                hdri = np.ascontiguousarray(ds_arr, dtype=np.float32)
+                ds_done = True
+        if not ds_done:
+            ys = np.linspace(0.0, sh - 1.0, h, dtype=np.float32)
+            xs = np.linspace(0.0, sw - 1.0, w, dtype=np.float32)
+            y0 = np.floor(ys).astype(np.int32)
+            x0 = np.floor(xs).astype(np.int32)
+            y1 = np.minimum(y0 + 1, sh - 1)
+            x1 = (x0 + 1) % sw
+            fy = (ys - y0)[:, None, None]
+            fx = (xs - x0)[None, :, None]
+            row_lerp = src[y0] * (1.0 - fy) + src[y1] * fy
+            hdri = (row_lerp[:, x0, :] * (1.0 - fx) + row_lerp[:, x1, :] * fx).astype(np.float32)
 
     if abs(p.azimuth_offset_deg) > 1e-4:
         shift_px = int(round((p.azimuth_offset_deg / 360.0) * w)) % w
@@ -1644,7 +1655,7 @@ def neutralize_hdri_environment(
     img = np.maximum(hdri_pixels.astype(np.float32, copy=False), 0.0)
     h = img.shape[0]
     lum = compute_luminance(img)
-    p95 = float(np.percentile(lum, 95.0))
+    p95 = _spherical_weighted_percentile(lum, 95.0)
     theta = (np.arange(h, dtype=np.float32) + 0.5) * (np.pi / float(max(h, 1)))
     sin_w = np.sin(theta)[:, None]
 
@@ -1835,21 +1846,62 @@ def render_lookdev_sphere_preview_srgb(
     return render_preview_srgb(canvas, preview_ev=exposure_ev, tonemap=tonemap)
 
 
+def _spherical_weighted_percentile(
+    lum_2d: np.ndarray,
+    q: float,
+    positive_only: bool = False,
+    min_val: float = 1e-5,
+) -> float:
+    """Compute solid-angle (sin theta) weighted percentile on a Lat/Long 2D luminance map."""
+    h, w = lum_2d.shape[:2]
+    step_y = max(1, h // 256)
+    step_x = max(1, w // 512)
+    lum_s = np.asarray(lum_2d[::step_y, ::step_x], dtype=np.float32)
+    sh, sw = lum_s.shape[:2]
+    theta = (np.arange(sh, dtype=np.float32) + 0.5) * (math.pi / float(max(sh, 1)))
+    sin_w = np.broadcast_to(np.maximum(np.sin(theta), 1e-4)[:, None], (sh, sw))
+    vals = lum_s.ravel()
+    wts = sin_w.ravel()
+    if positive_only:
+        mask = vals > float(min_val)
+        vals = vals[mask]
+        wts = wts[mask]
+    if vals.size == 0:
+        return float(min_val) if positive_only else 0.0
+    order = np.argsort(vals)
+    cdf = np.cumsum(wts[order].astype(np.float64))
+    total_w = float(cdf[-1])
+    if total_w <= 1e-12:
+        return float(np.median(vals))
+    target = float(np.clip(q / 100.0, 0.0, 1.0)) * total_w
+    idx = int(np.clip(np.searchsorted(cdf, target, side="left"), 0, vals.size - 1))
+    return float(vals[order[idx]])
+
+
 def compute_hdri_stats(hdri_pixels: np.ndarray) -> Dict[str, Any]:
     """
     Compute Nuke CurveTool-style HDRI telemetry:
     min/mean/max RGB & luminance, dynamic range in stops, and virtual 18% gray ball luminance.
     """
-    img = np.maximum(np.nan_to_num(hdri_pixels.astype(np.float32, copy=False), nan=0.0, posinf=65504.0, neginf=0.0), 0.0)
-    h = img.shape[0]
+    arr = np.asarray(hdri_pixels, dtype=np.float32)
+    if np.isfinite(float(np.sum(arr, dtype=np.float64))):
+        img = arr if float(np.min(arr)) >= 0.0 else np.maximum(arr, 0.0)
+    else:
+        img = np.maximum(np.nan_to_num(arr, nan=0.0, posinf=65504.0, neginf=0.0), 0.0)
+    h, w = img.shape[:2]
     lum = compute_luminance(img)
 
     # Solid-angle sin(theta) weights for accurate spherical average & virtual 18% gray ball
-    theta = (np.arange(h, dtype=np.float32) + 0.5) * (math.pi / float(max(h, 1)))
+    step = 2 if h >= 1024 else 1
+    img_s = img[::step, ::step]
+    lum_s = lum[::step, ::step]
+    hs, ws = lum_s.shape[:2]
+    theta = (np.arange(hs, dtype=np.float32) + 0.5) * (math.pi / float(max(hs, 1)))
     sin_w = np.sin(theta)[:, None]
-    w_sum = float(np.sum(sin_w)) * float(img.shape[1])
-    mean_lum = float(np.sum(lum * sin_w) / max(w_sum, 1e-6))
-    mean_rgb = tuple(float(np.sum(img[..., c] * sin_w) / max(w_sum, 1e-6)) for c in range(3))
+    w_sum = float(np.sum(sin_w)) * float(ws)
+    mean_lum = float(np.sum(lum_s * sin_w) / max(w_sum, 1e-6))
+    mean_rgb_arr = np.sum(img_s * sin_w[..., None], axis=(0, 1)) / max(w_sum, 1e-6)
+    mean_rgb = (float(mean_rgb_arr[0]), float(mean_rgb_arr[1]), float(mean_rgb_arr[2]))
 
     # Virtual 18% diffuse gray sphere under uniform dome: L_ball ≈ 0.18 * E_avg = 0.18 * mean_lum
     # (for Lambertian BRDF rho/pi integrated over hemisphere with radiance L, L_out = rho * L_avg)
@@ -1861,13 +1913,13 @@ def compute_hdri_stats(hdri_pixels: np.ndarray) -> Dict[str, Any]:
     peak_channel = float(np.max(img))
     max_lum = float(lum[max_y, max_x])
 
-    pos = lum[lum > 1e-5]
-    p01 = float(np.percentile(pos, 1.0)) if pos.size > 0 else 1e-5
-    min_lum = float(np.min(lum))
+    p01 = _spherical_weighted_percentile(lum, 1.0, positive_only=True, min_val=1e-5)
+    min_rgb_arr = np.min(img_s, axis=(0, 1))
+    min_lum = float(np.min(lum_s))
     dr_stops = float(np.log2(max(max_lum, 1e-5) / max(p01, 1e-5))) if max_lum > p01 else 0.0
 
     return {
-        "min_rgb": tuple(float(np.min(img[..., c])) for c in range(3)),
+        "min_rgb": (float(min_rgb_arr[0]), float(min_rgb_arr[1]), float(min_rgb_arr[2])),
         "mean_rgb": mean_rgb,
         "max_rgb": max_rgb,
         "peak_channel": peak_channel,
@@ -1884,17 +1936,18 @@ def compute_gray_ball_normalize_ev(hdri_pixels: np.ndarray, target_gray: float =
     Compute the EV exposure delta required so a virtual 18% diffuse gray ball
     lit by this HDRI dome reads `target_gray` (0.18) at Dome Light Exposure = 0.
 
-    Clamps extreme specular spikes above the 98.5th luminance percentile so tiny
-    5,000+ bulb/sun cores (or a pinned Peak White Target) do not crush the
-    diffuse midtone exposure or cause incremental drift on repeated clicks.
+    Clamps extreme specular spikes above the 98.5th solid-angle-weighted luminance
+    percentile so tiny 5,000+ bulb/sun cores do not crush the diffuse midtone
+    exposure or cause incremental drift on repeated clicks.
     """
-    img = np.maximum(
-        np.nan_to_num(hdri_pixels.astype(np.float32, copy=False), nan=0.0, posinf=65504.0, neginf=0.0),
-        0.0,
-    )
+    arr = np.asarray(hdri_pixels, dtype=np.float32)
+    if np.isfinite(float(np.sum(arr, dtype=np.float64))):
+        img = arr if float(np.min(arr)) >= 0.0 else np.maximum(arr, 0.0)
+    else:
+        img = np.maximum(np.nan_to_num(arr, nan=0.0, posinf=65504.0, neginf=0.0), 0.0)
     h = img.shape[0]
     lum = compute_luminance(img)
-    p_cap = float(np.percentile(lum, 98.5))
+    p_cap = _spherical_weighted_percentile(lum, 98.5)
     lum_diffuse = np.minimum(lum, max(p_cap, 1e-5))
     theta = (np.arange(h, dtype=np.float32) + 0.5) * (math.pi / float(max(h, 1)))
     sin_w = np.sin(theta)[:, None]
@@ -2031,6 +2084,9 @@ def apply_pole_rectilinear_patch(
     return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)
 
 
+_POLY_MASK_CACHE: Dict[tuple, np.ndarray] = {}
+
+
 def rasterize_polygon_mask(
     height: int,
     width: int,
@@ -2044,10 +2100,21 @@ def rasterize_polygon_mask(
     if not points_uv or len(points_uv) < 3:
         return np.zeros((h, w, 1), dtype=np.float32)
 
+    f_val = float(np.clip(feather, 0.0, 1.0))
+    cache_key = (
+        h,
+        w,
+        tuple((round(float(p[0]), 6), round(float(p[1]), 6)) for p in points_uv if len(p) >= 2),
+        round(f_val, 4),
+        bool(invert),
+    )
+    cached = _POLY_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     pts = [(float(p[0]) * float(w), float(p[1]) * float(h)) for p in points_uv]
     xs_p = [p[0] for p in pts]
     ys_p = [p[1] for p in pts]
-    f_val = float(np.clip(feather, 0.0, 1.0))
     r_px = max(1, int(round(f_val * 0.06 * min(w, h)))) if f_val > 1e-4 else 0
 
     x0 = max(0, int(math.floor(min(xs_p))) - r_px - 2)
@@ -2077,12 +2144,19 @@ def rasterize_polygon_mask(
 
     if invert:
         mask = 1.0 - mask
-    return np.ascontiguousarray(mask, dtype=np.float32)
+    mask = np.ascontiguousarray(mask, dtype=np.float32)
+    mask.setflags(write=False)
+    if len(_POLY_MASK_CACHE) >= 16:
+        _POLY_MASK_CACHE.pop(next(iter(_POLY_MASK_CACHE)))
+    _POLY_MASK_CACHE[cache_key] = mask
+    return mask
 
 
 def apply_polygon_masks(
     hdri_pixels: np.ndarray,
     masks: List[Dict[str, Any]],
+    working_ev: float = 0.0,
+    working_scale: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Apply 32-bit float polygon-masked grading (Exposure, RGB Gain, Temp, Gamma, Saturation, Blur)."""
     if hdri_pixels is None or not masks:
@@ -2090,6 +2164,8 @@ def apply_polygon_masks(
 
     out = hdri_pixels.astype(np.float32, copy=True)
     h, w = out.shape[:2]
+    ev_gamma_scale = float(2.0 ** working_ev) if abs(float(working_ev)) > 1e-4 else 1.0
+    has_scale_map = (working_scale is not None) and (working_scale.shape[:2] == (h, w))
 
     for m in masks:
         if not isinstance(m, dict) or not m.get("enabled", True):
@@ -2123,14 +2199,27 @@ def apply_polygon_masks(
             continue
 
         alpha = rasterize_polygon_mask(h, w, pts, feather=feather, invert=invert)
-        if float(np.max(alpha)) <= 1e-5:
+        alpha2d = alpha[..., 0]
+        ys_nz = np.where(np.max(alpha2d, axis=1) > 1e-5)[0]
+        if ys_nz.size == 0:
+            continue
+        xs_nz = np.where(np.max(alpha2d[ys_nz[0] : ys_nz[-1] + 1], axis=0) > 1e-5)[0]
+        if xs_nz.size == 0:
             continue
 
-        graded = out
+        by0, by1 = int(ys_nz[0]), int(ys_nz[-1]) + 1
+        bx0, bx1 = int(xs_nz[0]), int(xs_nz[-1]) + 1
+
         if blur_amt > 1e-4:
             rx = max(1, int(round(blur_amt * (w / 32.0))))
             ry = max(1, int(round(blur_amt * (h / 32.0))))
-            graded = _separable_box_blur(graded, rx, ry, wrap_x=True)
+            blurred_full = _separable_box_blur(out, rx, ry, wrap_x=True)
+            sub_in = blurred_full[by0:by1, bx0:bx1]
+        else:
+            sub_in = out[by0:by1, bx0:bx1]
+
+        sub_out = out[by0:by1, bx0:bx1]
+        sub_alpha = alpha[by0:by1, bx0:bx1]
 
         scale_ev = float(2.0 ** ev) if abs(ev) > 1e-4 else 1.0
         t_r = 1.0 + 0.35 * temp_shift
@@ -2139,13 +2228,22 @@ def apply_polygon_masks(
             [gain_r * t_r * scale_ev, gain_g * scale_ev, gain_b * t_b * scale_ev],
             dtype=np.float32,
         )[None, None, :]
-        if blur_amt <= 1e-4:
-            graded = out * rgb_mult
-        else:
-            graded = graded * rgb_mult
+        graded = sub_in * rgb_mult
 
         if abs(gamma - 1.0) > 1e-4:
-            graded = np.power(np.maximum(graded, 0.0), np.float32(1.0 / max(gamma, 0.05)))
+            if has_scale_map:
+                s_sub = np.maximum(working_scale[by0:by1, bx0:bx1], np.float32(1e-5))
+                graded = np.power(
+                    np.maximum(graded * s_sub, 0.0),
+                    np.float32(1.0 / max(gamma, 0.05)),
+                ) / s_sub
+            elif abs(ev_gamma_scale - 1.0) > 1e-6:
+                graded = np.power(
+                    np.maximum(graded * np.float32(ev_gamma_scale), 0.0),
+                    np.float32(1.0 / max(gamma, 0.05)),
+                ) / np.float32(max(ev_gamma_scale, 1e-8))
+            else:
+                graded = np.power(np.maximum(graded, 0.0), np.float32(1.0 / max(gamma, 0.05)))
 
         if abs(sat - 1.0) > 1e-4:
             lum = (
@@ -2155,6 +2253,6 @@ def apply_polygon_masks(
             )
             graded = np.maximum(lum + (graded - lum) * np.float32(sat), 0.0)
 
-        out = out * (1.0 - alpha) + graded * alpha
+        out[by0:by1, bx0:bx1] = sub_out * (1.0 - sub_alpha) + graded * sub_alpha
 
     return np.ascontiguousarray(np.maximum(out, 0.0), dtype=np.float32)

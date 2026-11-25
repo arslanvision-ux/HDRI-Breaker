@@ -1427,6 +1427,115 @@ class TestHDRIMaker(unittest.TestCase):
             w.close()
         app.processEvents()
 
+    def test_exposure_math_invariants_and_8k_ui_optimizations(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from hdri_maker.qt_compat import QtWidgets
+        from hdri_maker.ui_panel import HDRIMakerWidget
+        from hdri_maker.plate_io import read_plate, write_exr_32f
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. A1, A2, A3 invariance tests on graded plate + light + polygon mask + sky/ground gain
+            src_exr = os.path.join(tmpdir, "grade_plate.exr")
+            img = np.full((128, 256, 3), 0.30, dtype=np.float32)
+            img[52:76, 108:148, :] = 50.0
+            write_exr_32f(src_exr, img, output_colorspace="Linear Rec.709")
+
+            w = HDRIMakerWidget(restore_session=False)
+            w.plate_path_edit.setText(src_exr)
+            w._on_analyze_clicked()
+            w.ev_spin.setValue(-2.0)
+            w.sky_gain_spin.setValue(2.0)
+            w.gnd_gain_spin.setValue(1.6)
+            w._light_regions = [{"rect": (0.4, 0.38, 0.6, 0.62), "shape": "rect"}]
+            w._poly_masks = [
+                {
+                    "points": [[0.05, 0.10], [0.25, 0.10], [0.25, 0.40], [0.05, 0.40]],
+                    "enabled": True,
+                    "invert": True,
+                    "feather": 0.0,
+                    "blur": 0.0,
+                    "exposure_ev": 0.0,
+                    "saturation": 1.0,
+                    "gamma": 0.5,
+                    "temp_shift": 0.0,
+                    "gain_r": 1.0,
+                    "gain_g": 1.0,
+                    "gain_b": 1.0,
+                }
+            ]
+            w._regenerate_preview()
+
+            pre_light_mean = float(np.mean(w._extracted_lights[0][0]))
+            pre_bake_mean = float(np.mean(w._hdri_pixels))
+            self.assertGreater(pre_light_mean, 0.1)
+
+            # Exercise B2/B3 fast polygon cache & dirty-row brush preview before Bake
+            w._poly_masks[0]["gamma"] = 0.5
+            w._refresh_from_poly_cache()
+            w._on_brush_stroke_started(0.75, 0.5)
+            w._on_brush_stroke_moved(0.80, 0.5)
+            self.assertIsNotNone(w._cached_preview_srgb)
+            cached_copy = w._cached_preview_srgb.copy()
+            w._on_brush_stroke_finished()
+            self.assertTrue(np.array_equal(cached_copy, w._cached_preview_srgb))
+            pre_bake_after_brush = float(np.mean(w._hdri_pixels))
+
+            w._on_bake_edits_to_canvas()
+            post_light_mean = float(np.mean(w._baked_extracted_lights[0][0]))
+            post_bake_mean = float(np.mean(w._hdri_pixels))
+            self.assertAlmostEqual(post_light_mean / pre_light_mean, 1.0, delta=0.02)
+            self.assertAlmostEqual(post_bake_mean / pre_bake_after_brush, 1.0, delta=0.01)
+            w._regenerate_preview(fast=True)
+            self.assertGreater(len(w._baked_mip_cache), 0)
+            w.close()
+
+            # 2. A5 & A6: 8K equirectangular sun flux conservation + native 8K detail preservation post-bake
+            exr_8k = os.path.join(tmpdir, "env_8k.exr")
+            h8, w8 = 4096, 8192
+            env = np.full((h8, w8, 3), 0.20, dtype=np.float32)
+            # High-frequency alternating 1-pixel columns in an equatorial patch + bright 4x4 sun core
+            yy, xx = np.meshgrid(np.arange(1900, 2100), np.arange(3800, 4000), indexing="ij")
+            env[1900:2100, 3800:4000, :] = np.where((xx + yy) % 2 == 0, 0.80, 0.10)[..., None]
+            env[1020:1024, 2044:2048, :] = 400.0
+            write_exr_32f(exr_8k, env, output_colorspace="Linear Rec.709", compression="zips")
+
+            w8k = HDRIMakerWidget(restore_session=False)
+            w8k.plate_path_edit.setText(exr_8k)
+            idx_8k = w8k.res_combo.findText("8192 x 4096")
+            if idx_8k >= 0:
+                w8k.res_combo.setCurrentIndex(idx_8k)
+            w8k._on_analyze_clicked()
+
+            src_mean_lum = float(np.mean(0.2126 * env[..., 0] + 0.7152 * env[..., 1] + 0.0722 * env[..., 2]))
+            prev_mean_lum = float(
+                np.mean(0.2126 * w8k._hdri_pixels[..., 0] + 0.7152 * w8k._hdri_pixels[..., 1] + 0.0722 * w8k._hdri_pixels[..., 2])
+            )
+            self.assertAlmostEqual(prev_mean_lum / src_mean_lum, 1.0, delta=0.01)
+
+            w8k._brush_strokes.append(
+                {
+                    "mode": "clone",
+                    "radius_u": 0.02,
+                    "softness": 0.5,
+                    "strength": 1.0,
+                    "src_offset": [0.2, 0.0],
+                    "points": [[0.1, 0.5]],
+                }
+            )
+            w8k._on_bake_edits_to_canvas()
+            out_8k = os.path.join(tmpdir, "out_8k.exr")
+            w8k.out_path_edit.setText(out_8k)
+            written_8k = w8k._on_export_exr()
+            self.assertIsNotNone(written_8k)
+            rep = read_plate(written_8k, colorspace="Linear Rec.709", max_dim=None)
+            self.assertEqual(rep.pixels.shape[:2], (4096, 8192))
+            # Native 8K replay must preserve the crisp 1-pixel checkerboard (upsampled 4K would have ~0 std)
+            patch_std = float(np.std(rep.pixels[1900:2100, 3800:4000, 0]))
+            self.assertGreater(patch_std, 0.20)
+            w8k.close()
+        app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

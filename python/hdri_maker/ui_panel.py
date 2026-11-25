@@ -60,6 +60,7 @@ from .lighting_analyzer import (
 from .plate_io import (
     batch_merge_bracket_groups,
     detect_circular_fisheye,
+    downsample_image,
     group_bracket_sequences,
     inspect_bracket_paths,
     is_equirectangular_image,
@@ -2347,6 +2348,19 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._display_timer.setSingleShot(True)
         self._display_timer.setInterval(30)
         self._display_timer.timeout.connect(self._update_preview_pixmap)
+        self._poly_preview_timer = QtCore.QTimer(self)
+        self._poly_preview_timer.setSingleShot(True)
+        self._poly_preview_timer.setInterval(25)
+        self._poly_preview_timer.timeout.connect(self._refresh_from_poly_cache)
+        self._telemetry_timer = QtCore.QTimer(self)
+        self._telemetry_timer.setSingleShot(True)
+        self._telemetry_timer.setInterval(140)
+        self._telemetry_timer.timeout.connect(self._refresh_telemetry_label)
+        self._baked_mip_src: Optional[np.ndarray] = None
+        self._baked_mip_cache: Dict[tuple, np.ndarray] = {}
+        self._pre_poly_hdri: Optional[np.ndarray] = None
+        self._cached_preview_srgb: Optional[np.ndarray] = None
+        self._cached_preview_meta: Optional[tuple] = None
         self._rough_cache: Optional[tuple] = None
         self._raw_rough_cache: Optional[tuple] = None
 
@@ -2961,12 +2975,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _schedule_preview_update(self, *_args) -> None:
         """Debounce live preview regeneration: instant low-res drag, crisp 2K on settle."""
         if self._profile is not None and not self._suppress_auto_preview:
+            if not self._preview_fast_timer.isActive():
+                self._preview_fast_timer.start()
             if self._baked_canvas_hdri is not None:
-                self._preview_timer.setInterval(60)
+                self._preview_timer.setInterval(80)
                 self._preview_timer.start()
             else:
-                if not self._preview_fast_timer.isActive():
-                    self._preview_fast_timer.start()
                 self._preview_timer.setInterval(200)
                 self._preview_timer.start()
 
@@ -5580,7 +5594,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _on_poly_mask_points_changed(self, idx: int, pts: list) -> None:
         if 0 <= idx < len(self._poly_masks) and len(pts) >= 3:
             self._poly_masks[idx]["points"] = [[float(p[0]), float(p[1])] for p in pts if len(p) >= 2]
-            self._regenerate_preview()
+            self._refresh_from_poly_cache()
             self._commit_undo_baseline()
             self._refresh_undo_ui()
             self.status_label.setText(f"Updated Polygon Mask #{idx + 1} vertex positions.")
@@ -5637,7 +5651,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             m["gain_b"] = float(self.poly_b_spin.value())
             m["feather"] = float(self.poly_feather_spin.value())
             m["blur"] = float(self.poly_blur_spin.value())
-            self._schedule_preview_update()
+            if self._pre_poly_hdri is not None:
+                self._poly_preview_timer.start()
+            else:
+                self._schedule_preview_update()
 
     def _on_desaturate_poly_mask(self) -> None:
         self.poly_sat_spin.setValue(0.0)
@@ -5666,7 +5683,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._poly_masks.pop(self._selected_poly_idx)
         self._selected_poly_idx = min(self._selected_poly_idx, len(self._poly_masks) - 1)
         self._refresh_poly_mask_ui()
-        self._regenerate_preview()
+        self._refresh_from_poly_cache()
 
     def _on_clear_poly_masks(self) -> None:
         if not self._poly_masks:
@@ -5674,7 +5691,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._poly_masks.clear()
         self._selected_poly_idx = -1
         self._refresh_poly_mask_ui()
-        self._regenerate_preview()
+        self._refresh_from_poly_cache()
 
     def _on_toggle_brush_mode(self, checked: bool) -> None:
         if checked:
@@ -5772,7 +5789,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         if self._pre_brush_hdri is None:
             self._pre_brush_hdri = self._hdri_pixels.copy()
         self._brush_undo_stack.append(self._hdri_pixels.copy())
-        if len(self._brush_undo_stack) > 15:
+        if len(self._brush_undo_stack) > 6:
             self._brush_undo_stack.pop(0)
         pm_spec = self._active_brush_poly_mask_spec()
         if pm_spec is not None:
@@ -5804,7 +5821,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             alpha_mask=self._active_brush_alpha_mask,
         )
         self._rough_cache = None
-        self._update_preview_pixmap()
+        self._update_preview_brush_dab_fast(v, radius_u)
 
     def _on_brush_stroke_moved(self, u: float, v: float) -> None:
         if self._hdri_pixels is None or self._active_brush_stroke is None:
@@ -5828,7 +5845,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             alpha_mask=getattr(self, "_active_brush_alpha_mask", None),
         )
         self._rough_cache = None
-        self._update_preview_pixmap()
+        self._update_preview_brush_dab_fast(v, self._active_brush_stroke["radius_u"])
 
     def _on_brush_stroke_finished(self) -> None:
         if self._active_brush_stroke is not None:
@@ -5839,6 +5856,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._active_brush_stroke = None
             self._active_brush_alpha_mask = None
             self._brush_clone_offset_uv = None
+            self._update_preview_pixmap(update_telemetry=True)
             self._commit_undo_baseline()
             self._refresh_undo_ui()
             self.status_label.setText(f"Applied brush stroke ({len(self._brush_strokes)} total).")
@@ -5879,11 +5897,89 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._refresh_light_toolbar_visibility()
         self.status_label.setText("Cleared all brush strokes.")
 
+    @staticmethod
+    def _capture_post_grade_dict(p: HDRISynthesisParams) -> Dict[str, Any]:
+        return {
+            "exposure_ev": float(p.exposure_ev),
+            "sky_gain": float(p.sky_gain),
+            "ground_gain": float(p.ground_gain),
+            "temperature_kelvin": float(p.temperature_kelvin),
+            "temperature_blend": float(p.temperature_blend),
+            "wb_gains": [float(c) for c in (p.wb_gains or (1.0, 1.0, 1.0))],
+            "saturation": float(p.saturation),
+            "highlight_recovery": float(p.highlight_recovery),
+            "nadir_cleanup": float(p.nadir_cleanup),
+            "neutralize_environment": bool(p.neutralize_environment),
+            "hdri_blur": float(p.hdri_blur),
+            "sun_reconstruct": float(getattr(p, "sun_reconstruct", 0.0)),
+            "peak_white_target": float(getattr(p, "peak_white_target", 0.0)),
+            "peak_white_knee": float(getattr(p, "peak_white_knee", 0.5)),
+        }
+
+    @staticmethod
+    def _params_from_post_grade(pg: Optional[Dict[str, Any]], width: int, height: int) -> HDRISynthesisParams:
+        if not isinstance(pg, dict):
+            return HDRISynthesisParams(width=width, height=height)
+        wb = pg.get("wb_gains") or (1.0, 1.0, 1.0)
+        wb_tuple = (float(wb[0]), float(wb[1]), float(wb[2])) if len(wb) == 3 else (1.0, 1.0, 1.0)
+        return HDRISynthesisParams(
+            width=width,
+            height=height,
+            azimuth_offset_deg=0.0,
+            exposure_ev=float(pg.get("exposure_ev", 0.0)),
+            sky_gain=float(pg.get("sky_gain", 1.0)),
+            ground_gain=float(pg.get("ground_gain", 1.0)),
+            temperature_kelvin=float(pg.get("temperature_kelvin", 0.0)),
+            temperature_blend=float(pg.get("temperature_blend", 0.0)),
+            wb_gains=wb_tuple,
+            saturation=float(pg.get("saturation", 1.0)),
+            highlight_recovery=float(pg.get("highlight_recovery", 0.0)),
+            nadir_cleanup=float(pg.get("nadir_cleanup", 0.0)),
+            neutralize_environment=bool(pg.get("neutralize_environment", False)),
+            hdri_blur=float(pg.get("hdri_blur", 0.0)),
+            sun_reconstruct=float(pg.get("sun_reconstruct", 0.0)),
+            peak_white_target=float(pg.get("peak_white_target", 0.0)),
+            peak_white_knee=float(pg.get("peak_white_knee", 0.5)),
+        )
+
+    def _compute_poly_gamma_scale(
+        self,
+        baked: np.ndarray,
+        p: HDRISynthesisParams,
+        polys: List[Dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        """Compute multiplicative post-grade factor map when baking polygon masks with non-unit gamma."""
+        if not any(isinstance(m, dict) and m.get("enabled", True) and abs(float(m.get("gamma", 1.0)) - 1.0) > 1e-4 for m in polys):
+            return None
+        needs_map = (
+            abs(p.sky_gain - 1.0) > 1e-4
+            or abs(p.ground_gain - 1.0) > 1e-4
+            or (p.temperature_kelvin > 0.0 and p.temperature_blend > 0.0)
+            or (p.wb_gains is not None and max(abs(c - 1.0) for c in p.wb_gains) > 1e-4)
+        )
+        if not needs_map:
+            return None
+        mult_p = HDRISynthesisParams(
+            width=baked.shape[1],
+            height=baked.shape[0],
+            azimuth_offset_deg=0.0,
+            exposure_ev=p.exposure_ev,
+            sky_gain=p.sky_gain,
+            ground_gain=p.ground_gain,
+            temperature_kelvin=p.temperature_kelvin,
+            temperature_blend=p.temperature_blend,
+            wb_gains=p.wb_gains,
+        )
+        graded_ref = apply_post_adjustments_to_hdri(baked, mult_p, self._profile)
+        return np.clip(graded_ref / np.maximum(baked, 1e-5), 1e-4, 1e4).astype(np.float32)
+
     def _on_bake_edits_to_canvas(self) -> None:
         if self._profile is None:
             self.status_label.setText("Analyze a plate first before baking edits.")
             return
         try:
+            from dataclasses import replace as _dc_replace
+
             # Ensure no interactive pick/brush button remains stuck checked after collapsing
             for btn in (
                 self.pick_sky_btn,
@@ -5950,15 +6046,31 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._baked_azimuth_offset_deg = float(p.azimuth_offset_deg)
             newly_extracted: List[tuple] = []
             if self._light_regions:
-                baked, newly_extracted = extract_and_inpaint_multiple_hotspots(
-                    baked,
+                post_for_lights = _dc_replace(p, width=baked.shape[1], height=baked.shape[0], azimuth_offset_deg=0.0)
+                graded_for_lights = apply_post_adjustments_to_hdri(baked, post_for_lights, self._profile)
+                _, newly_extracted = extract_and_inpaint_multiple_hotspots(
+                    graded_for_lights,
                     self._light_regions,
                     light_tex_size=self._current_light_tex_size(),
+                    inpaint_hdri=False,
+                    region_blur=0.0,
+                )
+                baked, _ = extract_and_inpaint_multiple_hotspots(
+                    baked,
+                    self._light_regions,
+                    light_tex_size=(16, 16),
                     inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                     region_blur=self.light_blur_slider.value(),
                 )
+            poly_scale = self._compute_poly_gamma_scale(baked, p, self._poly_masks) if self._poly_masks else None
+            post_grade = self._capture_post_grade_dict(p) if (self._light_regions or poly_scale is not None) else None
             if self._poly_masks:
-                baked = apply_polygon_masks(baked, self._poly_masks)
+                baked = apply_polygon_masks(
+                    baked,
+                    self._poly_masks,
+                    working_ev=float(p.exposure_ev),
+                    working_scale=poly_scale,
+                )
             if self._brush_strokes:
                 baked = apply_brush_strokes(baked, self._brush_strokes)
 
@@ -5989,6 +6101,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         {"rect": list(r["rect"]), "shape": r.get("shape", "rect")}
                         for r in self._light_regions
                     ],
+                    "post_grade": post_grade,
+                    "working_ev": float(p.exposure_ev),
                     "poly_masks": json.loads(json.dumps(self._poly_masks)),
                     "brush_strokes": json.loads(json.dumps(self._brush_strokes)),
                     "remove_hotspot": bool(self.remove_hotspot_chk.isChecked()),
@@ -6006,6 +6120,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._extracted_lights = list(self._baked_extracted_lights)
                 self._last_light_exr_paths = []
             self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
+            self._baked_mip_src = None
+            self._baked_mip_cache.clear()
+            self._pre_poly_hdri = None
             self._sky_rect = None
             self._ground_rect = None
             self._light_regions.clear()
@@ -6054,6 +6171,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._baked_azimuth_offset_deg = 0.0
             self._baked_extracted_lights.clear()
             self._baked_ops.clear()
+        self._baked_mip_src = None
+        self._baked_mip_cache.clear()
+        self._pre_poly_hdri = None
         self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         self._refresh_poly_mask_ui()
         has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
@@ -6236,6 +6356,20 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._bake_history.pop(0)
         self._baked_canvas_hdri = np.ascontiguousarray(dlg.result_hdri, dtype=np.float32)
         self._baked_azimuth_offset_deg = float(self.yaw_spin.value())
+        if getattr(dlg, "_patch", None) is not None:
+            self._baked_ops.append(
+                {
+                    "kind": "pole_patch",
+                    "pole": dlg._current_pole(),
+                    "fov_deg": float(dlg.fov_spin.value()),
+                    "feather": 0.20,
+                    "patch": dlg._patch.copy(),
+                    "azimuth_offset_deg": float(self.yaw_spin.value()),
+                }
+            )
+        self._baked_mip_src = None
+        self._baked_mip_cache.clear()
+        self._pre_poly_hdri = None
         self.unbake_edits_btn.setEnabled(True)
         self.unbake_edits_btn.setText(f"Unbake ({len(self._bake_history)})")
         self._regenerate_preview()
@@ -6603,15 +6737,68 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.hotspot_table.setItem(row, col, item)
 
-    def _render_from_baked_canvas(self, p: HDRISynthesisParams, apply_regions: bool = True) -> np.ndarray:
+    def _get_baked_mip(self, width: int, height: int, src_canvas: Optional[np.ndarray] = None) -> np.ndarray:
+        """Return a cached downsampled proxy of `_baked_canvas_hdri` for instant slider/preview updates."""
+        base_canvas = src_canvas if src_canvas is not None else self._baked_canvas_hdri
+        if base_canvas is None:
+            return None
+        sh, sw = base_canvas.shape[:2]
+        tw, th = int(width), int(height)
+        if (sh, sw) == (th, tw):
+            return base_canvas
+        if src_canvas is not None:
+            # One-off resolution (e.g. native 8K replay export)
+            if sh > th and sw > tw and (th * sw == sh * tw):
+                ds = downsample_image(base_canvas, max_dim=max(th, tw))
+                if ds.shape[:2] == (th, tw):
+                    return np.ascontiguousarray(ds, dtype=np.float32)
+            return base_canvas
+        if self._baked_mip_src is not self._baked_canvas_hdri:
+            self._baked_mip_src = self._baked_canvas_hdri
+            self._baked_mip_cache.clear()
+        key = (th, tw)
+        cached = self._baked_mip_cache.get(key)
+        if cached is not None:
+            return cached
+        if sh == 2 * th and sw == 2 * tw:
+            mip = np.ascontiguousarray(
+                (
+                    base_canvas[0::2, 0::2]
+                    + base_canvas[0::2, 1::2]
+                    + base_canvas[1::2, 0::2]
+                    + base_canvas[1::2, 1::2]
+                )
+                * np.float32(0.25),
+                dtype=np.float32,
+            )
+        elif sh > th and sw > tw and (th * sw == sh * tw):
+            ds = downsample_image(base_canvas, max_dim=max(th, tw))
+            mip = ds if ds.shape[:2] == (th, tw) else apply_post_adjustments_to_hdri(base_canvas, HDRISynthesisParams(width=tw, height=th), None)
+        else:
+            mip = apply_post_adjustments_to_hdri(base_canvas, HDRISynthesisParams(width=tw, height=th), None)
+        mip = np.ascontiguousarray(mip, dtype=np.float32)
+        if len(self._baked_mip_cache) >= 4:
+            self._baked_mip_cache.pop(next(iter(self._baked_mip_cache)))
+        self._baked_mip_cache[key] = mip
+        return mip
+
+    def _render_from_baked_canvas(
+        self,
+        p: HDRISynthesisParams,
+        apply_regions: bool = True,
+        override_canvas: Optional[np.ndarray] = None,
+        override_az: Optional[float] = None,
+    ) -> np.ndarray:
         """Render from `_baked_canvas_hdri` while keeping live Sky/Ground selections & post-adjustments responsive."""
         from dataclasses import replace as _dc_replace
 
-        delta_yaw = float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg)
+        src_canvas = self._get_baked_mip(p.width, p.height, src_canvas=override_canvas)
+        base_az = float(self._baked_azimuth_offset_deg if override_az is None else override_az)
+        delta_yaw = float(p.azimuth_offset_deg) - base_az
         if apply_regions and (self._sky_rect is not None or self._ground_rect is not None):
             # Resize & apply delta yaw first so live Sky/Ground UV rects match the current canvas
             pre_p = HDRISynthesisParams(width=p.width, height=p.height, azimuth_offset_deg=delta_yaw)
-            base = apply_post_adjustments_to_hdri(self._baked_canvas_hdri, pre_p, self._profile)
+            base = apply_post_adjustments_to_hdri(src_canvas, pre_p, self._profile)
             base = apply_sky_ground_inpaint_to_hdri(
                 base,
                 sky_rect=self._sky_rect,
@@ -6624,13 +6811,35 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             post_p = _dc_replace(p, azimuth_offset_deg=0.0)
             return apply_post_adjustments_to_hdri(base, post_p, self._profile)
         post_p = _dc_replace(p, azimuth_offset_deg=delta_yaw)
-        return apply_post_adjustments_to_hdri(self._baked_canvas_hdri, post_p, self._profile)
+        return apply_post_adjustments_to_hdri(src_canvas, post_p, self._profile)
+
+    def _refresh_from_poly_cache(self) -> None:
+        """Fast interactive update when polygon mask sliders/vertices change without rebuilding base HDRI."""
+        if self._pre_poly_hdri is None or self._profile is None:
+            self._regenerate_preview(fast=False)
+            return
+        try:
+            hdri = (
+                apply_polygon_masks(self._pre_poly_hdri, self._poly_masks)
+                if self._poly_masks
+                else self._pre_poly_hdri.copy()
+            )
+            self._pre_brush_hdri = hdri.copy()
+            self._brush_undo_stack.clear()
+            if self._brush_strokes:
+                hdri = apply_brush_strokes(hdri, self._brush_strokes)
+            self._hdri_pixels = hdri
+            self._rough_cache = None
+            self._update_preview_pixmap(update_telemetry=False)
+            self._telemetry_timer.start()
+        except Exception as exc:
+            self._log_debug(f"Poly cache refresh error: {exc}")
 
     def _regenerate_preview(self, fast: bool = False) -> None:
         if self._profile is None:
             return
         try:
-            # Crisp 2K preview (or 640x320 during interactive plate dragging)
+            # Crisp 2K preview (or 400x200 during interactive plate/slider dragging)
             p = self._current_synthesis_params()
             if fast:
                 p.width = min(p.width, 400)
@@ -6663,12 +6872,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             elif not self._light_regions:
                 self._extracted_lights = list(self._baked_extracted_lights)
             if not fast:
+                self._pre_poly_hdri = hdri.copy()
                 if self._poly_masks:
                     hdri = apply_polygon_masks(hdri, self._poly_masks)
                 self._pre_brush_hdri = hdri.copy()
                 self._brush_undo_stack.clear()
                 if self._brush_strokes:
                     hdri = apply_brush_strokes(hdri, self._brush_strokes)
+            else:
+                self._pre_poly_hdri = None
             self._hdri_pixels = hdri
             if hasattr(self, "ab_split_btn") and self.ab_split_btn.isChecked() and not fast:
                 raw_p = HDRISynthesisParams(
@@ -6691,103 +6903,33 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 self._raw_hdri_pixels = None
             if not fast:
                 self._log_debug("Updating preview pixmap...")
-            self._update_preview_pixmap()
+            self._update_preview_pixmap(update_telemetry=not fast)
             if not fast:
                 self._log_debug("Preview pixmap updated.")
         except Exception as exc:
             self._log_debug(f"Preview generation error: {exc}\n{traceback.format_exc()}")
             self.status_label.setText(f"Preview error: {exc}")
 
-    def _update_preview_pixmap(self) -> None:
-        if self._hdri_pixels is None:
+    def _refresh_telemetry_label(self) -> None:
+        if self._hdri_pixels is None or not hasattr(self, "telemetry_label"):
             return
-        if hasattr(self, "telemetry_label"):
-            st = compute_hdri_stats(self._hdri_pixels)
-            pr, pg, pb = st["max_rgb"]
-            self.telemetry_label.setText(
-                f"HDRI Telemetry: Peak RGB ({pr:.1f}, {pg:.1f}, {pb:.1f}) | "
-                f"Max Lum: {st['max_lum']:.1f} | Mean: {st['mean_lum']:.3f} | "
-                f"18% Ball: {st['gray_ball_lum']:.3f} | DR: {st['dynamic_range_stops']:.1f} EV"
-            )
-        ev = self.preview_ev_slider.value() / 10.0
-        self.preview_ev_val.setText(f"{ev:+.1f} EV")
-        tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
-        if tm_mode == "Overlap Diff" and self._views:
-            enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
-            diff_rgb = compute_overlap_difference_map(
-                enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
-                out_width=min(1024, self._hdri_pixels.shape[1]),
-                out_height=min(512, self._hdri_pixels.shape[0]),
-                azimuth_offset_deg=self.yaw_spin.value(),
-                vertical_shift_deg=self.vshift_spin.value(),
-            )
-            srgb = np.clip(diff_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
-        else:
-            rough = (self.preview_roughness_slider.value() / 100.0) if hasattr(self, "preview_roughness_slider") else 0.0
-            if hasattr(self, "preview_roughness_val"):
-                self.preview_roughness_val.setText(f"{rough:.2f}")
-
-            def _get_display_src(arr: np.ndarray, cache_attr: str, rough_val: float) -> np.ndarray:
-                cached = getattr(self, cache_attr, None)
-                arr_id = id(arr)
-                if cached is not None and cached[0] == arr_id and abs(cached[1] - rough_val) < 1e-4:
-                    return cached[2]
-                sh, sw = arr.shape[:2]
-                # Cap display buffer at 1024x512 (or 320x160 when roughness blur > 0) for instant EV/Rough dragging
-                max_w = 320 if rough_val > 1e-3 else 1024
-                if sw > max_w:
-                    step = max(1, sw // max_w)
-                    disp = arr[::step, ::step]
-                else:
-                    disp = arr
-                if rough_val > 1e-3:
-                    from .hdri_generator import blur_latlong_hdri
-                    disp = blur_latlong_hdri(disp, blur_amount=min(1.0, (rough_val ** 1.45) * 0.85))
-                setattr(self, cache_attr, (arr_id, rough_val, disp))
-                return disp
-
-            disp_src = _get_display_src(self._hdri_pixels, "_rough_cache", rough)
-            if tm_mode == "Lookdev Spheres":
-                srgb = render_lookdev_sphere_preview_srgb(
-                    disp_src,
-                    width=960,
-                    height=480,
-                    yaw_deg=0.0,
-                    pitch_deg=0.0,
-                    exposure_ev=ev,
-                    tonemap="ACES",
-                )
-            else:
-                srgb = render_preview_srgb(
-                    disp_src,
-                    preview_ev=ev,
-                    tonemap=tm_mode,
-                    roughness_preview=0.0,
-                )
-            if (
-                hasattr(self, "ab_split_btn")
-                and self.ab_split_btn.isChecked()
-                and getattr(self, "_raw_hdri_pixels", None) is not None
-            ):
-                raw_disp_src = _get_display_src(self._raw_hdri_pixels, "_raw_rough_cache", rough)
-                raw_srgb = render_preview_srgb(
-                    raw_disp_src,
-                    preview_ev=ev,
-                    tonemap=tm_mode,
-                    roughness_preview=0.0,
-                )
-                rh, rw, _ = raw_srgb.shape
-                rqimg = QtGui.QImage(raw_srgb.data, rw, rh, 3 * rw, QtGui.QImage.Format_RGB888)
-                self.preview_label.set_ab_split(True, QtGui.QPixmap.fromImage(rqimg.copy()))
-            else:
-                self.preview_label.set_ab_split(False)
-        self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
-        self.preview_label.set_plate_overlay(
-            self._views if len(self._views) <= 12 else self._views[:1],
-            self._selected_plate_idx,
-            self.yaw_spin.value(),
-            self.vshift_spin.value(),
+        st = compute_hdri_stats(self._hdri_pixels)
+        pr, pg, pb = st["max_rgb"]
+        self.telemetry_label.setText(
+            f"HDRI Telemetry: Peak RGB ({pr:.1f}, {pg:.1f}, {pb:.1f}) | "
+            f"Max Lum: {st['max_lum']:.1f} | Mean: {st['mean_lum']:.3f} | "
+            f"18% Ball: {st['gray_ball_lum']:.3f} | DR: {st['dynamic_range_stops']:.1f} EV"
         )
+
+    def _finish_preview_pixmap_upload(self, srgb: np.ndarray, refresh_overlays: bool = True) -> None:
+        if refresh_overlays:
+            self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
+            self.preview_label.set_plate_overlay(
+                self._views if len(self._views) <= 12 else self._views[:1],
+                self._selected_plate_idx,
+                self.yaw_spin.value(),
+                self.vshift_spin.value(),
+            )
         h, w, _ = srgb.shape
         qimg = QtGui.QImage(srgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg.copy())
@@ -6830,6 +6972,139 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             painter.end()
 
         self.preview_label.set_source_pixmap(pix)
+
+    def _update_preview_brush_dab_fast(self, v_center: float, radius_u: float) -> None:
+        """Retonemap only the dirty row band touched by a live brush dab (60 FPS 8K/2K painting)."""
+        if self._hdri_pixels is None:
+            return
+        ev = self.preview_ev_slider.value() / 10.0
+        tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
+        rough = (self.preview_roughness_slider.value() / 100.0) if hasattr(self, "preview_roughness_slider") else 0.0
+        if (
+            rough > 1e-3
+            or tm_mode in ("Overlap Diff", "Lookdev Spheres")
+            or (hasattr(self, "ab_split_btn") and self.ab_split_btn.isChecked())
+            or self._cached_preview_srgb is None
+        ):
+            self._update_preview_pixmap(update_telemetry=False)
+            return
+
+        sh, sw = self._hdri_pixels.shape[:2]
+        step = max(1, sw // 1024) if sw > 1024 else 1
+        disp = self._hdri_pixels[::step, ::step] if step > 1 else self._hdri_pixels
+        dh, dw = disp.shape[:2]
+        meta = (dh, dw, round(ev, 4), tm_mode, 0.0)
+        if self._cached_preview_meta != meta or self._cached_preview_srgb.shape[:2] != (dh, dw):
+            self._update_preview_pixmap(update_telemetry=False)
+            return
+
+        cy = int(round(float(np.clip(v_center, 0.0, 1.0)) * max(1, dh - 1)))
+        ry_disp = int(math.ceil(float(np.clip(radius_u, 0.002, 0.25)) * float(dw))) + 6
+        dy0 = max(0, cy - ry_disp)
+        dy1 = min(dh, cy + ry_disp + 1)
+        if dy1 > dy0:
+            self._cached_preview_srgb[dy0:dy1, :] = render_preview_srgb(
+                disp[dy0:dy1, :],
+                preview_ev=ev,
+                tonemap=tm_mode,
+                roughness_preview=0.0,
+            )
+        self._finish_preview_pixmap_upload(self._cached_preview_srgb, refresh_overlays=False)
+        self._telemetry_timer.start()
+
+    def _update_preview_pixmap(self, update_telemetry: bool = True) -> None:
+        if self._hdri_pixels is None:
+            return
+        if update_telemetry:
+            self._telemetry_timer.stop()
+            self._refresh_telemetry_label()
+        else:
+            self._telemetry_timer.start()
+        ev = self.preview_ev_slider.value() / 10.0
+        self.preview_ev_val.setText(f"{ev:+.1f} EV")
+        tm_mode = self.preview_tonemap_combo.currentText() if hasattr(self, "preview_tonemap_combo") else "aces"
+        if tm_mode == "Overlap Diff" and self._views:
+            enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
+            diff_rgb = compute_overlap_difference_map(
+                enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
+                out_width=min(1024, self._hdri_pixels.shape[1]),
+                out_height=min(512, self._hdri_pixels.shape[0]),
+                azimuth_offset_deg=self.yaw_spin.value(),
+                vertical_shift_deg=self.vshift_spin.value(),
+            )
+            srgb = np.clip(diff_rgb * 255.0, 0.0, 255.0).astype(np.uint8)
+            self._cached_preview_srgb = None
+            self._cached_preview_meta = None
+        else:
+            rough = (self.preview_roughness_slider.value() / 100.0) if hasattr(self, "preview_roughness_slider") else 0.0
+            if hasattr(self, "preview_roughness_val"):
+                self.preview_roughness_val.setText(f"{rough:.2f}")
+
+            def _get_display_src(arr: np.ndarray, cache_attr: str, rough_val: float) -> np.ndarray:
+                cached = getattr(self, cache_attr, None)
+                arr_id = id(arr)
+                if cached is not None and cached[0] == arr_id and abs(cached[1] - rough_val) < 1e-4:
+                    return cached[2]
+                sh, sw = arr.shape[:2]
+                # Cap display buffer at 1024x512 (or 320x160 when roughness blur > 0) for instant EV/Rough dragging
+                max_w = 320 if rough_val > 1e-3 else 1024
+                if sw > max_w:
+                    step = max(1, sw // max_w)
+                    disp = arr[::step, ::step]
+                else:
+                    disp = arr
+                if rough_val > 1e-3:
+                    from .hdri_generator import blur_latlong_hdri
+                    disp = blur_latlong_hdri(disp, blur_amount=min(1.0, (rough_val ** 1.45) * 0.85))
+                setattr(self, cache_attr, (arr_id, rough_val, disp))
+                return disp
+
+            disp_src = _get_display_src(self._hdri_pixels, "_rough_cache", rough)
+            if tm_mode == "Lookdev Spheres":
+                srgb = render_lookdev_sphere_preview_srgb(
+                    disp_src,
+                    width=960,
+                    height=480,
+                    yaw_deg=0.0,
+                    pitch_deg=0.0,
+                    exposure_ev=ev,
+                    tonemap="ACES",
+                )
+                self._cached_preview_srgb = None
+                self._cached_preview_meta = None
+            else:
+                srgb = render_preview_srgb(
+                    disp_src,
+                    preview_ev=ev,
+                    tonemap=tm_mode,
+                    roughness_preview=0.0,
+                )
+                self._cached_preview_srgb = srgb.copy()
+                self._cached_preview_meta = (
+                    srgb.shape[0],
+                    srgb.shape[1],
+                    round(ev, 4),
+                    tm_mode,
+                    round(rough, 4),
+                )
+            if (
+                hasattr(self, "ab_split_btn")
+                and self.ab_split_btn.isChecked()
+                and getattr(self, "_raw_hdri_pixels", None) is not None
+            ):
+                raw_disp_src = _get_display_src(self._raw_hdri_pixels, "_raw_rough_cache", rough)
+                raw_srgb = render_preview_srgb(
+                    raw_disp_src,
+                    preview_ev=ev,
+                    tonemap=tm_mode,
+                    roughness_preview=0.0,
+                )
+                rh, rw, _ = raw_srgb.shape
+                rqimg = QtGui.QImage(raw_srgb.data, rw, rh, 3 * rw, QtGui.QImage.Format_RGB888)
+                self.preview_label.set_ab_split(True, QtGui.QPixmap.fromImage(rqimg.copy()))
+            else:
+                self.preview_label.set_ab_split(False)
+        self._finish_preview_pixmap_upload(srgb, refresh_overlays=True)
 
     def _on_export_sequence_exr(self) -> Optional[str]:
         if not self._frame_profiles:
@@ -6960,43 +7235,68 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 )
                 return out_path
             else:
-                if self._baked_canvas_hdri is not None:
-                    hdri = self._render_from_baked_canvas(params, apply_regions=True)
-                else:
-                    enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
-                    cs_in = self.colorspace_combo.currentText()
+                enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
+                cs_in = self.colorspace_combo.currentText()
 
+                def _reload_fullres_views(views_list):
+                    if params.width <= 4096 or not views_list:
+                        return views_list
+                    reloaded = []
+                    for v in views_list:
+                        if v.source_path and os.path.isfile(v.source_path) and max(v.pixels.shape[0], v.pixels.shape[1]) <= 4096:
+                            full_p = read_plate(v.source_path, colorspace=cs_in, max_dim=None)
+                            reloaded.append(
+                                PlateViewInput(
+                                    pixels=full_p.pixels,
+                                    is_hdr=full_p.is_hdr,
+                                    source_path=v.source_path,
+                                    fov_h_deg=v.fov_h_deg,
+                                    cam_azimuth_deg=v.cam_azimuth_deg,
+                                    cam_elevation_deg=v.cam_elevation_deg,
+                                    cam_roll_deg=v.cam_roll_deg,
+                                    scale_x=v.scale_x,
+                                    scale_y=v.scale_y,
+                                    warp_k1=v.warp_k1,
+                                    lens_type=v.lens_type,
+                                    exposure_ev=v.exposure_ev,
+                                    vignette_v1=v.vignette_v1,
+                                    weight=v.weight,
+                                    enabled=v.enabled,
+                                    exclude_rects=v.exclude_rects,
+                                )
+                            )
+                        else:
+                            reloaded.append(v)
+                    return reloaded
+
+                if self._baked_canvas_hdri is not None:
+                    can_replay_fullres = (
+                        params.width > self._baked_canvas_hdri.shape[1]
+                        and bool(self._baked_ops)
+                        and bool(enabled_views)
+                    )
+                    if can_replay_fullres:
+                        def _build_baked_fullres_export():
+                            export_views = _reload_fullres_views(enabled_views)
+                            baked_full, baked_az_full = self._replay_baked_canvas_at_resolution(
+                                params.width, params.height, export_views
+                            )
+                            return self._render_from_baked_canvas(
+                                params,
+                                apply_regions=True,
+                                override_canvas=baked_full,
+                                override_az=baked_az_full,
+                            )
+
+                        hdri = self._run_in_background(
+                            f"Replaying baked edits at native {params.width}x{params.height} 32-bit EXR...",
+                            _build_baked_fullres_export,
+                        )
+                    else:
+                        hdri = self._render_from_baked_canvas(params, apply_regions=True)
+                else:
                     def _build_export_hdri():
-                        export_views = enabled_views
-                        # Native Full-Res Pass-Through: when exporting > 4K (8K/16K), reload full-res source plates
-                        if params.width > 4096 and enabled_views:
-                            reloaded = []
-                            for v in enabled_views:
-                                if v.source_path and os.path.isfile(v.source_path) and max(v.pixels.shape[0], v.pixels.shape[1]) <= 4096:
-                                    full_p = read_plate(v.source_path, colorspace=cs_in, max_dim=None)
-                                    reloaded.append(
-                                        PlateViewInput(
-                                            pixels=full_p.pixels,
-                                            is_hdr=full_p.is_hdr,
-                                            source_path=v.source_path,
-                                            fov_h_deg=v.fov_h_deg,
-                                            cam_azimuth_deg=v.cam_azimuth_deg,
-                                            cam_elevation_deg=v.cam_elevation_deg,
-                                            cam_roll_deg=v.cam_roll_deg,
-                                            scale_x=v.scale_x,
-                                            scale_y=v.scale_y,
-                                            warp_k1=v.warp_k1,
-                                            lens_type=v.lens_type,
-                                            exposure_ev=v.exposure_ev,
-                                            vignette_v1=v.vignette_v1,
-                                            weight=v.weight,
-                                            enabled=v.enabled,
-                                            exclude_rects=v.exclude_rects,
-                                        )
-                                    )
-                                else:
-                                    reloaded.append(v)
-                            export_views = reloaded
+                        export_views = _reload_fullres_views(enabled_views)
                         return generate_latlong_hdri(
                             self._profile,
                             params,
@@ -7366,6 +7666,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._preview_fast_timer.stop()
         self._preview_timer.stop()
         self._display_timer.stop()
+        self._poly_preview_timer.stop()
+        self._telemetry_timer.stop()
         self._suppress_auto_preview = True
         try:
             self.multiview_table.setRowCount(0)
@@ -7376,6 +7678,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._raw_hdri_pixels = None
             self._baked_canvas_hdri = None
             self._baked_azimuth_offset_deg = 0.0
+            self._baked_mip_src = None
+            self._baked_mip_cache.clear()
+            self._pre_poly_hdri = None
+            self._cached_preview_srgb = None
+            self._cached_preview_meta = None
             self._pre_bake_snapshot = None
             self._bake_history.clear()
             self._baked_ops.clear()
@@ -7532,7 +7839,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "brush_strength": self.brush_strength_slider.value(),
             "brush_softness": self.brush_soft_slider.value(),
             "brush_clip_poly": self.brush_clip_poly_chk.isChecked(),
-            "baked_ops": list(self._baked_ops),
+            "baked_ops": [op for op in self._baked_ops if isinstance(op, dict) and op.get("kind", "bake") == "bake"],
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -7578,6 +7885,111 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._commit_undo_baseline()
         self._refresh_undo_ui()
 
+    def _replay_baked_canvas_at_resolution(
+        self,
+        target_w: int,
+        target_h: int,
+        export_views: List[PlateViewInput],
+    ) -> tuple:
+        """Replay `_baked_ops` at arbitrary export resolution (e.g. native 8K) without mutating UI light textures."""
+        p = self._current_synthesis_params()
+        baked = None
+        baked_az = 0.0
+        views_arg = export_views if (export_views and len(export_views) <= 12) else (export_views[:1] if export_views else None)
+        for op in self._baked_ops:
+            if not isinstance(op, dict):
+                continue
+            kind = op.get("kind", "bake")
+            op_az = float(op.get("azimuth_offset_deg", p.azimuth_offset_deg))
+            if kind == "pole_patch":
+                patch = op.get("patch")
+                if baked is not None and patch is not None:
+                    delta_yaw = op_az - baked_az
+                    if abs(delta_yaw) > 1e-4:
+                        shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
+                        if shift_px != 0:
+                            baked = np.roll(baked, shift_px, axis=1)
+                    baked_az = op_az
+                    baked = apply_pole_rectilinear_patch(
+                        baked,
+                        patch,
+                        pole=str(op.get("pole", "nadir")),
+                        fov_deg=float(op.get("fov_deg", 110.0)),
+                        feather=float(op.get("feather", 0.20)),
+                    )
+                continue
+            sr = op.get("sky_rect")
+            sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
+            gr = op.get("ground_rect")
+            ground_rect = tuple(gr) if (isinstance(gr, (list, tuple)) and len(gr) == 4) else None
+            if baked is None:
+                bake_p = HDRISynthesisParams(
+                    width=int(target_w),
+                    height=int(target_h),
+                    hotspot_boost=p.hotspot_boost,
+                    hotspot_softness=p.hotspot_softness,
+                    ambient_wrap=p.ambient_wrap,
+                    horizon_softness=p.horizon_softness,
+                    azimuth_offset_deg=op_az,
+                    plate_projection_blend=p.plate_projection_blend,
+                    vertical_shift_deg=p.vertical_shift_deg,
+                    stitch_blend=p.stitch_blend,
+                    ldr_highlight_boost=p.ldr_highlight_boost,
+                    enable_inpaint=p.enable_inpaint,
+                    sky_blend=float(op.get("sky_blend", p.sky_blend)),
+                    ground_blend=float(op.get("ground_blend", p.ground_blend)),
+                    sky_blur=float(op.get("sky_blur", p.sky_blur)),
+                    ground_blur=float(op.get("ground_blur", p.ground_blur)),
+                    sky_rect=sky_rect,
+                    ground_rect=ground_rect,
+                    light_rect=p.light_rect,
+                    remove_hotspot_from_hdri=bool(op.get("remove_hotspot", True)),
+                    physical_sky_fill=p.physical_sky_fill,
+                )
+                baked = generate_latlong_hdri(self._profile, bake_p, views=views_arg)
+                baked_az = op_az
+            else:
+                delta_yaw = op_az - baked_az
+                if abs(delta_yaw) > 1e-4:
+                    shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
+                    if shift_px != 0:
+                        baked = np.roll(baked, shift_px, axis=1)
+                baked_az = op_az
+                if sky_rect is not None or ground_rect is not None:
+                    baked = apply_sky_ground_inpaint_to_hdri(
+                        baked,
+                        sky_rect=sky_rect,
+                        ground_rect=ground_rect,
+                        sky_blend=float(op.get("sky_blend", p.sky_blend)),
+                        ground_blend=float(op.get("ground_blend", p.ground_blend)),
+                        sky_blur=float(op.get("sky_blur", p.sky_blur)),
+                        ground_blur=float(op.get("ground_blur", p.ground_blur)),
+                    )
+            op_lights = op.get("light_regions") or []
+            if op_lights:
+                baked, _ = extract_and_inpaint_multiple_hotspots(
+                    baked,
+                    op_lights,
+                    light_tex_size=(16, 16),
+                    inpaint_hdri=bool(op.get("remove_hotspot", True)),
+                    region_blur=float(op.get("light_region_blur", 0.0)),
+                )
+            op_polys = op.get("poly_masks") or []
+            if op_polys:
+                pg = op.get("post_grade")
+                pg_p = self._params_from_post_grade(pg, baked.shape[1], baked.shape[0]) if isinstance(pg, dict) else None
+                op_scale = self._compute_poly_gamma_scale(baked, pg_p, op_polys) if pg_p is not None else None
+                baked = apply_polygon_masks(
+                    baked,
+                    op_polys,
+                    working_ev=float(op.get("working_ev", 0.0)),
+                    working_scale=op_scale,
+                )
+            op_strokes = op.get("brush_strokes") or []
+            if op_strokes:
+                baked = apply_brush_strokes(baked, op_strokes)
+        return np.ascontiguousarray(baked, dtype=np.float32), baked_az
+
     def _replay_baked_ops(self) -> None:
         """Reconstruct `_baked_canvas_hdri` and `_baked_extracted_lights` from serialized `_baked_ops`."""
         if not self._baked_ops or self._profile is None:
@@ -7590,6 +8002,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             baked_lights: List[tuple] = []
             for idx, op in enumerate(self._baked_ops):
                 if not isinstance(op, dict):
+                    continue
+                if op.get("kind", "bake") != "bake":
                     continue
                 op_az = float(op.get("azimuth_offset_deg", p.azimuth_offset_deg))
                 sr = op.get("sky_rect")
@@ -7647,10 +8061,23 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 if op_lights:
                     tex_sz = op.get("light_tex_size", [512, 512])
                     tex_pair = (int(tex_sz[0]), int(tex_sz[1])) if len(tex_sz) == 2 else (512, 512)
-                    baked, newly_extracted = extract_and_inpaint_multiple_hotspots(
-                        baked,
+                    pg = op.get("post_grade")
+                    if isinstance(pg, dict):
+                        post_p = self._params_from_post_grade(pg, baked.shape[1], baked.shape[0])
+                        graded_src = apply_post_adjustments_to_hdri(baked, post_p, self._profile)
+                    else:
+                        graded_src = baked
+                    _, newly_extracted = extract_and_inpaint_multiple_hotspots(
+                        graded_src,
                         op_lights,
                         light_tex_size=tex_pair,
+                        inpaint_hdri=False,
+                        region_blur=0.0,
+                    )
+                    baked, _ = extract_and_inpaint_multiple_hotspots(
+                        baked,
+                        op_lights,
+                        light_tex_size=(16, 16),
                         inpaint_hdri=bool(op.get("remove_hotspot", True)),
                         region_blur=float(op.get("light_region_blur", 0.0)),
                     )
@@ -7658,13 +8085,24 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         baked_lights.extend(newly_extracted)
                 op_polys = op.get("poly_masks") or []
                 if op_polys:
-                    baked = apply_polygon_masks(baked, op_polys)
+                    pg = op.get("post_grade")
+                    pg_p = self._params_from_post_grade(pg, baked.shape[1], baked.shape[0]) if isinstance(pg, dict) else None
+                    op_scale = self._compute_poly_gamma_scale(baked, pg_p, op_polys) if pg_p is not None else None
+                    baked = apply_polygon_masks(
+                        baked,
+                        op_polys,
+                        working_ev=float(op.get("working_ev", 0.0)),
+                        working_scale=op_scale,
+                    )
                 op_strokes = op.get("brush_strokes") or []
                 if op_strokes:
                     baked = apply_brush_strokes(baked, op_strokes)
             if baked is not None:
                 self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
                 self._baked_azimuth_offset_deg = baked_az
+                self._baked_mip_src = None
+                self._baked_mip_cache.clear()
+                self._pre_poly_hdri = None
                 self._baked_extracted_lights = baked_lights
                 self.unbake_edits_btn.setEnabled(True)
                 self.unbake_edits_btn.setText("Unbake")
@@ -7675,6 +8113,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _apply_state_dict_inner(self, data: Dict[str, Any]) -> None:
         self._baked_canvas_hdri = None
         self._baked_azimuth_offset_deg = 0.0
+        self._baked_mip_src = None
+        self._baked_mip_cache.clear()
+        self._pre_poly_hdri = None
+        self._cached_preview_srgb = None
+        self._cached_preview_meta = None
         self._bake_history.clear()
         self._baked_extracted_lights.clear()
         self._extracted_lights.clear()
