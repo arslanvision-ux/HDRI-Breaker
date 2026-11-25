@@ -324,18 +324,26 @@ def _populate_domelight_node(
     _set_first_parm(dome, ("ry",), float(rotation_y_deg))
 
     if profile is not None and enable_color_temp:
-        _set_parm_control(dome, ("xn__inputsenableColorTemperature_control_pzb", "xn__inputsenableColorTemperature_control_r6a"))
+        _set_parm_control(dome, ("xn__inputsenableColorTemperature_control_pzb", "xn__inputsenableColorTemperature_control_r6a"), "set")
         _set_first_parm(
             dome,
             ("xn__inputsenableColorTemperature_omb", "xn__inputsenableColorTemperature_r6a", "enableColorTemperature"),
             1,
         )
-        _set_parm_control(dome, ("xn__inputscolorTemperature_control_xpb", "xn__inputscolorTemperature_control_v6a"))
+        _set_parm_control(dome, ("xn__inputscolorTemperature_control_xpb", "xn__inputscolorTemperature_control_v6a"), "set")
         _set_first_parm(
             dome,
             ("xn__inputscolorTemperature_wcb", "xn__inputscolorTemperature_v6a", "colorTemperature"),
             float(profile.overall_cct_kelvin),
         )
+    else:
+        _set_parm_control(dome, ("xn__inputsenableColorTemperature_control_pzb", "xn__inputsenableColorTemperature_control_r6a"), "none")
+        _set_first_parm(
+            dome,
+            ("xn__inputsenableColorTemperature_omb", "xn__inputsenableColorTemperature_r6a", "enableColorTemperature"),
+            0,
+        )
+        _set_parm_control(dome, ("xn__inputscolorTemperature_control_xpb", "xn__inputscolorTemperature_control_v6a"), "none")
 
     _configure_domelight_contributions(dome, contrib_mode)
     dome.moveToGoodPosition()
@@ -567,6 +575,8 @@ def create_hotspot_light_rig(
     parent_dome=None,
     rig_prefix: str = "hdri_maker_key",
     intensity_scale: float = 1.0,
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
 ):
     """
     Create Solaris distant/key LOP lights matching the extracted plate hotspots.
@@ -585,29 +595,31 @@ def create_hotspot_light_rig(
         light = _create_lop(stage, ("distantlight::2.0", "light::2.0", "distantlight"), name)
         _set_first_parm(light, ("primpath",), f"/lights/{name}")
 
-        # Point light from spherical (azimuth, elevation) toward origin
-        _set_first_parm(light, ("rx",), float(-hs.elevation_deg))
-        _set_first_parm(light, ("ry",), float(hs.azimuth_deg))
+        # Point light from spherical (azimuth, elevation) toward origin, matching USD DomeLight convention
+        eff_el = max(-89.0, min(89.0, float(hs.elevation_deg) + float(vertical_shift_deg)))
+        eff_az = -(float(hs.azimuth_deg) + float(azimuth_offset_deg))
+        _set_first_parm(light, ("rx",), float(-eff_el))
+        _set_first_parm(light, ("ry",), float(eff_az))
 
-        _set_parm_control(light, ("xn__inputsintensity_control_i5a",))
+        _set_parm_control(light, ("xn__inputsintensity_control_jeb", "xn__inputsintensity_control_i5a"))
         _set_first_parm(
             light,
-            ("xn__inputsintensity_i5a", "inputs:intensity", "intensity"),
+            ("xn__inputsintensity_i0a", "xn__inputsintensity_i5a", "inputs:intensity", "intensity"),
             float(hs.mean_intensity * intensity_scale),
         )
 
-        _set_parm_control(light, ("xn__inputscolor_control_i4a",))
+        _set_parm_control(light, ("xn__inputscolor_control_06a", "xn__inputscolor_control_i4a"))
         _set_first_parm_tuple(
             light,
-            ("xn__inputscolor_i4a", "inputs:color", "color"),
+            ("xn__inputscolor_zta", "xn__inputscolor_i4a", "inputs:color", "color"),
             hs.color_rgb,
         )
 
-        _set_parm_control(light, ("xn__inputsangle_control_e4a",))
+        _set_parm_control(light, ("xn__inputsangle_control_06a", "xn__inputsangle_control_e4a", "xn__inputsangle_control_f6a"))
         _set_first_parm(
             light,
-            ("xn__inputsangle_e4a", "inputs:angle", "angle"),
-            float(max(0.5, hs.radius_deg * 0.5)),
+            ("xn__inputsangle_zta", "xn__inputsangle_e4a", "xn__inputsangle_f6a", "inputs:angle", "angle"),
+            float(max(0.53, min(30.0, hs.radius_deg * 2.0))),
         )
 
         if prev_node is not None:
@@ -769,6 +781,7 @@ def _create_ground_shader_for_engine(
     is_shadow_catcher: bool,
     render_engine: str,
     vop_types,
+    ground_colorspace: str = "ACEScg",
 ) -> str:
     """Create the dedicated single-renderer ground_proj_mtl shader inside a Solaris Material Library."""
     eng = _normalize_render_engine(render_engine)
@@ -848,6 +861,8 @@ def _create_ground_shader_for_engine(
         ktex = ml.createNode("mtlximage", "ground_mtlx_col")
         _set_vop_parm(ktex, "signature", "color3")
         _set_vop_parm(ktex, "file", ground_tex)
+        if "aces" not in str(ground_colorspace).lower():
+            _set_vop_parm(ktex, "colorspace", "lin_rec709")
         _set_vop_parm(ktex, "uaddressmode", "clamp")
         _set_vop_parm(ktex, "vaddressmode", "clamp")
         _vop_connect(ktex, "texcoord", kuv, "out")
@@ -912,6 +927,7 @@ def _build_lookdev_material_library(
     ground_emission: float,
     is_shadow_catcher: bool,
     render_engine: str = "Karma (MaterialX)",
+    ground_colorspace: str = "ACEScg",
 ):
     """Create or rebuild the Solaris Material Library LOP with 5 unique materials for the chosen render engine."""
     ml = _create_lop(stage_net, ("materiallibrary",), mat_lib_name)
@@ -958,6 +974,7 @@ def _build_lookdev_material_library(
                 is_shadow_catcher=is_shadow_catcher,
                 render_engine=render_engine,
                 vop_types=vop_types,
+                ground_colorspace=ground_colorspace,
             ),
             "/lookdev/materials/ground_proj_mtl",
             "/lookdev/ground_disc",
@@ -991,6 +1008,7 @@ def create_or_update_lookdev_and_ground(
     render_engine: str = "Karma (MaterialX)",
     node_name: str = "hdri_maker_lookdev",
     set_display_flag: bool = True,
+    feather_start: float = 0.55,
 ):
     """
     Create or update a Solaris pythonscript LOP on /stage that builds:
@@ -1029,6 +1047,7 @@ ground_op_tex = {ground_op_norm!r}
 use_acescg = {use_acescg!r}
 ground_radius = {float(ground_radius)}
 tripod_height = {float(tripod_height)}
+feather_start = {float(max(0.0, min(0.99, feather_start)))}
 ground_emission = {max(0.0, float(ground_emission))}
 use_diffuse = {bool(use_diffuse)}
 use_emissive = {bool(use_emissive)}
@@ -1137,8 +1156,8 @@ xf_gr = UsdGeom.Xformable(grey.GetPrim())
 xf_gr.ClearXformOpOrder()
 xf_gr.AddTranslateOp().Set(Gf.Vec3d(spacing * 0.5, ball_y, 0.0))
 
-# 3. Macbeth ColorChecker Chart (ACEScg or Linear Rec.709)
-macbeth_srgb = [
+# 3. Macbeth ColorChecker Chart (Linear Rec.709 reference reflectances -> ACEScg or Linear Rec.709)
+macbeth_lin_rec709 = [
     (0.400, 0.200, 0.161), (0.690, 0.451, 0.380), (0.322, 0.400, 0.537), (0.294, 0.376, 0.180),
     (0.459, 0.388, 0.596), (0.369, 0.647, 0.588), (0.737, 0.420, 0.102), (0.227, 0.271, 0.569),
     (0.671, 0.259, 0.259), (0.286, 0.169, 0.318), (0.537, 0.667, 0.133), (0.788, 0.576, 0.102),
@@ -1161,7 +1180,7 @@ backing.GetPointsAttr().Set([Gf.Vec3f(-hw, -hh, -0.002), Gf.Vec3f(hw, -hh, -0.00
 backing.GetFaceVertexCountsAttr().Set([4])
 backing.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
 
-for idx, cs in enumerate(macbeth_srgb):
+for idx, cs in enumerate(macbeth_lin_rec709):
     r_i, c_i = idx // cols, idx % cols
     px = c_i * (patch_sz + gap) - tot_w * 0.5
     py = (rows - 1 - r_i) * (patch_sz + gap) - tot_h * 0.5
@@ -1173,7 +1192,7 @@ for idx, cs in enumerate(macbeth_srgb):
     ])
     pm.GetFaceVertexCountsAttr().Set([4])
     pm.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
-    lin = _srgb_to_lin_rec709(cs)
+    lin = (float(cs[0]), float(cs[1]), float(cs[2]))
     col_out = _rec709_to_acescg(lin) if use_acescg else lin
     col_vec = Gf.Vec3f(float(col_out[0]), float(col_out[1]), float(col_out[2]))
     pm.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant).Set([col_vec])
@@ -1189,7 +1208,7 @@ g_pts, g_nrms, g_uvs, g_opacities, g_counts, g_indices = [], [], [], [], [], []
 for r in range(g_rings + 1):
     rad = ground_radius * (float(r) / float(g_rings))
     rn = float(r) / float(g_rings)
-    t_f = max(0.0, min(1.0, (rn - 0.55) / 0.45))
+    t_f = max(0.0, min(1.0, (rn - feather_start) / max(1e-4, 1.0 - feather_start)))
     alpha = 1.0 - (t_f * t_f * (3.0 - 2.0 * t_f))
     for s in range(g_sectors + 1):
         th = 2.0 * math.pi * float(s) / float(g_sectors)
@@ -1253,6 +1272,7 @@ if is_shadow_catcher:
         ground_emission=max(0.0, float(ground_emission)),
         is_shadow_catcher=bool(is_shadow_catcher),
         render_engine=render_engine,
+        ground_colorspace=colorspace,
     )
 
     try:
@@ -1376,6 +1396,8 @@ def create_or_update_distant_sun_from_hotspot(
     exposure: float = 0.0,
     angle_deg: Optional[float] = None,
     set_display_flag: bool = True,
+    azimuth_offset_deg: float = 0.0,
+    vertical_shift_deg: float = 0.0,
 ):
     """
     Create or update a Solaris Distant Light (Sun) LOP aimed from the hotspot's
@@ -1384,15 +1406,16 @@ def create_or_update_distant_sun_from_hotspot(
     stage = _ensure_stage_context()
     sun = _create_lop(stage, ("distantlight::2.0", "light::2.0", "distantlight"), node_name)
     _set_first_parm(sun, ("primpath",), prim_path)
-    _set_first_parm(sun, ("lighttype",), "UsdLuxDistantLight")
 
-    _set_first_parm(sun, ("rx",), float(-hotspot.elevation_deg))
-    _set_first_parm(sun, ("ry",), float(hotspot.azimuth_deg))
+    eff_el = max(-89.0, min(89.0, float(hotspot.elevation_deg) + float(vertical_shift_deg)))
+    eff_az = -(float(hotspot.azimuth_deg) + float(azimuth_offset_deg))
+    _set_first_parm(sun, ("rx",), float(-eff_el))
+    _set_first_parm(sun, ("ry",), float(eff_az))
     _set_first_parm(sun, ("rz",), 0.0)
 
-    eff_angle = float(angle_deg) if angle_deg is not None else float(max(0.53, min(15.0, hotspot.radius_deg * 0.5)))
-    _set_parm_control(sun, ("xn__inputsangle_control_e4a", "xn__inputsangle_control_f6a"))
-    _set_first_parm(sun, ("xn__inputsangle_e4a", "xn__inputsangle_f6a", "inputs:angle", "angle"), eff_angle)
+    eff_angle = float(angle_deg) if angle_deg is not None else float(max(0.53, min(30.0, hotspot.radius_deg * 2.0)))
+    _set_parm_control(sun, ("xn__inputsangle_control_06a", "xn__inputsangle_control_e4a", "xn__inputsangle_control_f6a"))
+    _set_first_parm(sun, ("xn__inputsangle_zta", "xn__inputsangle_e4a", "xn__inputsangle_f6a", "inputs:angle", "angle"), eff_angle)
 
     _set_parm_control(sun, ("xn__inputsintensity_control_jeb", "xn__inputsintensity_control_i5a"))
     _set_first_parm(

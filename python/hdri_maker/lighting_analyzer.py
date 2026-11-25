@@ -292,7 +292,14 @@ def analyze_plate(
     p10, p25, p50, p90, p95, p99, p999 = np.percentile(
         lum, [10.0, 25.0, 50.0, 90.0, 95.0, 99.0, 99.9]
     )
-    mean_lum = float(np.mean(lum))
+    is_equirect = abs(aspect - 2.0) <= 0.08
+    if is_equirect:
+        v_coords = (np.arange(h, dtype=np.float32) + 0.5) / float(max(h, 1))
+        solid_w = np.maximum(np.sin(v_coords * math.pi), 1e-3)[:, None]
+        mean_lum = float(np.sum(lum * solid_w) / np.maximum(np.sum(solid_w) * w, 1e-5))
+    else:
+        solid_w = None
+        mean_lum = float(np.mean(lum))
     max_lum = float(np.max(lum))
     dr_stops = float(math.log2(max(float(p999), 1e-5) / max(float(p10), 1e-5)))
     key_to_fill = float(p95 / max(float(p25), 1e-5))
@@ -306,18 +313,25 @@ def analyze_plate(
     y_gnd_start = int(h * 0.65)
     y_nadir_start = min(h - 1, int(h * 0.88))
 
-    def _robust_mean_rgb(region: np.ndarray) -> Tuple[float, float, float]:
+    def _robust_mean_rgb(region: np.ndarray, row_weights: Optional[np.ndarray] = None) -> Tuple[float, float, float]:
         # Clip extreme 1% specular spikes so ambient sky/ground tone isn't skewed
         reg_lum = compute_luminance(region)
         cap = float(np.percentile(reg_lum, 98.0))
         mask = reg_lum <= max(cap, 1e-5)
+        if row_weights is not None:
+            rw = np.broadcast_to(row_weights, reg_lum.shape)
+            w_eff = np.where(mask, rw, 0.0)
+            w_sum = float(np.sum(w_eff))
+            if w_sum > 1e-6:
+                m = np.sum(region * w_eff[..., None], axis=(0, 1)) / w_sum
+                return (float(m[0]), float(m[1]), float(m[2]))
         if np.any(mask):
             m = np.mean(region[mask], axis=0)
         else:
             m = np.mean(region, axis=(0, 1))
         return (float(m[0]), float(m[1]), float(m[2]))
 
-    overall_rgb = _robust_mean_rgb(img)
+    overall_rgb = _robust_mean_rgb(img, solid_w)
     zenith_rgb = _robust_mean_rgb(img[:y_zenith, :])
     sky_rgb = _robust_mean_rgb(img[:y_sky_end, :])
     horizon_rgb = _robust_mean_rgb(img[y_hor_start:y_hor_end, :])

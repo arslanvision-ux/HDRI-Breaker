@@ -963,6 +963,105 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertAlmostEqual(float(reproj[63, 64, 0]), 0.25, places=2)
         self.assertAlmostEqual(float(reproj[0, 64, 0]), 0.1, places=4)
 
+    def test_audit_fixes_solaris_color_and_spherical_math(self) -> None:
+        from hdri_maker.hdri_generator import (
+            extract_and_inpaint_hotspot,
+            generate_diffuse_irradiance_hdri,
+        )
+        from hdri_maker.lighting_analyzer import HotspotLight
+        from hdri_maker.plate_io import HAS_OIIO, convert_colorspace_to_linear_rec709, read_plate
+
+        # 1. Sony S-Log3 / RED Log3G10 / Canon Log 2 apply wide-gamut -> Rec.709 matrices
+        # Pure wide-gamut red (0.7, 0.2, 0.2) should produce negative/clamped or suppressed G/B relative to R
+        red_log = np.full((4, 4, 3), [0.65, 0.35, 0.35], dtype=np.float32)
+        for cs_name in ("Sony S-Log3", "RED Log3G10", "Canon Log 2"):
+            lin_cs, _ = convert_colorspace_to_linear_rec709(red_log, cs_name)
+            self.assertGreater(float(lin_cs[0, 0, 0]), float(lin_cs[0, 0, 1]) * 3.0)
+
+        # 2. Linear-space downsampling in read_plate: checkerboard of 0 and 255 sRGB -> ~0.50 linear (not 0.214!)
+        if HAS_OIIO:
+            import OpenImageIO as oiio
+
+            srgb_chk = np.zeros((64, 64, 3), dtype=np.uint8)
+            srgb_chk[:, 0::2] = 255
+            chk_path = os.path.join(self.tmpdir.name, "checker_srgb.png")
+            out = oiio.ImageOutput.create(chk_path)
+            spec = oiio.ImageSpec(64, 64, 3, oiio.UINT8)
+            out.open(chk_path, spec)
+            out.write_image(srgb_chk)
+            out.close()
+            pf = read_plate(chk_path, colorspace="sRGB", max_dim=16)
+            self.assertGreater(float(np.mean(pf.pixels)), 0.45)
+
+        # 3. RectLight alpha preserves >90% energy & region_blur wraps across u=0/1 seam
+        hdri = np.full((64, 128, 3), 0.2, dtype=np.float32)
+        hdri[24:40, 0:8] = 5.0
+        hdri[24:40, 120:128] = 5.0
+        cleaned, light_tex, _ = extract_and_inpaint_hotspot(
+            hdri,
+            (0.0, 0.375, 0.1, 0.625),
+            inpaint_hdri=True,
+            shape="rect",
+            region_blur=0.5,
+        )
+        self.assertGreater(float(np.mean(light_tex[..., 3])), 0.90)
+        self.assertTrue(np.all(np.isfinite(cleaned)))
+
+        # 4. Solid-angle weighted diffuse irradiance does not over-weight zenith pole
+        polar = np.full((64, 128, 3), 0.1, dtype=np.float32)
+        polar[0:2, :, :] = 100.0  # tiny solid-angle zenith cap
+        diff = generate_diffuse_irradiance_hdri(polar, clamp_percentile=99.9)
+        self.assertLess(float(np.mean(diff[32, :])), 1.0)
+
+        # 5. Solaris USD checks: Sun orientation/angle, Key light rig, Dome color temp reset, Macbeth linear Reflectance
+        if HAS_HOU:
+            import hou
+            from hdri_maker.solaris_stage import (
+                create_hotspot_light_rig,
+                create_or_update_distant_sun_from_hotspot,
+                create_or_update_domelight,
+                create_or_update_lookdev_and_ground,
+            )
+
+            hou.hipFile.clear(suppress_save_prompt=True)
+            dome_exr = os.path.join(self.tmpdir.name, "audit_dome.exr")
+            write_exr_32f(dome_exr, np.full((32, 64, 3), 0.2, dtype=np.float32))
+            prof = analyze_plate(_make_synthetic_plate(), is_hdr=True)
+            dome = create_or_update_domelight(dome_exr, profile=prof, enable_color_temp=True)
+            self.assertTrue(bool(dome.stage().GetPrimAtPath("/lights/hdri_maker_dome").GetAttribute("inputs:enableColorTemperature").Get()))
+            dome = create_or_update_domelight(dome_exr, profile=prof, enable_color_temp=False)
+            self.assertFalse(bool(dome.stage().GetPrimAtPath("/lights/hdri_maker_dome").GetAttribute("inputs:enableColorTemperature").Get()))
+
+            hs = HotspotLight(
+                index=0, plate_u=0.25, plate_v=0.25,
+                azimuth_deg=30.0, elevation_deg=45.0, radius_deg=4.0,
+                peak_intensity=25.0, mean_intensity=12.0,
+                color_rgb=(1.0, 0.8, 0.6), cct_kelvin=4500.0,
+            )
+            sun = create_or_update_distant_sun_from_hotspot(hs, parent_node=dome, azimuth_offset_deg=15.0)
+            self.assertAlmostEqual(sun.parm("ry").eval(), -45.0, places=3)
+            sun_prim = sun.stage().GetPrimAtPath("/lights/hdri_maker_sun")
+            self.assertAlmostEqual(float(sun_prim.GetAttribute("inputs:angle").Get()), 8.0, places=3)
+
+            keys = create_hotspot_light_rig([hs], parent_dome=sun)
+            key_prim = keys[0].stage().GetPrimAtPath("/lights/hdri_maker_key_1")
+            self.assertAlmostEqual(float(key_prim.GetAttribute("inputs:intensity").Get()), 12.0, places=3)
+            self.assertAlmostEqual(float(key_prim.GetAttribute("inputs:angle").Get()), 8.0, places=3)
+
+            g_exr = os.path.join(self.tmpdir.name, "audit_g.exr")
+            go_exr = os.path.join(self.tmpdir.name, "audit_go.exr")
+            write_exr_32f(g_exr, np.full((32, 32, 3), 0.2, dtype=np.float32))
+            write_exr_32f(go_exr, np.full((32, 32, 3), 1.0, dtype=np.float32))
+            ld = create_or_update_lookdev_and_ground(
+                g_exr, go_exr, parent_node=keys[0], colorspace="Linear Rec.709", feather_start=0.70
+            )
+            st = ld.stage()
+            neutral5 = st.GetPrimAtPath("/lookdev/tripod/macbeth/chart/patch_21").GetAttribute("primvars:displayColor").Get()[0]
+            self.assertAlmostEqual(float(neutral5[0]), 0.200, places=3)
+            op_vals = st.GetPrimAtPath("/lookdev/ground_disc").GetAttribute("primvars:displayOpacity").Get()
+            # At r_norm = 0.625 (< 0.70 feather_start), opacity must still be 1.0
+            self.assertAlmostEqual(float(op_vals[20 * 97]), 1.0, places=4)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

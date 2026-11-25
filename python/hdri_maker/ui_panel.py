@@ -2042,6 +2042,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._ground_rect: Optional[tuple] = None
         self._light_regions: List[Dict[str, Any]] = []
         self._extracted_lights: List[tuple] = []
+        self._baked_extracted_lights: List[tuple] = []
         self._brush_strokes: List[Dict[str, Any]] = []
         self._brush_undo_stack: List[np.ndarray] = []
         self._pre_brush_hdri: Optional[np.ndarray] = None
@@ -3528,6 +3529,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_azimuth_offset_deg = 0.0
         self._pre_bake_snapshot = None
         self._bake_history.clear()
+        self._baked_extracted_lights.clear()
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
         if n_rows == 0:
@@ -3585,6 +3587,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_azimuth_offset_deg = 0.0
         self._pre_bake_snapshot = None
         self._bake_history.clear()
+        self._baked_extracted_lights.clear()
         if hasattr(self, "unbake_edits_btn"):
             self.unbake_edits_btn.setEnabled(False)
         if len(self._views) != n_rows or not self._views:
@@ -4586,6 +4589,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._views = []
         self._baked_canvas_hdri = None
         self._bake_history.clear()
+        self._baked_extracted_lights.clear()
         self._profile = LightingProfile(
             source_path=self._macbeth_path or "Macbeth Reference",
             overall_cct_kelvin=float(cct),
@@ -5388,14 +5392,15 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
                 )
                 self._baked_azimuth_offset_deg = float(p.azimuth_offset_deg)
+            newly_extracted: List[tuple] = []
             if self._light_regions:
-                baked, extracted = extract_and_inpaint_multiple_hotspots(
+                baked, newly_extracted = extract_and_inpaint_multiple_hotspots(
                     baked,
                     self._light_regions,
+                    light_tex_size=self._current_light_tex_size(),
                     inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                     region_blur=self.light_blur_slider.value(),
                 )
-                self._extracted_lights = extracted
             if self._brush_strokes:
                 baked = apply_brush_strokes(baked, self._brush_strokes)
 
@@ -5407,12 +5412,17 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "sky_rect": self._sky_rect,
                     "ground_rect": self._ground_rect,
                     "light_regions": [dict(r) for r in self._light_regions],
+                    "baked_extracted_lights": list(self._baked_extracted_lights),
                     "brush_strokes": [dict(s) for s in self._brush_strokes],
                 }
             )
             if len(self._bake_history) > 5:
                 self._bake_history.pop(0)
 
+            if newly_extracted:
+                self._baked_extracted_lights.extend(newly_extracted)
+                self._extracted_lights = list(self._baked_extracted_lights)
+                self._last_light_exr_paths = []
             self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
             self._sky_rect = None
             self._ground_rect = None
@@ -5448,10 +5458,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._sky_rect = prev.get("sky_rect")
             self._ground_rect = prev.get("ground_rect")
             self._light_regions = [dict(r) for r in prev.get("light_regions", [])]
+            self._baked_extracted_lights = list(prev.get("baked_extracted_lights", []))
             self._brush_strokes = [dict(s) for s in prev.get("brush_strokes", [])]
         else:
             self._baked_canvas_hdri = None
             self._baked_azimuth_offset_deg = 0.0
+            self._baked_extracted_lights.clear()
         has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
         self.unbake_edits_btn.setEnabled(has_more)
         self.unbake_edits_btn.setText(
@@ -5578,6 +5590,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 "sky_rect": self._sky_rect,
                 "ground_rect": self._ground_rect,
                 "light_regions": [dict(r) for r in self._light_regions],
+                "baked_extracted_lights": list(self._baked_extracted_lights),
                 "brush_strokes": [dict(s) for s in self._brush_strokes],
             }
         )
@@ -6008,9 +6021,9 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                     region_blur=self.light_blur_slider.value(),
                 )
-                self._extracted_lights = extracted
+                self._extracted_lights = list(self._baked_extracted_lights) + extracted
             elif not self._light_regions:
-                self._extracted_lights = []
+                self._extracted_lights = list(self._baked_extracted_lights)
             if not fast:
                 self._pre_brush_hdri = hdri.copy()
                 self._brush_undo_stack.clear()
@@ -6258,6 +6271,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                                     "hdri_maker:light_cct_kelvin": f"{light_info.cct_kelvin:.1f}",
                                 },
                                 frame=prof.frame,
+                                is_envmap=False,
                             )
                             self._last_light_exr_paths.append(written_l)
                     meta = {
@@ -6336,6 +6350,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         hdri = _build_export_hdri()
                 light_msg = ""
                 self._last_light_exr_paths = []
+                extracted: List[tuple] = []
                 if self._light_regions:
                     hdri, extracted = extract_and_inpaint_multiple_hotspots(
                         hdri,
@@ -6344,9 +6359,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                         inpaint_hdri=self.remove_hotspot_chk.isChecked(),
                         region_blur=self.light_blur_slider.value(),
                     )
-                    self._extracted_lights = extracted
+                all_extracted = list(self._baked_extracted_lights) + extracted
+                if all_extracted:
+                    self._extracted_lights = all_extracted
                     stem, _ = os.path.splitext(out_path)
-                    for idx, (light_tex, light_info) in enumerate(extracted, start=1):
+                    for idx, (light_tex, light_info) in enumerate(all_extracted, start=1):
                         light_exr_out = f"{stem}_light_{idx}.exr"
                         written_l = write_exr_32f(
                             light_exr_out,
@@ -6359,6 +6376,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                                 "hdri_maker:light_elevation_deg": f"{light_info.elevation_deg:.2f}",
                                 "hdri_maker:light_cct_kelvin": f"{light_info.cct_kelvin:.1f}",
                             },
+                            is_envmap=False,
                         )
                         self._last_light_exr_paths.append(written_l)
                     light_msg = f" + {len(self._last_light_exr_paths)} Light EXR(s)"
@@ -6424,6 +6442,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 ground_emission=self.ground_emission_slider.value(),
                 ground_shader_mode=self.ground_shader_combo.currentText(),
                 render_engine=self.render_engine_combo.currentText(),
+                feather_start=feather_start,
             )
             return " + Lookdev Tripod & Ground (/lookdev)"
         return f" + Ground Proj EXR: {g_tex_path}"
@@ -6492,8 +6511,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("Analyze a plate first before creating the Solaris Area Light.")
             return
 
-        # If user hasn't picked any Light Area yet, auto-create one around hotspot #1
-        if not self._light_regions:
+        # If user hasn't picked any Light Area yet (and none were baked), auto-create one around hotspot #1
+        if not self._light_regions and not self._baked_extracted_lights:
             if not self._profile.hotspots:
                 self.status_label.setText("No hotspot detected. Use 'Pick Light Area' to select light(s) on the preview.")
                 return
@@ -6513,7 +6532,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         # Always export/refresh HDRI EXR (inpainted) + 32-bit Light Texture EXR(s)
         self._on_export_exr()
 
-        if not self._extracted_lights or len(self._last_light_exr_paths) != len(self._light_regions):
+        if not self._extracted_lights or len(self._last_light_exr_paths) != len(self._extracted_lights):
             self.status_label.setText("Failed to extract 32-bit float light texture EXR(s).")
             return
 
@@ -6582,7 +6601,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     diffuse_exr_path=diff_exr,
                 )
                 self._last_dome_node = parent
-            sun = create_or_update_distant_sun_from_hotspot(hs, parent_node=parent)
+            sun = create_or_update_distant_sun_from_hotspot(
+                hs,
+                parent_node=parent,
+                azimuth_offset_deg=self.yaw_spin.value(),
+                vertical_shift_deg=self.vshift_spin.value(),
+            )
             self.status_label.setText(
                 f"Solaris Distant Sun ready at {sun.path()} (Az={hs.azimuth_deg:+.1f}°, El={hs.elevation_deg:+.1f}°)."
             )
@@ -6694,6 +6718,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._ground_rect = None
             self._light_regions.clear()
             self._extracted_lights.clear()
+            self._baked_extracted_lights.clear()
             self._last_light_exr_paths.clear()
             self._brush_strokes.clear()
             self._brush_undo_stack.clear()

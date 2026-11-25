@@ -903,7 +903,12 @@ def generate_diffuse_irradiance_hdri(
     target_lum = p_hi + p_hi * np.tanh(excess / p_hi)
     scale = np.where(lum > p_hi, target_lum / np.maximum(lum, 1e-6), 1.0)
     clamped = img * scale[..., None]
-    return blur_latlong_hdri(clamped, blur_amount=0.45)
+    h_img, w_img = clamped.shape[:2]
+    v = (np.arange(h_img, dtype=np.float32) + 0.5) / float(max(h_img, 1))
+    cos_el = np.maximum(np.sin(v * math.pi), 1e-3)[:, None, None]
+    blur_num = blur_latlong_hdri(clamped * cos_el, blur_amount=0.45)
+    blur_den = blur_latlong_hdri(np.broadcast_to(cos_el, (h_img, w_img, 1)).copy(), blur_amount=0.45)
+    return np.ascontiguousarray(blur_num / np.maximum(blur_den, 1e-5), dtype=np.float32)
 
 
 def render_preview_srgb(
@@ -1051,8 +1056,8 @@ def extract_and_inpaint_hotspot(
         # Mask RGB into a soft disk so UsdLuxRectLight emits & reflects as a true disk in Karma & Redshift
         light_tex = (light_tex * alpha[..., None]).astype(np.float32)
     else:
-        vig_x = (1.0 - _smoothstep(0.45, 1.0, np.abs(ux))).astype(np.float32)
-        vig_y = (1.0 - _smoothstep(0.45, 1.0, np.abs(uy))).astype(np.float32)
+        vig_x = (1.0 - _smoothstep(0.92, 1.0, np.abs(ux))).astype(np.float32)
+        vig_y = (1.0 - _smoothstep(0.92, 1.0, np.abs(uy))).astype(np.float32)
         alpha = (vig_x * vig_y).astype(np.float32)
     light_tex = np.concatenate([light_tex, alpha[..., None]], axis=-1).astype(np.float32)
 
@@ -1131,10 +1136,10 @@ def extract_and_inpaint_hotspot(
         pad = min(max(8, r_px * 2), max(h, w) // 4)
         py0 = max(0, y0 - pad)
         py1 = min(h, y1 + pad)
-        px0 = max(0, x0 - pad)
-        px1 = min(w, x1 + pad)
-        blurred_crop = _separable_box_blur(cleaned[py0:py1, px0:px1], r_px, r_px, wrap_x=False)
-        local_patch = blurred_crop[(y0 - py0) : (y1 - py0), (x0 - px0) : (x1 - px0)]
+        x_indices = (np.arange(x0 - pad, x1 + pad, dtype=np.int32)) % w
+        crop = np.take(cleaned[py0:py1], x_indices, axis=1)
+        blurred_crop = _separable_box_blur(crop, r_px, r_px, wrap_x=False)
+        local_patch = blurred_crop[(y0 - py0) : (y1 - py0), pad : pad + bw]
         cleaned[y0:y1, x0:x1] = cleaned[y0:y1, x0:x1] * (1.0 - mask) + local_patch * mask
 
     return np.ascontiguousarray(cleaned, dtype=np.float32), np.ascontiguousarray(light_tex, dtype=np.float32), info

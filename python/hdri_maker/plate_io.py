@@ -574,6 +574,30 @@ MAT_AWG4_TO_REC709 = np.array(
     ],
     dtype=np.float32,
 )
+MAT_SGAMUT3CINE_TO_REC709 = np.array(
+    [
+        [1.663895, -0.592023, -0.071872],
+        [-0.175577, 1.269923, -0.094346],
+        [-0.015642, -0.104309, 1.119951],
+    ],
+    dtype=np.float32,
+)
+MAT_RWG_TO_REC709 = np.array(
+    [
+        [1.797797, -0.558899, -0.238898],
+        [-0.141913, 1.454524, -0.312611],
+        [0.013831, -0.207268, 1.193437],
+    ],
+    dtype=np.float32,
+)
+MAT_CGAMUT_TO_REC709 = np.array(
+    [
+        [1.653146, -0.495981, -0.157165],
+        [-0.174368, 1.385346, -0.210978],
+        [-0.017014, -0.155863, 1.172877],
+    ],
+    dtype=np.float32,
+)
 
 
 def list_available_input_colorspaces() -> List[str]:
@@ -620,7 +644,7 @@ def _logc4_to_linear(x: np.ndarray) -> np.ndarray:
 
 
 def _slog3_to_linear(x: np.ndarray) -> np.ndarray:
-    """Sony S-Log3 to scene-linear."""
+    """Sony S-Log3 (S-Gamut3.Cine) to Linear Rec.709."""
     arr = np.asarray(x, dtype=np.float32)
     cut = 171.2102946929 / 1023.0
     lin = np.where(
@@ -628,11 +652,11 @@ def _slog3_to_linear(x: np.ndarray) -> np.ndarray:
         np.power(10.0, (arr * 1023.0 - 420.0) / 261.5) * (0.18 + 0.01) - 0.01,
         (arr * 1023.0 - 95.0) * 0.01125000 / (171.2102946929 - 95.0),
     )
-    return lin.astype(np.float32)
+    return apply_color_matrix(lin.astype(np.float32), MAT_SGAMUT3CINE_TO_REC709)
 
 
 def _red_log3g10_to_linear(x: np.ndarray) -> np.ndarray:
-    """RED Log3G10 to scene-linear."""
+    """RED Log3G10 (REDWideGamutRGB) to Linear Rec.709."""
     arr = np.asarray(x, dtype=np.float32)
     a = 0.224282
     b = 155.975327
@@ -643,11 +667,11 @@ def _red_log3g10_to_linear(x: np.ndarray) -> np.ndarray:
         arr / g - c,
         (np.power(10.0, arr / a) - 1.0) / b - c,
     )
-    return lin.astype(np.float32)
+    return apply_color_matrix(lin.astype(np.float32), MAT_RWG_TO_REC709)
 
 
 def _canon_log2_to_linear(x: np.ndarray) -> np.ndarray:
-    """Canon Log 2 to scene-linear."""
+    """Canon Log 2 (Cinema Gamut) to Linear Rec.709."""
     arr = np.asarray(x, dtype=np.float32)
     c_off = 0.092864125
     lin = np.where(
@@ -655,7 +679,7 @@ def _canon_log2_to_linear(x: np.ndarray) -> np.ndarray:
         (np.power(10.0, (arr - c_off) / 0.24136077) - 1.0) / 87.099375,
         -(np.power(10.0, (c_off - arr) / 0.24136077) - 1.0) / 87.099375,
     )
-    return lin.astype(np.float32)
+    return apply_color_matrix(lin.astype(np.float32), MAT_CGAMUT_TO_REC709)
 
 
 def _acescct_to_linear_rec709(x: np.ndarray) -> np.ndarray:
@@ -699,15 +723,30 @@ def convert_colorspace_to_linear_rec709(pixels: np.ndarray, cs_name: str) -> Tup
     if HAS_OCIO and ocio_name:
         try:
             cfg = OCIO.GetCurrentConfig()
-            dst_name = "Linear Rec.709 (sRGB)"
             avail = {str(c.getName()) for c in cfg.getColorSpaces()}
-            if dst_name not in avail:
+            dst_name = next(
+                (
+                    cand
+                    for cand in (
+                        "Linear Rec.709 (sRGB)",
+                        "Utility - Linear - sRGB",
+                        "lin_srgb",
+                        "Linear sRGB",
+                        "Linear Rec.709",
+                    )
+                    if cand in avail
+                ),
+                None,
+            )
+            if dst_name is None:
                 dst_name = cfg.getCanonicalName(OCIO.ROLE_SCENE_LINEAR)
             if ocio_name in avail and dst_name:
                 proc = cfg.getProcessor(ocio_name, dst_name)
                 cpu = proc.getDefaultCPUProcessor()
                 buf = np.ascontiguousarray(pixels, dtype=np.float32).copy()
                 cpu.applyRGB(buf)
+                if "acescg" in str(dst_name).lower() or "ap1" in str(dst_name).lower():
+                    buf = apply_color_matrix(buf, MAT_ACESCG_TO_REC709)
                 return buf, ocio_name
         except Exception:
             pass
@@ -798,13 +837,10 @@ def read_plate(
     else:
         raise RuntimeError("Neither OpenImageIO nor PIL is available to read plates.")
 
-    # Sanitize NaNs/Infs before any downsampling so a single bad EXR pixel cannot poison neighbors
+    # Sanitize NaNs/Infs before linearization so a single bad EXR pixel cannot poison neighbors
     pixels = np.nan_to_num(pixels, nan=0.0, posinf=65504.0, neginf=0.0)
 
-    if max_dim and max(pixels.shape[0], pixels.shape[1]) > max_dim:
-        pixels = downsample_image(pixels, max_dim=max_dim)
-
-    # Normalize to Linear Rec.709
+    # Normalize to Linear Rec.709 BEFORE downsampling so mip/area averaging operates on linear light
     cs_mode = colorspace.strip()
     if cs_mode == "Auto":
         if ext in LDR_EXTENSIONS or (not is_hdr and "linear" not in detected_cs.lower()):
@@ -817,6 +853,9 @@ def read_plate(
             source_cs = "Linear Rec.709"
     else:
         pixels, source_cs = convert_colorspace_to_linear_rec709(pixels, cs_mode)
+
+    if max_dim and max(pixels.shape[0], pixels.shape[1]) > max_dim:
+        pixels = downsample_image(pixels, max_dim=max_dim)
 
     # Sanitize NaNs/Infs while preserving >1.0 HDR values
     pixels = np.nan_to_num(pixels, nan=0.0, posinf=65504.0, neginf=0.0)
@@ -872,6 +911,7 @@ def write_exr_32f(
     compression: str = "piz",
     metadata: Optional[Dict[str, str]] = None,
     frame: Optional[int] = None,
+    is_envmap: bool = True,
 ) -> str:
     """
     Write a true 32-bit float (oiio.FLOAT) Lat/Long EXR file.
@@ -921,8 +961,9 @@ def write_exr_32f(
         "ACEScg" if output_colorspace == "ACEScg" else "Linear",
     )
     spec.attribute("Software", "Houdini Solaris HDRI Breaker")
-    spec.attribute("textureformat", "LatLong")
-    spec.attribute("hdri_maker:envmap", "latlong")
+    if is_envmap:
+        spec.attribute("textureformat", "LatLong")
+        spec.attribute("hdri_maker:envmap", "latlong")
 
     if metadata:
         for k, v in metadata.items():
