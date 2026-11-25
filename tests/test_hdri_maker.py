@@ -1062,6 +1062,102 @@ class TestHDRIMaker(unittest.TestCase):
             # At r_norm = 0.625 (< 0.70 feather_start), opacity must still be 1.0
             self.assertAlmostEqual(float(op_vals[20 * 97]), 1.0, places=4)
 
+    def test_json_save_load_restores_lights_brush_and_baked_edits(self):
+        import json
+        from hdri_maker.qt_compat import QtWidgets
+        from hdri_maker.ui_panel import HDRIMakerWidget
+        from hdri_maker.plate_io import write_exr_32f
+
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication([])
+
+        plate_path = os.path.join(self.tmpdir.name, "json_roundtrip_plate.exr")
+        write_exr_32f(plate_path, _make_synthetic_plate(128, 256))
+
+        w1 = HDRIMakerWidget(restore_session=False)
+        w1.plate_path_edit.setText(plate_path)
+        w1.input_projection_combo.setCurrentText("360° Equirectangular (Lat/Long)")
+        w1.yaw_spin.setValue(35.0)
+        w1.vshift_spin.setValue(-4.5)
+        w1.ev_spin.setValue(0.75)
+        w1.light_shape_combo.setCurrentText("Circle")
+        w1.light_res_combo.setCurrentText("1024 x 1024")
+        w1.light_blur_slider.setValue(0.65)
+        w1.remove_hotspot_chk.setChecked(False)
+        w1.brush_mode_combo.setCurrentText("Dodge (Boost HDR)")
+        w1.brush_size_slider.setValue(42)
+        w1.brush_strength_slider.setValue(70)
+        w1.brush_soft_slider.setValue(50)
+        w1._on_analyze_clicked()
+
+        # Add light #1 and brush stroke #1, then Bake Edits
+        w1._sky_rect = (0.1, 0.05, 0.3, 0.2)
+        w1._light_regions = [{"rect": (0.20, 0.20, 0.35, 0.35), "shape": "rect"}]
+        w1._brush_strokes = [
+            {
+                "mode": "dodge",
+                "radius_u": 0.03,
+                "softness": 0.5,
+                "strength": 0.7,
+                "src_offset": None,
+                "points": [[0.5, 0.5], [0.52, 0.5]],
+            }
+        ]
+        w1._on_bake_edits_to_canvas()
+        self.assertEqual(len(w1._baked_extracted_lights), 1)
+        self.assertEqual(len(w1._baked_ops), 1)
+
+        # Add live unbaked light #2 and brush stroke #2 after baking
+        w1._ground_rect = (0.4, 0.7, 0.6, 0.9)
+        w1._light_regions = [{"rect": (0.60, 0.25, 0.72, 0.38), "shape": "circle"}]
+        w1._brush_strokes = [
+            {
+                "mode": "heal",
+                "radius_u": 0.02,
+                "softness": 0.65,
+                "strength": 0.85,
+                "src_offset": None,
+                "points": [[0.25, 0.6]],
+            }
+        ]
+        w1._regenerate_preview()
+        self.assertEqual(len(w1._extracted_lights), 2)
+
+        json_path = os.path.join(self.tmpdir.name, "saved_state.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(w1.get_state_dict(), f, indent=2)
+        w1.close()
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+
+        w2 = HDRIMakerWidget(restore_session=False)
+        w2.apply_state_dict(loaded, auto_analyze=True)
+
+        self.assertEqual(w2.input_projection_combo.currentText(), "360° Equirectangular (Lat/Long)")
+        self.assertAlmostEqual(w2.yaw_spin.value(), 35.0)
+        self.assertAlmostEqual(w2.vshift_spin.value(), -4.5)
+        self.assertAlmostEqual(w2.ev_spin.value(), 0.75)
+        self.assertEqual(w2.light_shape_combo.currentText(), "Circle")
+        self.assertEqual(w2.light_res_combo.currentText(), "1024 x 1024")
+        self.assertAlmostEqual(w2.light_blur_slider.value(), 0.65)
+        self.assertFalse(w2.remove_hotspot_chk.isChecked())
+        self.assertEqual(w2.brush_mode_combo.currentText(), "Dodge (Boost HDR)")
+        self.assertEqual(w2.brush_size_slider.value(), 42)
+        self.assertEqual(w2.brush_strength_slider.value(), 70)
+        self.assertEqual(w2.brush_soft_slider.value(), 50)
+        self.assertEqual(w2._ground_rect, (0.4, 0.7, 0.6, 0.9))
+        self.assertEqual(len(w2._light_regions), 1)
+        self.assertEqual(len(w2._brush_strokes), 1)
+        self.assertIsNotNone(w2._baked_canvas_hdri)
+        self.assertEqual(len(w2._baked_extracted_lights), 1)
+        self.assertEqual(len(w2._extracted_lights), 2)
+        self.assertEqual(len(w2.preview_label._light_regions), 1)
+        self.assertEqual(w2.preview_label._ground_rect, (0.4, 0.7, 0.6, 0.9))
+        self.assertIsNotNone(w2._hdri_pixels)
+        w2.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

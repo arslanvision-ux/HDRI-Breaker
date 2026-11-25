@@ -2050,6 +2050,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._baked_azimuth_offset_deg: float = 0.0
         self._pre_bake_snapshot: Optional[Dict[str, Any]] = None
         self._bake_history: List[Dict[str, Any]] = []
+        self._baked_ops: List[Dict[str, Any]] = []
         self._active_brush_stroke: Optional[Dict[str, Any]] = None
         self._brush_clone_src_uv: Optional[Tuple[float, float]] = None
         self._brush_clone_offset_uv: Optional[Tuple[float, float]] = None
@@ -5414,10 +5415,32 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "light_regions": [dict(r) for r in self._light_regions],
                     "baked_extracted_lights": list(self._baked_extracted_lights),
                     "brush_strokes": [dict(s) for s in self._brush_strokes],
+                    "baked_ops": [dict(op) for op in self._baked_ops],
                 }
             )
             if len(self._bake_history) > 5:
                 self._bake_history.pop(0)
+
+            self._baked_ops.append(
+                {
+                    "kind": "bake",
+                    "azimuth_offset_deg": float(p.azimuth_offset_deg),
+                    "sky_rect": list(self._sky_rect) if self._sky_rect else None,
+                    "ground_rect": list(self._ground_rect) if self._ground_rect else None,
+                    "light_regions": [
+                        {"rect": list(r["rect"]), "shape": r.get("shape", "rect")}
+                        for r in self._light_regions
+                    ],
+                    "brush_strokes": json.loads(json.dumps(self._brush_strokes)),
+                    "remove_hotspot": bool(self.remove_hotspot_chk.isChecked()),
+                    "light_region_blur": float(self.light_blur_slider.value()),
+                    "light_tex_size": list(self._current_light_tex_size()),
+                    "sky_blend": float(p.sky_blend),
+                    "ground_blend": float(p.ground_blend),
+                    "sky_blur": float(p.sky_blur),
+                    "ground_blur": float(p.ground_blur),
+                }
+            )
 
             if newly_extracted:
                 self._baked_extracted_lights.extend(newly_extracted)
@@ -5430,6 +5453,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._brush_strokes.clear()
             self._brush_undo_stack.clear()
             self._pre_brush_hdri = None
+            self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
             self.unbake_edits_btn.setEnabled(True)
             self.unbake_edits_btn.setText(f"Unbake ({len(self._bake_history)})")
             self.unbake_edits_btn.setToolTip(
@@ -5460,10 +5484,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._light_regions = [dict(r) for r in prev.get("light_regions", [])]
             self._baked_extracted_lights = list(prev.get("baked_extracted_lights", []))
             self._brush_strokes = [dict(s) for s in prev.get("brush_strokes", [])]
+            self._baked_ops = [dict(op) for op in prev.get("baked_ops", [])]
         else:
             self._baked_canvas_hdri = None
             self._baked_azimuth_offset_deg = 0.0
             self._baked_extracted_lights.clear()
+            self._baked_ops.clear()
+        self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         has_more = bool(self._bake_history) or (self._baked_canvas_hdri is not None)
         self.unbake_edits_btn.setEnabled(has_more)
         self.unbake_edits_btn.setText(
@@ -5592,6 +5619,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 "light_regions": [dict(r) for r in self._light_regions],
                 "baked_extracted_lights": list(self._baked_extracted_lights),
                 "brush_strokes": [dict(s) for s in self._brush_strokes],
+                "baked_ops": [dict(op) for op in self._baked_ops],
             }
         )
         if len(self._bake_history) > 5:
@@ -6714,6 +6742,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._baked_azimuth_offset_deg = 0.0
             self._pre_bake_snapshot = None
             self._bake_history.clear()
+            self._baked_ops.clear()
             self._sky_rect = None
             self._ground_rect = None
             self._light_regions.clear()
@@ -6808,6 +6837,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "plate_path": self.plate_path_edit.text(),
             "colorspace": self.colorspace_combo.currentText(),
             "seq_mode": self.seq_mode_combo.currentText(),
+            "input_projection": self.input_projection_combo.currentText(),
             "use_range": self.use_range_chk.isChecked(),
             "start_frame": self.start_frame_spin.value(),
             "end_frame": self.end_frame_spin.value(),
@@ -6854,6 +6884,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "preview_roughness": self.preview_roughness_slider.value(),
             "ab_split": self.ab_split_btn.isChecked(),
             "brush_strokes": self._brush_strokes,
+            "brush_mode": self.brush_mode_combo.currentText(),
+            "brush_size": self.brush_size_slider.value(),
+            "brush_strength": self.brush_strength_slider.value(),
+            "brush_softness": self.brush_soft_slider.value(),
+            "baked_ops": list(self._baked_ops),
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -6878,6 +6913,8 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "ui_scale": self.ui_scale_slider.value(),
             "ui_theme": self.theme_combo.currentText(),
             "out_path": self.out_path_edit.text(),
+            "last_exr_path": self._last_exr_path,
+            "last_light_exr_paths": list(self._last_light_exr_paths),
         }
 
     def apply_state_dict(self, data: Dict[str, Any], auto_analyze: bool = True) -> None:
@@ -6892,13 +6929,124 @@ class HDRIMakerWidget(QtWidgets.QWidget):
 
         if auto_analyze and (self.multiview_table.rowCount() > 0 or self.plate_path_edit.text().strip()):
             self._on_analyze_clicked()
+            if self._baked_ops and self._profile is not None:
+                self._replay_baked_ops()
+        self._commit_undo_baseline()
+        self._refresh_undo_ui()
+
+    def _replay_baked_ops(self) -> None:
+        """Reconstruct `_baked_canvas_hdri` and `_baked_extracted_lights` from serialized `_baked_ops`."""
+        if not self._baked_ops or self._profile is None:
+            return
+        try:
+            p = self._current_synthesis_params()
+            enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
+            baked = None
+            baked_az = 0.0
+            baked_lights: List[tuple] = []
+            for idx, op in enumerate(self._baked_ops):
+                if not isinstance(op, dict):
+                    continue
+                op_az = float(op.get("azimuth_offset_deg", p.azimuth_offset_deg))
+                sr = op.get("sky_rect")
+                sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
+                gr = op.get("ground_rect")
+                ground_rect = tuple(gr) if (isinstance(gr, (list, tuple)) and len(gr) == 4) else None
+                if baked is None:
+                    bake_p = HDRISynthesisParams(
+                        width=min(p.width, 4096),
+                        height=min(p.height, 2048),
+                        hotspot_boost=p.hotspot_boost,
+                        hotspot_softness=p.hotspot_softness,
+                        ambient_wrap=p.ambient_wrap,
+                        horizon_softness=p.horizon_softness,
+                        azimuth_offset_deg=op_az,
+                        plate_projection_blend=p.plate_projection_blend,
+                        vertical_shift_deg=p.vertical_shift_deg,
+                        stitch_blend=p.stitch_blend,
+                        ldr_highlight_boost=p.ldr_highlight_boost,
+                        enable_inpaint=p.enable_inpaint,
+                        sky_blend=float(op.get("sky_blend", p.sky_blend)),
+                        ground_blend=float(op.get("ground_blend", p.ground_blend)),
+                        sky_blur=float(op.get("sky_blur", p.sky_blur)),
+                        ground_blur=float(op.get("ground_blur", p.ground_blur)),
+                        sky_rect=sky_rect,
+                        ground_rect=ground_rect,
+                        light_rect=p.light_rect,
+                        remove_hotspot_from_hdri=bool(op.get("remove_hotspot", True)),
+                        physical_sky_fill=p.physical_sky_fill,
+                    )
+                    baked = generate_latlong_hdri(
+                        self._profile,
+                        bake_p,
+                        views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
+                    )
+                    baked_az = op_az
+                else:
+                    delta_yaw = op_az - baked_az
+                    if abs(delta_yaw) > 1e-4:
+                        shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
+                        if shift_px != 0:
+                            baked = np.roll(baked, shift_px, axis=1)
+                    baked_az = op_az
+                    if sky_rect is not None or ground_rect is not None:
+                        baked = apply_sky_ground_inpaint_to_hdri(
+                            baked,
+                            sky_rect=sky_rect,
+                            ground_rect=ground_rect,
+                            sky_blend=float(op.get("sky_blend", p.sky_blend)),
+                            ground_blend=float(op.get("ground_blend", p.ground_blend)),
+                            sky_blur=float(op.get("sky_blur", p.sky_blur)),
+                            ground_blur=float(op.get("ground_blur", p.ground_blur)),
+                        )
+                op_lights = op.get("light_regions") or []
+                if op_lights:
+                    tex_sz = op.get("light_tex_size", [512, 512])
+                    tex_pair = (int(tex_sz[0]), int(tex_sz[1])) if len(tex_sz) == 2 else (512, 512)
+                    baked, newly_extracted = extract_and_inpaint_multiple_hotspots(
+                        baked,
+                        op_lights,
+                        light_tex_size=tex_pair,
+                        inpaint_hdri=bool(op.get("remove_hotspot", True)),
+                        region_blur=float(op.get("light_region_blur", 0.0)),
+                    )
+                    if newly_extracted:
+                        baked_lights.extend(newly_extracted)
+                op_strokes = op.get("brush_strokes") or []
+                if op_strokes:
+                    baked = apply_brush_strokes(baked, op_strokes)
+            if baked is not None:
+                self._baked_canvas_hdri = np.ascontiguousarray(baked, dtype=np.float32)
+                self._baked_azimuth_offset_deg = baked_az
+                self._baked_extracted_lights = baked_lights
+                self.unbake_edits_btn.setEnabled(True)
+                self.unbake_edits_btn.setText("Unbake")
+                self._regenerate_preview()
+        except Exception as exc:
+            self._log_debug(f"Replay baked ops error: {exc}")
 
     def _apply_state_dict_inner(self, data: Dict[str, Any]) -> None:
+        self._baked_canvas_hdri = None
+        self._baked_azimuth_offset_deg = 0.0
+        self._bake_history.clear()
+        self._baked_extracted_lights.clear()
+        self._extracted_lights.clear()
+        self._brush_undo_stack.clear()
+        self._pre_brush_hdri = None
+        self._rough_cache = None
+        self._raw_rough_cache = None
+        self.unbake_edits_btn.setEnabled(False)
+        self.unbake_edits_btn.setText("Unbake")
+
         self.plate_path_edit.setText(str(data.get("plate_path", "")))
         if "colorspace" in data:
             self.colorspace_combo.setCurrentText(str(data["colorspace"]))
         if "seq_mode" in data:
             self.seq_mode_combo.setCurrentText(str(data["seq_mode"]))
+        if "input_projection" in data:
+            self.input_projection_combo.setCurrentText(str(data["input_projection"]))
+        else:
+            self.input_projection_combo.setCurrentIndex(0)
         self.use_range_chk.setChecked(bool(data.get("use_range", False)))
         self.start_frame_spin.setValue(int(data.get("start_frame", 1)))
         self.end_frame_spin.setValue(int(data.get("end_frame", 100)))
@@ -6973,6 +7121,14 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.preview_roughness_slider.setValue(int(data.get("preview_roughness", 0)))
         self.ab_split_btn.setChecked(bool(data.get("ab_split", False)))
         self._brush_strokes = list(data.get("brush_strokes") or [])
+        if "brush_mode" in data:
+            self.brush_mode_combo.setCurrentText(str(data["brush_mode"]))
+        else:
+            self.brush_mode_combo.setCurrentIndex(0)
+        self.brush_size_slider.setValue(int(data.get("brush_size", 25)))
+        self.brush_strength_slider.setValue(int(data.get("brush_strength", 85)))
+        self.brush_soft_slider.setValue(int(data.get("brush_softness", 65)))
+        self._baked_ops = [dict(op) for op in (data.get("baked_ops") or []) if isinstance(op, dict)]
 
         sr = data.get("sky_rect")
         self._sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
@@ -6991,6 +7147,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             )
         if "light_shape" in data:
             self.light_shape_combo.setCurrentText(str(data["light_shape"]))
+        self.preview_label.set_regions(self._sky_rect, self._ground_rect, self._light_regions)
         self._refresh_light_toolbar_visibility()
         if "light_resolution" in data:
             self.light_res_combo.setCurrentText(str(data["light_resolution"]))
@@ -7017,6 +7174,13 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._apply_ui_scale(self.ui_scale_slider.value())
         if data.get("out_path"):
             self.out_path_edit.setText(str(data["out_path"]))
+        else:
+            self.out_path_edit.setText("")
+        last_exr = str(data.get("last_exr_path", ""))
+        self._last_exr_path = last_exr if (last_exr and os.path.isfile(last_exr)) else ""
+        self._last_light_exr_paths = [
+            str(p) for p in (data.get("last_light_exr_paths") or []) if p and os.path.isfile(str(p))
+        ]
 
     def _auto_save_session(self) -> None:
         try:
@@ -7036,6 +7200,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
     def _auto_analyze_restored_plates(self) -> None:
         if self.multiview_table.rowCount() > 0 or self.plate_path_edit.text().strip():
             self._on_analyze_clicked()
+            if self._baked_ops and self._profile is not None:
+                self._replay_baked_ops()
+            self._commit_undo_baseline()
+            self._refresh_undo_ui()
 
     def _auto_load_session(self) -> None:
         data = None
