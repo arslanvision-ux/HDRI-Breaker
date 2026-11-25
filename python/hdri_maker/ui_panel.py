@@ -2002,6 +2002,8 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
         self._preview_ev = float(preview_ev)
         self._patch: Optional[np.ndarray] = None
         self._undo_stack: List[np.ndarray] = []
+        self._pole_strokes: List[Dict[str, Any]] = []
+        self._active_pole_stroke: Optional[Dict[str, Any]] = None
         self._clone_src_uv: Optional[tuple] = None
         self._clone_offset_uv: Optional[tuple] = None
         self._last_dab_uv: Optional[tuple] = None
@@ -2156,6 +2158,8 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
 
     def _extract_patch(self) -> None:
         self._undo_stack.clear()
+        self._pole_strokes.clear()
+        self._active_pole_stroke = None
         self._clone_src_uv = None
         self._clone_offset_uv = None
         self._patch = extract_pole_rectilinear_patch(
@@ -2233,6 +2237,14 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
         else:
             self._clone_offset_uv = None
         self._last_dab_uv = (float(u), float(v))
+        self._active_pole_stroke = {
+            "mode": mode,
+            "radius_u": self.size_slider.value() / 1000.0,
+            "softness": self.soft_slider.value() / 100.0,
+            "strength": self.strength_slider.value() / 100.0,
+            "src_offset": list(self._clone_offset_uv) if (mode == "clone" and self._clone_offset_uv is not None) else None,
+            "points": [[float(u), float(v)]],
+        }
         self._paint_dab(float(u), float(v))
         self._refresh_pixmap()
 
@@ -2250,21 +2262,35 @@ class PolePatchEditorDialog(QtWidgets.QDialog):
             n_steps = max(1, min(24, int(math.ceil(dist / step))))
             for s in range(1, n_steps + 1):
                 t = s / float(n_steps)
-                self._paint_dab(self._last_dab_uv[0] + du * t, self._last_dab_uv[1] + dv * t)
+                pu = self._last_dab_uv[0] + du * t
+                pv = self._last_dab_uv[1] + dv * t
+                if self._active_pole_stroke is not None:
+                    self._active_pole_stroke["points"].append([float(pu), float(pv)])
+                self._paint_dab(pu, pv)
         else:
+            if self._active_pole_stroke is not None:
+                self._active_pole_stroke["points"].append([float(u), float(v)])
             self._paint_dab(float(u), float(v))
         self._last_dab_uv = (float(u), float(v))
         self._refresh_pixmap()
 
     def _on_brush_stroke_finished(self) -> None:
+        if self._active_pole_stroke is not None:
+            self._pole_strokes.append(self._active_pole_stroke)
+            self._active_pole_stroke = None
         self._last_dab_uv = None
 
     def _on_undo(self) -> None:
         if self._undo_stack:
             self._patch = self._undo_stack.pop()
+            if self._pole_strokes:
+                self._pole_strokes.pop()
             self._refresh_pixmap()
 
     def _on_apply(self) -> None:
+        if self._active_pole_stroke is not None:
+            self._pole_strokes.append(self._active_pole_stroke)
+            self._active_pole_stroke = None
         if self._patch is not None:
             self.result_hdri = apply_pole_rectilinear_patch(
                 self._source_hdri,
@@ -6363,6 +6389,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     "pole": dlg._current_pole(),
                     "fov_deg": float(dlg.fov_spin.value()),
                     "feather": 0.20,
+                    "strokes": json.loads(json.dumps(getattr(dlg, "_pole_strokes", []))),
                     "patch": dlg._patch.copy(),
                     "azimuth_offset_deg": float(self.yaw_spin.value()),
                 }
@@ -7839,7 +7866,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "brush_strength": self.brush_strength_slider.value(),
             "brush_softness": self.brush_soft_slider.value(),
             "brush_clip_poly": self.brush_clip_poly_chk.isChecked(),
-            "baked_ops": [op for op in self._baked_ops if isinstance(op, dict) and op.get("kind", "bake") == "bake"],
+            "baked_ops": [
+                {k: v for k, v in op.items() if k != "patch"}
+                for op in self._baked_ops
+                if isinstance(op, dict)
+            ],
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
             "light_regions": [
@@ -7902,21 +7933,55 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             kind = op.get("kind", "bake")
             op_az = float(op.get("azimuth_offset_deg", p.azimuth_offset_deg))
             if kind == "pole_patch":
-                patch = op.get("patch")
-                if baked is not None and patch is not None:
+                op_fov = float(op.get("fov_deg", 110.0))
+                op_pole = str(op.get("pole", "nadir"))
+                op_feather = float(op.get("feather", 0.20))
+                if baked is None:
+                    bake_p = HDRISynthesisParams(
+                        width=int(target_w),
+                        height=int(target_h),
+                        hotspot_boost=p.hotspot_boost,
+                        hotspot_softness=p.hotspot_softness,
+                        ambient_wrap=p.ambient_wrap,
+                        horizon_softness=p.horizon_softness,
+                        azimuth_offset_deg=op_az,
+                        plate_projection_blend=p.plate_projection_blend,
+                        vertical_shift_deg=p.vertical_shift_deg,
+                        stitch_blend=p.stitch_blend,
+                        ldr_highlight_boost=p.ldr_highlight_boost,
+                        enable_inpaint=p.enable_inpaint,
+                        sky_blend=p.sky_blend,
+                        ground_blend=p.ground_blend,
+                        sky_blur=p.sky_blur,
+                        ground_blur=p.ground_blur,
+                        sky_rect=self._sky_rect,
+                        ground_rect=self._ground_rect,
+                        light_rect=p.light_rect,
+                        remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
+                        physical_sky_fill=p.physical_sky_fill,
+                    )
+                    baked = generate_latlong_hdri(self._profile, bake_p, views=views_arg)
+                    baked_az = op_az
+                else:
                     delta_yaw = op_az - baked_az
                     if abs(delta_yaw) > 1e-4:
                         shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
                         if shift_px != 0:
                             baked = np.roll(baked, shift_px, axis=1)
                     baked_az = op_az
-                    baked = apply_pole_rectilinear_patch(
-                        baked,
-                        patch,
-                        pole=str(op.get("pole", "nadir")),
-                        fov_deg=float(op.get("fov_deg", 110.0)),
-                        feather=float(op.get("feather", 0.20)),
-                    )
+                patch = op.get("patch")
+                if patch is None:
+                    patch = extract_pole_rectilinear_patch(baked, pole=op_pole, patch_size=512, fov_deg=op_fov)
+                    op_pole_strokes = op.get("strokes") or []
+                    if op_pole_strokes:
+                        patch = apply_brush_strokes(patch, op_pole_strokes)
+                baked = apply_pole_rectilinear_patch(
+                    baked,
+                    patch,
+                    pole=op_pole,
+                    fov_deg=op_fov,
+                    feather=op_feather,
+                )
                 continue
             sr = op.get("sky_rect")
             sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
@@ -8003,9 +8068,60 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             for idx, op in enumerate(self._baked_ops):
                 if not isinstance(op, dict):
                     continue
-                if op.get("kind", "bake") != "bake":
-                    continue
                 op_az = float(op.get("azimuth_offset_deg", p.azimuth_offset_deg))
+                if op.get("kind", "bake") == "pole_patch":
+                    op_fov = float(op.get("fov_deg", 110.0))
+                    op_pole = str(op.get("pole", "nadir"))
+                    op_feather = float(op.get("feather", 0.20))
+                    if baked is None:
+                        bake_p = HDRISynthesisParams(
+                            width=min(p.width, 4096),
+                            height=min(p.height, 2048),
+                            hotspot_boost=p.hotspot_boost,
+                            hotspot_softness=p.hotspot_softness,
+                            ambient_wrap=p.ambient_wrap,
+                            horizon_softness=p.horizon_softness,
+                            azimuth_offset_deg=op_az,
+                            plate_projection_blend=p.plate_projection_blend,
+                            vertical_shift_deg=p.vertical_shift_deg,
+                            stitch_blend=p.stitch_blend,
+                            ldr_highlight_boost=p.ldr_highlight_boost,
+                            enable_inpaint=p.enable_inpaint,
+                            sky_blend=p.sky_blend,
+                            ground_blend=p.ground_blend,
+                            sky_blur=p.sky_blur,
+                            ground_blur=p.ground_blur,
+                            sky_rect=self._sky_rect,
+                            ground_rect=self._ground_rect,
+                            light_rect=p.light_rect,
+                            remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
+                            physical_sky_fill=p.physical_sky_fill,
+                        )
+                        baked = generate_latlong_hdri(
+                            self._profile,
+                            bake_p,
+                            views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
+                        )
+                        baked_az = op_az
+                    else:
+                        delta_yaw = op_az - baked_az
+                        if abs(delta_yaw) > 1e-4:
+                            shift_px = int(round((delta_yaw / 360.0) * baked.shape[1])) % baked.shape[1]
+                            if shift_px != 0:
+                                baked = np.roll(baked, shift_px, axis=1)
+                        baked_az = op_az
+                    patch = extract_pole_rectilinear_patch(baked, pole=op_pole, patch_size=512, fov_deg=op_fov)
+                    op_pole_strokes = op.get("strokes") or []
+                    if op_pole_strokes:
+                        patch = apply_brush_strokes(patch, op_pole_strokes)
+                    baked = apply_pole_rectilinear_patch(
+                        baked,
+                        patch,
+                        pole=op_pole,
+                        fov_deg=op_fov,
+                        feather=op_feather,
+                    )
+                    continue
                 sr = op.get("sky_rect")
                 sky_rect = tuple(sr) if (isinstance(sr, (list, tuple)) and len(sr) == 4) else None
                 gr = op.get("ground_rect")

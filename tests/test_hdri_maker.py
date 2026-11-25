@@ -1424,7 +1424,38 @@ class TestHDRIMaker(unittest.TestCase):
             w._on_bake_edits_to_canvas()
             mean_after_bake = float(np.mean(w._hdri_pixels))
             self.assertAlmostEqual(mean_after_bake, mean_before, places=3)
+
+            # Nadir/Zenith pole edits must serialize to JSON and survive full widget reload
+            import json
+            from hdri_maker.ui_panel import PolePatchEditorDialog
+            dlg = PolePatchEditorDialog(w._build_ungraded_pole_source(), preview_ev=0.0, parent=w)
+            dlg.mode_combo.setCurrentIndex(4)  # Dodge (Boost HDR)
+            dlg._on_brush_stroke_started(0.5, 0.5)
+            dlg._on_brush_stroke_moved(0.55, 0.5)
+            dlg._on_brush_stroke_finished()
+            dlg._on_apply()
+            w._baked_canvas_hdri = np.ascontiguousarray(dlg.result_hdri, dtype=np.float32)
+            w._baked_ops.append(
+                {
+                    "kind": "pole_patch",
+                    "pole": dlg._current_pole(),
+                    "fov_deg": float(dlg.fov_spin.value()),
+                    "feather": 0.20,
+                    "strokes": json.loads(json.dumps(dlg._pole_strokes)),
+                    "patch": dlg._patch.copy(),
+                    "azimuth_offset_deg": float(w.yaw_spin.value()),
+                }
+            )
+            w._on_bake_edits_to_canvas()
+            nadir_before_save = float(np.mean(w._hdri_pixels[-40:, :, :]))
+            state_json = json.loads(json.dumps(w.get_state_dict()))
             w.close()
+
+            w2 = HDRIMakerWidget(restore_session=False)
+            w2.apply_state_dict(state_json, auto_analyze=True)
+            nadir_after_reload = float(np.mean(w2._hdri_pixels[-40:, :, :]))
+            self.assertAlmostEqual(nadir_after_reload, nadir_before_save, places=3)
+            w2.close()
         app.processEvents()
 
     def test_exposure_math_invariants_and_8k_ui_optimizations(self) -> None:
