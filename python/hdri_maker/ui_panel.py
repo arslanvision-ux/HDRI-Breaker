@@ -6166,31 +6166,55 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             f"Normalized Exposure to {new_ev:+.2f} EV (delta {delta_ev:+.2f} EV -> diffuse 18% gray ball = 0.18)."
         )
 
+    def _build_ungraded_pole_source(self) -> np.ndarray:
+        """Return un-graded 32-bit canvas base for pole editing so post-adjustments and live edits are never double-applied."""
+        p = self._current_synthesis_params()
+        if self._baked_canvas_hdri is not None:
+            src = self._baked_canvas_hdri.copy()
+            delta_yaw = float(p.azimuth_offset_deg) - float(self._baked_azimuth_offset_deg)
+            if abs(delta_yaw) > 1e-4:
+                shift_px = int(round((delta_yaw / 360.0) * src.shape[1])) % src.shape[1]
+                if shift_px != 0:
+                    src = np.roll(src, shift_px, axis=1)
+            return src
+        bake_p = HDRISynthesisParams(
+            width=min(p.width, 2048),
+            height=min(p.height, 1024),
+            hotspot_boost=p.hotspot_boost,
+            hotspot_softness=p.hotspot_softness,
+            ambient_wrap=p.ambient_wrap,
+            horizon_softness=p.horizon_softness,
+            azimuth_offset_deg=p.azimuth_offset_deg,
+            plate_projection_blend=p.plate_projection_blend,
+            vertical_shift_deg=p.vertical_shift_deg,
+            stitch_blend=p.stitch_blend,
+            ldr_highlight_boost=p.ldr_highlight_boost,
+            enable_inpaint=p.enable_inpaint,
+            sky_blend=p.sky_blend,
+            ground_blend=p.ground_blend,
+            sky_blur=p.sky_blur,
+            ground_blur=p.ground_blur,
+            sky_rect=self._sky_rect,
+            ground_rect=self._ground_rect,
+            light_rect=p.light_rect,
+            remove_hotspot_from_hdri=self.remove_hotspot_chk.isChecked(),
+            physical_sky_fill=p.physical_sky_fill,
+        )
+        enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
+        return generate_latlong_hdri(
+            self._profile,
+            bake_p,
+            views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
+        )
+
     def _on_open_pole_patch_editor(self) -> None:
         if self._hdri_pixels is None:
             self.status_label.setText("Analyze a plate first before editing Nadir/Zenith.")
             return
-        # Never feed light-inpainted pixels into _baked_canvas_hdri while _light_regions are still unbaked,
-        # otherwise subsequent Bake/Export would extract already-inpainted patches as light textures.
-        pole_src = self._hdri_pixels
-        if self._light_regions and self._profile is not None:
-            p = self._current_synthesis_params()
-            p.width = min(p.width, 2048)
-            p.height = min(p.height, 1024)
-            if self._baked_canvas_hdri is not None:
-                pole_src = self._render_from_baked_canvas(p, apply_regions=True)
-            else:
-                enabled_views = [v for v in self._views if getattr(v, "enabled", True)]
-                pole_src = generate_latlong_hdri(
-                    self._profile,
-                    p,
-                    views=enabled_views if len(enabled_views) <= 12 else enabled_views[:1],
-                )
-            if self._poly_masks:
-                pole_src = apply_polygon_masks(pole_src, self._poly_masks)
-            if self._brush_strokes:
-                pole_src = apply_brush_strokes(pole_src, self._brush_strokes)
-        ev = self.preview_ev_slider.value() / 10.0
+        # Edit the un-graded base canvas (without post-adjustments, light inpainting, poly masks, or brush strokes)
+        # so _render_from_baked_canvas never double-applies exposure_ev/grade or live edits.
+        pole_src = self._build_ungraded_pole_source() if self._profile is not None else self._hdri_pixels
+        ev = (self.preview_ev_slider.value() / 10.0) + (float(self.ev_spin.value()) if self._profile is not None else 0.0)
         dlg = PolePatchEditorDialog(pole_src, preview_ev=ev, parent=self)
         ok = dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
         if not ok or dlg.result_hdri is None:
@@ -6203,6 +6227,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                 "ground_rect": self._ground_rect,
                 "light_regions": [dict(r) for r in self._light_regions],
                 "baked_extracted_lights": list(self._baked_extracted_lights),
+                "poly_masks": json.loads(json.dumps(self._poly_masks)),
                 "brush_strokes": [dict(s) for s in self._brush_strokes],
                 "baked_ops": [dict(op) for op in self._baked_ops],
             }

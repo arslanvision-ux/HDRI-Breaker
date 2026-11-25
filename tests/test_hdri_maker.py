@@ -1384,6 +1384,49 @@ class TestHDRIMaker(unittest.TestCase):
             w2.close()
         app.processEvents()
 
+    def test_pole_editor_and_bake_preserve_exposure(self) -> None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from hdri_maker.qt_compat import QtWidgets
+        from hdri_maker.ui_panel import HDRIMakerWidget
+        from hdri_maker.plate_io import write_exr_32f
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_exr = os.path.join(tmpdir, "plate_ev.exr")
+            img = np.full((128, 256, 3), 0.25, dtype=np.float32)
+            write_exr_32f(src_exr, img, output_colorspace="Linear Rec.709")
+
+            w = HDRIMakerWidget(restore_session=False)
+            w.plate_path_edit.setText(src_exr)
+            w._on_analyze_clicked()
+            w.ev_spin.setValue(1.5)
+            w._regenerate_preview()
+            mean_before = float(np.mean(w._hdri_pixels))
+
+            # Pole source must remain un-graded so storing it into _baked_canvas_hdri never doubles exposure_ev
+            pole_src = w._build_ungraded_pole_source()
+            w._baked_canvas_hdri = np.ascontiguousarray(pole_src, dtype=np.float32)
+            w._baked_azimuth_offset_deg = float(w.yaw_spin.value())
+            w._brush_strokes.append(
+                {
+                    "mode": "clone",
+                    "radius_u": 0.04,
+                    "softness": 0.5,
+                    "strength": 1.0,
+                    "src_offset": [0.2, 0.0],
+                    "points": [[0.3, 0.5]],
+                }
+            )
+            w._regenerate_preview()
+            mean_after_pole = float(np.mean(w._hdri_pixels))
+            self.assertAlmostEqual(mean_after_pole, mean_before, places=3)
+
+            w._on_bake_edits_to_canvas()
+            mean_after_bake = float(np.mean(w._hdri_pixels))
+            self.assertAlmostEqual(mean_after_bake, mean_before, places=3)
+            w.close()
+        app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
