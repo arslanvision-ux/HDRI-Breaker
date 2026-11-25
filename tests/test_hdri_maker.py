@@ -1277,6 +1277,66 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertEqual(w2.preview_label._selected_poly_idx, -1)
         w2.close()
 
+    def test_custom_file_dialog_toolbar_and_bookmarks(self) -> None:
+        import tempfile
+        from hdri_maker.file_dialog import HDRIFileDialog, load_bookmarks_data, parse_filter_string
+        from hdri_maker.qt_compat import QtWidgets
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        self.assertIsNotNone(app)
+
+        parsed = parse_filter_string("HDRI Maker State (*.json);;All Files (*)")
+        self.assertEqual(parsed[0][1], ["*.json"])
+        self.assertEqual(parsed[1][1], [])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sub_a = os.path.join(tmpdir, "shot_010")
+            sub_b = os.path.join(tmpdir, "shot_020")
+            os.makedirs(sub_a, exist_ok=True)
+            os.makedirs(sub_b, exist_ok=True)
+            bm_json = os.path.join(tmpdir, "bookmarks.json")
+
+            dlg = HDRIFileDialog(
+                caption="Save HDRI Maker State",
+                initial_path=os.path.join(sub_a, "hdri_maker_state.json"),
+                filter_str="HDRI Maker State (*.json);;All Files (*)",
+                mode=HDRIFileDialog.MODE_SAVE,
+                bookmarks_path=bm_json,
+            )
+            # Clear labeled top toolbar buttons
+            self.assertIn("Back", dlg.btn_back.text())
+            self.assertIn("Up", dlg.btn_up.text())
+            self.assertIn("New Folder", dlg.btn_new_folder.text())
+            self.assertIn("Bookmark", dlg.btn_bookmark.text())
+            self.assertEqual(dlg.filename_edit.text(), "hdri_maker_state.json")
+
+            # Bookmark sub_a, navigate to sub_b, then back and verify persistence
+            dlg.add_current_bookmark()
+            self.assertEqual(dlg.bookmarks_list.count(), 1)
+            self.assertTrue(dlg.navigate_to(sub_b))
+            self.assertEqual(dlg.current_dir(), os.path.normpath(sub_b))
+            dlg.go_back()
+            self.assertEqual(dlg.current_dir(), os.path.normpath(sub_a))
+
+            saved = load_bookmarks_data(bm_json)
+            self.assertEqual(len(saved["bookmarks"]), 1)
+            self.assertEqual(saved["bookmarks"][0]["path"], os.path.normpath(sub_a))
+
+            # Re-open dialog and verify bookmark persists across instances
+            dlg2 = HDRIFileDialog(
+                caption="Load HDRI Maker State",
+                initial_path="",
+                filter_str="HDRI Maker State (*.json)",
+                mode=HDRIFileDialog.MODE_OPEN_ONE,
+                bookmarks_path=bm_json,
+            )
+            self.assertEqual(dlg2.bookmarks_list.count(), 1)
+            dlg2.bookmarks_list.setCurrentRow(0)
+            dlg2.remove_selected_bookmark()
+            self.assertEqual(dlg2.bookmarks_list.count(), 0)
+            dlg.close()
+            dlg2.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

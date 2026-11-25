@@ -71,6 +71,7 @@ from .plate_io import (
     resolve_plate_sequence,
     write_exr_32f,
 )
+from .file_dialog import HDRIFileDialog
 from .qt_compat import Qt, QtCore, QtGui, QtWidgets, Signal
 from .solaris_stage import (
     HAS_HOU,
@@ -1687,7 +1688,7 @@ class MacbethWBDialog(QtWidgets.QDialog):
             self._load_image(initial_path)
 
     def _on_browse(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        path, _ = HDRIFileDialog.get_open_file_name(
             self,
             "Select Macbeth ColorChecker Reference Image",
             self.path_edit.text().strip(),
@@ -3682,10 +3683,10 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self._frames_row_widget.setVisible(is_seq)
 
     def _on_browse_plate(self) -> None:
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+        paths, _ = HDRIFileDialog.get_open_file_names(
             self,
             "Select Plate Image(s) or Sequence Frame",
-            "",
+            self.plate_path_edit.text().strip(),
             "Images (*.exr *.hdr *.jpg *.jpeg *.png *.tif *.tiff *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.pef *.srw *.heic *.heif);;RAW / Phone (*.dng *.cr2 *.cr3 *.nef *.arw *.raf *.orf *.rw2 *.heic *.heif);;All Files (*)",
         )
         if not paths:
@@ -4110,7 +4111,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText(f"Bracket merge error: {exc}")
 
     def _on_add_multiview_plates(self) -> None:
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+        paths, _ = HDRIFileDialog.get_open_file_names(
             self,
             "Select Multiple Plate Images (Different Positions)",
             "",
@@ -4315,7 +4316,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.status_label.setText(f"Unified all {n_rows} plate(s) to FOV {target_fov:.1f}° (Scale X/Y = 1.0).")
 
     def _on_browse_output(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        path, _ = HDRIFileDialog.get_save_file_name(
             self,
             "Save 32-bit Float Lat/Long EXR",
             self.out_path_edit.text(),
@@ -6196,7 +6197,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.status_label.setText(f"Applied flat rectilinear {dlg._current_pole().title()} patch to 360° HDRI.")
 
     def _on_merge_brackets_clicked(self) -> None:
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+        paths, _ = HDRIFileDialog.get_open_file_names(
             self,
             "Select Bracketed Exposure Plates to Merge into 32-bit HDR EXR",
             "",
@@ -6253,7 +6254,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText(f"Bracket merge error: {exc}")
 
     def _on_batch_merge_brackets_clicked(self) -> None:
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+        paths, _ = HDRIFileDialog.get_open_file_names(
             self,
             "Select All Bracketed Photos from 360° Shoot (Auto-Grouped by Angle)",
             "",
@@ -7214,7 +7215,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText("USD Rig export requires Houdini /stage.")
             return
         default_dir = os.path.dirname(self.out_path_edit.text().strip()) or os.path.expanduser("~")
-        usd_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        usd_path, _ = HDRIFileDialog.get_save_file_name(
             self,
             "Export Solaris HDRI & Lookdev Rig (.usda / .usd)",
             os.path.join(default_dir, "hdri_maker_rig.usda"),
@@ -7820,7 +7821,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             pass
 
     def _on_save_state(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        path, _ = HDRIFileDialog.get_save_file_name(
             self,
             "Save HDRI Maker State",
             "hdri_maker_state.json",
@@ -7838,7 +7839,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             self.status_label.setText(f"Save state error: {exc}")
 
     def _on_load_state(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        path, _ = HDRIFileDialog.get_open_file_name(
             self,
             "Load HDRI Maker State",
             "",
