@@ -3183,7 +3183,12 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         # Contextual Polygon Mask Grading Toolbar (shown when Polygon Mask is active or selected)
         self.poly_toolbar_widget = QtWidgets.QWidget()
         self.poly_toolbar_widget.setVisible(False)
-        poly_row = FlowLayout(self.poly_toolbar_widget, margin=2, spacing=6)
+        poly_main_layout = QtWidgets.QVBoxLayout(self.poly_toolbar_widget)
+        poly_main_layout.setContentsMargins(2, 2, 2, 2)
+        poly_main_layout.setSpacing(4)
+
+        poly_actions_widget = QtWidgets.QWidget()
+        poly_row = FlowLayout(poly_actions_widget, margin=0, spacing=6)
 
         self.poly_sel_combo = QtWidgets.QComboBox()
         self.poly_sel_combo.setMinimumWidth(95)
@@ -3200,25 +3205,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.poly_invert_chk = QtWidgets.QCheckBox("Invert")
         self.poly_invert_chk.toggled.connect(self._on_poly_param_changed)
 
-        def _mk_poly_spin(lo: float, hi: float, val: float, step: float, dec: int = 2) -> QtWidgets.QDoubleSpinBox:
-            sb = QtWidgets.QDoubleSpinBox()
-            sb.setRange(lo, hi)
-            sb.setValue(val)
-            sb.setSingleStep(step)
-            sb.setDecimals(dec)
-            sb.setMaximumWidth(64)
-            sb.valueChanged.connect(self._on_poly_param_changed)
-            return sb
+        def _mk_poly_slider(lo: float, hi: float, val: float, step: float, dec: int = 2) -> SliderResetControl:
+            ctrl = SliderResetControl(lo, hi, val, step=step, decimals=dec)
+            ctrl.setMinimumWidth(140)
+            ctrl.valueChanged.connect(self._on_poly_param_changed)
+            return ctrl
 
-        self.poly_ev_spin = _mk_poly_spin(-6.0, 6.0, 0.0, 0.1)
-        self.poly_sat_spin = _mk_poly_spin(0.0, 2.5, 1.0, 0.05)
-        self.poly_gamma_spin = _mk_poly_spin(0.2, 3.0, 1.0, 0.05)
-        self.poly_temp_spin = _mk_poly_spin(-1.0, 1.0, 0.0, 0.05)
-        self.poly_r_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
-        self.poly_g_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
-        self.poly_b_spin = _mk_poly_spin(0.0, 3.0, 1.0, 0.05)
-        self.poly_feather_spin = _mk_poly_spin(0.0, 1.0, 0.15, 0.02)
-        self.poly_blur_spin = _mk_poly_spin(0.0, 1.0, 0.0, 0.02)
+        self.poly_ev_spin = _mk_poly_slider(-6.0, 6.0, 0.0, 0.1)
+        self.poly_sat_spin = _mk_poly_slider(0.0, 2.5, 1.0, 0.05)
+        self.poly_gamma_spin = _mk_poly_slider(0.2, 3.0, 1.0, 0.05)
+        self.poly_temp_spin = _mk_poly_slider(-1.0, 1.0, 0.0, 0.05)
+        self.poly_r_spin = _mk_poly_slider(0.0, 3.0, 1.0, 0.05)
+        self.poly_g_spin = _mk_poly_slider(0.0, 3.0, 1.0, 0.05)
+        self.poly_b_spin = _mk_poly_slider(0.0, 3.0, 1.0, 0.05)
+        self.poly_feather_spin = _mk_poly_slider(0.0, 1.0, 0.15, 0.02)
+        self.poly_blur_spin = _mk_poly_slider(0.0, 1.0, 0.0, 0.02)
 
         poly_row.addWidget(QtWidgets.QLabel("Mask:"))
         poly_row.addWidget(self.poly_sel_combo)
@@ -3227,24 +3228,28 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         poly_row.addWidget(poly_desat_btn)
         poly_row.addWidget(poly_reset_btn)
         poly_row.addWidget(self.poly_invert_chk)
-        poly_row.addWidget(QtWidgets.QLabel("EV:"))
-        poly_row.addWidget(self.poly_ev_spin)
-        poly_row.addWidget(QtWidgets.QLabel("Sat:"))
-        poly_row.addWidget(self.poly_sat_spin)
-        poly_row.addWidget(QtWidgets.QLabel("Gamma:"))
-        poly_row.addWidget(self.poly_gamma_spin)
-        poly_row.addWidget(QtWidgets.QLabel("Temp:"))
-        poly_row.addWidget(self.poly_temp_spin)
-        poly_row.addWidget(QtWidgets.QLabel("R:"))
-        poly_row.addWidget(self.poly_r_spin)
-        poly_row.addWidget(QtWidgets.QLabel("G:"))
-        poly_row.addWidget(self.poly_g_spin)
-        poly_row.addWidget(QtWidgets.QLabel("B:"))
-        poly_row.addWidget(self.poly_b_spin)
-        poly_row.addWidget(QtWidgets.QLabel("Feather:"))
-        poly_row.addWidget(self.poly_feather_spin)
-        poly_row.addWidget(QtWidgets.QLabel("Blur:"))
-        poly_row.addWidget(self.poly_blur_spin)
+        poly_main_layout.addWidget(poly_actions_widget)
+
+        poly_grid = QtWidgets.QGridLayout()
+        poly_grid.setContentsMargins(0, 0, 0, 0)
+        poly_grid.setHorizontalSpacing(8)
+        poly_grid.setVerticalSpacing(3)
+        poly_grid_items = [
+            (0, 0, "EV:", self.poly_ev_spin),
+            (0, 1, "Sat:", self.poly_sat_spin),
+            (0, 2, "Gamma:", self.poly_gamma_spin),
+            (1, 0, "Temp:", self.poly_temp_spin),
+            (1, 1, "Feather:", self.poly_feather_spin),
+            (1, 2, "Blur:", self.poly_blur_spin),
+            (2, 0, "R:", self.poly_r_spin),
+            (2, 1, "G:", self.poly_g_spin),
+            (2, 2, "B:", self.poly_b_spin),
+        ]
+        for r_idx, c_idx, lbl_txt, ctrl in poly_grid_items:
+            poly_grid.addWidget(QtWidgets.QLabel(lbl_txt), r_idx, c_idx * 2)
+            poly_grid.addWidget(ctrl, r_idx, c_idx * 2 + 1)
+            poly_grid.setColumnStretch(c_idx * 2 + 1, 1)
+        poly_main_layout.addLayout(poly_grid)
         layout.addWidget(self.poly_toolbar_widget)
 
         self.preview_label.brushCloneSourcePicked.connect(self._on_brush_clone_src_picked)
