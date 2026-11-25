@@ -1337,6 +1337,53 @@ class TestHDRIMaker(unittest.TestCase):
             dlg.close()
             dlg2.close()
 
+    def test_baked_light_textures_preserved_and_source_plate_protected(self) -> None:
+        import json
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from hdri_maker.qt_compat import QtWidgets
+        from hdri_maker.ui_panel import HDRIMakerWidget
+        from hdri_maker.plate_io import read_plate, write_exr_32f
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_exr = os.path.join(tmpdir, "source_plate.exr")
+            img = np.full((128, 256, 3), 0.2, dtype=np.float32)
+            img[50:78, 102:154, :] = 50.0
+            write_exr_32f(src_exr, img, output_colorspace="Linear Rec.709")
+
+            w1 = HDRIMakerWidget(restore_session=False)
+            w1.plate_path_edit.setText(src_exr)
+            w1._on_analyze_clicked()
+            w1._light_regions = [{"rect": (0.4, 0.4, 0.6, 0.6), "shape": "rect"}]
+
+            # Guard: exporting to the same path as the loaded input plate must redirect to *_hdri.exr
+            w1.out_path_edit.setText(src_exr)
+            written_path = w1._on_export_exr()
+            self.assertIsNotNone(written_path)
+            self.assertNotEqual(os.path.normcase(os.path.abspath(written_path)), os.path.normcase(os.path.abspath(src_exr)))
+            self.assertTrue(written_path.endswith("_hdri.exr"))
+            # Source plate on disk must still retain the original un-inpainted hotspot
+            src_check = read_plate(src_exr, colorspace="Linear Rec.709", max_dim=None)
+            self.assertGreater(float(np.max(src_check.pixels)), 40.0)
+
+            # Bake, save JSON, reload into a fresh widget, bake again, and re-export
+            w1._on_bake_edits_to_canvas()
+            state_json = json.loads(json.dumps(w1.get_state_dict()))
+            w1.close()
+
+            w2 = HDRIMakerWidget(restore_session=False)
+            w2.apply_state_dict(state_json, auto_analyze=True)
+            self.assertEqual(len(w2._baked_extracted_lights), 1)
+            w2._on_bake_edits_to_canvas()
+            out2 = w2._on_export_exr()
+            self.assertIsNotNone(out2)
+            self.assertEqual(len(w2._last_light_exr_paths), 1)
+            light_check = read_plate(w2._last_light_exr_paths[0], colorspace="Linear Rec.709", max_dim=None)
+            self.assertGreater(float(np.max(light_check.pixels)), 40.0)
+            self.assertGreater(float(np.mean(light_check.pixels)), 30.0)
+            w2.close()
+        app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
