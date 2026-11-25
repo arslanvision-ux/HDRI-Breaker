@@ -1384,6 +1384,7 @@ def apply_brush_dab(
     strength: float = 0.85,
     src_offset_uv: Optional[Tuple[float, float]] = None,
     inplace: bool = False,
+    alpha_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Apply a single 32-bit float wrap-aware brush dab onto a 2:1 Lat/Long HDRI.
@@ -1425,6 +1426,11 @@ def apply_brush_dab(
     # Smooth falloff: 1 at center, 0 at r_norm >= 1.0
     falloff = 1.0 - _smoothstep(inner, 1.0, r_norm)
     w_mask = (falloff * float(np.clip(strength, 0.02, 1.0)))[..., None]
+    if alpha_mask is not None and alpha_mask.shape[:2] == (h, w):
+        poly_patch = np.clip(alpha_mask[np.ix_(ys, xs)].astype(np.float32, copy=False), 0.0, 1.0)
+        if poly_patch.ndim == 2:
+            poly_patch = poly_patch[..., None]
+        w_mask = w_mask * poly_patch
 
     m = str(mode or "heal").strip().lower()
     if m == "clone" and src_offset_uv is not None:
@@ -1489,6 +1495,8 @@ def apply_brush_strokes(
     if not strokes:
         return hdri
     out = hdri.astype(np.float32, copy=True)
+    h, w = out.shape[:2]
+    mask_cache: Dict[Any, np.ndarray] = {}
     for st in strokes:
         mode = str(st.get("mode", "heal"))
         radius_u = float(st.get("radius_u", 0.025))
@@ -1496,6 +1504,19 @@ def apply_brush_strokes(
         strength = float(st.get("strength", 0.85))
         src_off = st.get("src_offset")
         src_offset_uv = (float(src_off[0]), float(src_off[1])) if src_off is not None else None
+        alpha_mask: Optional[np.ndarray] = None
+        pm = st.get("poly_mask")
+        if isinstance(pm, dict) and len(pm.get("points") or []) >= 3:
+            pm_pts = tuple((round(float(p[0]), 6), round(float(p[1]), 6)) for p in pm["points"] if len(p) >= 2)
+            pm_feather = round(float(pm.get("feather", 0.15)), 4)
+            pm_invert = bool(pm.get("invert", False))
+            cache_key = (pm_pts, pm_feather, pm_invert)
+            alpha_mask = mask_cache.get(cache_key)
+            if alpha_mask is None:
+                alpha_mask = rasterize_polygon_mask(
+                    h, w, list(pm_pts), feather=pm_feather, invert=pm_invert
+                )
+                mask_cache[cache_key] = alpha_mask
         pts = st.get("points") or []
         for pt in pts:
             if len(pt) >= 2:
@@ -1509,6 +1530,7 @@ def apply_brush_strokes(
                     strength=strength,
                     src_offset_uv=src_offset_uv,
                     inplace=True,
+                    alpha_mask=alpha_mask,
                 )
     return np.ascontiguousarray(out, dtype=np.float32)
 

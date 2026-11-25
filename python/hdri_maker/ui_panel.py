@@ -36,6 +36,7 @@ from .hdri_generator import (
     extract_pole_rectilinear_patch,
     generate_diffuse_irradiance_hdri,
     generate_latlong_hdri,
+    rasterize_polygon_mask,
     render_lookdev_sphere_preview_srgb,
     render_preview_srgb,
 )
@@ -3166,6 +3167,11 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.brush_soft_slider.setValue(65)
         self.brush_soft_slider.setMaximumWidth(64)
         self.brush_soft_slider.valueChanged.connect(self._on_brush_config_changed)
+        self.brush_clip_poly_chk = QtWidgets.QCheckBox("Clip to Poly Mask")
+        self.brush_clip_poly_chk.setChecked(True)
+        self.brush_clip_poly_chk.setToolTip(
+            "When a Polygon Mask is selected, constrain Brush Paint strokes inside that mask (respecting Feather & Invert)"
+        )
         clear_brush_btn = QtWidgets.QPushButton("Clear Brush")
         clear_brush_btn.clicked.connect(self._on_clear_brush)
 
@@ -3177,6 +3183,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         brush_row.addWidget(self.brush_strength_slider)
         brush_row.addWidget(QtWidgets.QLabel("Soft:"))
         brush_row.addWidget(self.brush_soft_slider)
+        brush_row.addWidget(self.brush_clip_poly_chk)
         brush_row.addWidget(clear_brush_btn)
         layout.addWidget(self.brush_toolbar_widget)
 
@@ -5601,6 +5608,20 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._brush_clone_src_uv = (float(u), float(v))
         self.status_label.setText(f"Clone Source set at ({u:.3f}, {v:.3f}). Drag anywhere to clone-stamp.")
 
+    def _active_brush_poly_mask_spec(self) -> Optional[Dict[str, Any]]:
+        if hasattr(self, "brush_clip_poly_chk") and not self.brush_clip_poly_chk.isChecked():
+            return None
+        if 0 <= self._selected_poly_idx < len(self._poly_masks):
+            m = self._poly_masks[self._selected_poly_idx]
+            pts = m.get("points") or []
+            if len(pts) >= 3:
+                return {
+                    "points": [[float(p[0]), float(p[1])] for p in pts if len(p) >= 2],
+                    "feather": float(m.get("feather", 0.15)),
+                    "invert": bool(m.get("invert", False)),
+                }
+        return None
+
     def _on_brush_stroke_started(self, u: float, v: float) -> None:
         if self._hdri_pixels is None:
             return
@@ -5623,12 +5644,21 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self._brush_undo_stack.append(self._hdri_pixels.copy())
         if len(self._brush_undo_stack) > 15:
             self._brush_undo_stack.pop(0)
+        pm_spec = self._active_brush_poly_mask_spec()
+        if pm_spec is not None:
+            h, w = self._hdri_pixels.shape[:2]
+            self._active_brush_alpha_mask = rasterize_polygon_mask(
+                h, w, pm_spec["points"], feather=pm_spec["feather"], invert=pm_spec["invert"]
+            )
+        else:
+            self._active_brush_alpha_mask = None
         self._active_brush_stroke = {
             "mode": mode,
             "radius_u": radius_u,
             "softness": softness,
             "strength": strength,
             "src_offset": list(src_off) if src_off is not None else None,
+            "poly_mask": pm_spec,
             "points": [[float(u), float(v)]],
         }
         apply_brush_dab(
@@ -5641,6 +5671,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             strength=strength,
             src_offset_uv=src_off,
             inplace=True,
+            alpha_mask=self._active_brush_alpha_mask,
         )
         self._rough_cache = None
         self._update_preview_pixmap()
@@ -5664,6 +5695,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             strength=self._active_brush_stroke["strength"],
             src_offset_uv=src_off,
             inplace=True,
+            alpha_mask=getattr(self, "_active_brush_alpha_mask", None),
         )
         self._rough_cache = None
         self._update_preview_pixmap()
@@ -5675,6 +5707,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             mode = self._active_brush_stroke.get("mode", "heal")
             self._undo_stack.append({"kind": "brush", "label": f"Brush ({mode})"})
             self._active_brush_stroke = None
+            self._active_brush_alpha_mask = None
             self._brush_clone_offset_uv = None
             self._commit_undo_baseline()
             self._refresh_undo_ui()
@@ -6459,8 +6492,6 @@ class HDRIMakerWidget(QtWidgets.QWidget):
                     hdri = apply_polygon_masks(hdri, self._poly_masks)
                 self._pre_brush_hdri = hdri.copy()
                 self._brush_undo_stack.clear()
-                if self._poly_masks:
-                    hdri = apply_polygon_masks(hdri, self._poly_masks)
                 if self._brush_strokes:
                     hdri = apply_brush_strokes(hdri, self._brush_strokes)
             self._hdri_pixels = hdri
@@ -7303,6 +7334,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
             "brush_size": self.brush_size_slider.value(),
             "brush_strength": self.brush_strength_slider.value(),
             "brush_softness": self.brush_soft_slider.value(),
+            "brush_clip_poly": self.brush_clip_poly_chk.isChecked(),
             "baked_ops": list(self._baked_ops),
             "sky_rect": list(self._sky_rect) if self._sky_rect else None,
             "ground_rect": list(self._ground_rect) if self._ground_rect else None,
@@ -7550,6 +7582,7 @@ class HDRIMakerWidget(QtWidgets.QWidget):
         self.brush_size_slider.setValue(int(data.get("brush_size", 25)))
         self.brush_strength_slider.setValue(int(data.get("brush_strength", 85)))
         self.brush_soft_slider.setValue(int(data.get("brush_softness", 65)))
+        self.brush_clip_poly_chk.setChecked(bool(data.get("brush_clip_poly", True)))
         self._baked_ops = [dict(op) for op in (data.get("baked_ops") or []) if isinstance(op, dict)]
 
         sr = data.get("sky_rect")

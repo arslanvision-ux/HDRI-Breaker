@@ -1230,6 +1230,39 @@ class TestHDRIMaker(unittest.TestCase):
         self.assertAlmostEqual(float(w2._poly_masks[0]["feather"]), 0.25, places=3)
         self.assertAlmostEqual(float(w2._poly_masks[0]["blur"]), 0.30, places=3)
         self.assertEqual(len(w2.preview_label._poly_masks), 1)
+
+        # 3. Brush Paint clipped to active Polygon Mask
+        w2._on_reset_poly_grade()
+        w2.brush_btn.setChecked(True)
+        self.assertTrue(w2.brush_clip_poly_chk.isChecked())
+        self.assertFalse(w2.poly_toolbar_widget.isHidden())
+        self.assertFalse(w2.brush_toolbar_widget.isHidden())
+        w2.brush_mode_combo.setCurrentText("Dodge (Boost HDR)")
+        w2.brush_size_slider.setValue(120)
+        w2.brush_strength_slider.setValue(100)
+        pre_outside = w2._hdri_pixels[10, 10].copy()
+        pre_inside = w2._hdri_pixels[
+            int(0.5 * (w2._hdri_pixels.shape[0] - 1)),
+            int(0.5 * (w2._hdri_pixels.shape[1] - 1)),
+        ].copy()
+        # Paint across the boundary of the polygon mask (0.4,0.4)-(0.6,0.6)
+        w2._on_brush_stroke_started(0.5, 0.5)
+        w2._on_brush_stroke_moved(0.62, 0.62)
+        w2._on_brush_stroke_finished()
+        post_inside = w2._hdri_pixels[
+            int(0.5 * (w2._hdri_pixels.shape[0] - 1)),
+            int(0.5 * (w2._hdri_pixels.shape[1] - 1)),
+        ]
+        post_outside = w2._hdri_pixels[10, 10]
+        outside_near_edge = w2._hdri_pixels[
+            int(0.63 * (w2._hdri_pixels.shape[0] - 1)),
+            int(0.63 * (w2._hdri_pixels.shape[1] - 1)),
+        ]
+        self.assertGreater(float(np.mean(post_inside)), float(np.mean(pre_inside)) * 1.2)
+        self.assertTrue(np.allclose(post_outside, pre_outside, atol=1e-6))
+        self.assertIsNotNone(w2._brush_strokes[-1].get("poly_mask"))
+        # Verify outside-near-edge (which is inside brush radius around (0.62,0.62) but outside poly mask) wasn't boosted like inside
+        self.assertLess(float(np.mean(outside_near_edge)), float(np.mean(post_inside)))
         w2.close()
 
 
